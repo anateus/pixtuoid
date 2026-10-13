@@ -25,6 +25,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Default ACLs of the workspace candidates
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pilot-out | Out-Null
+          whoami /groups | Select-String -Pattern 'Administrators|Mandatory Label' | Out-File pilot-out/acls.txt
+          foreach ($d in @("$env:SystemDrive\", $env:ProgramData, $env:PUBLIC)) { "== $d" | Out-File -Append pilot-out/acls.txt; icacls $d | Out-File -Append pilot-out/acls.txt }
       - uses: ./.github/actions/setup-cargo-just
       - uses: ./.github/actions/setup-npm
         with:

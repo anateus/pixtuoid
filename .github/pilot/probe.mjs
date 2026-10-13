@@ -363,7 +363,6 @@ function leaks(since) {
 }
 
 async function main() {
-  fs.rmSync(OUT, { recursive: true, force: true });
   fs.mkdirSync(OUT, { recursive: true });
   facts();
   const runs = RUNS.map(resolveRun).filter((r) => !only || only.test(r.id));
