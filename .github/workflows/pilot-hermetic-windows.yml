@@ -41,7 +41,7 @@ jobs:
       - name: Probe every CLI
         shell: bash
         env:
-          PILOT_ONLY: ${{ inputs.only || 'codex[.](tool|windows|danger)|in-temp|opencode[.]tool-run-1|dsh[.]tool-run' }}
+          PILOT_ONLY: ${{ inputs.only || '^pd-' }}
         run: node .github/pilot/probe.mjs
       - name: Probe Rust std
         shell: bash

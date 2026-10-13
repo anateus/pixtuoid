@@ -96,6 +96,14 @@ const RUNS = [
     env: (port) => ({ DEEPSEEK_BASE_URL: `http://127.0.0.1:${port}`, DEEPSEEK_API_KEY: KEY, DSH_TELEMETRY_DISABLED: '1' }),
   })),
   { id: 'dsh.permission-pwsh', base: 'dsh.permission', scriptBody: DSH_PWSH_PERMISSION },
+  // Round 4: the workspace under ProgramData behind a protected DACL, the W2
+  // gate's fix for the inherited `BUILTIN\Users:(CI)(WD,AD,...)` create ACE.
+  ...Object.entries({
+    // OWNER RIGHTS, SYSTEM, Administrators full; Users read+execute.
+    lead: ['*S-1-3-4:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX'],
+    'owner-only': ['*S-1-3-4:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F'],
+  }).flatMap(([dacl, grants]) => ['claude-code.tool-run', 'codex.windows-sandbox-unelevated', 'opencode.tool-run-1', 'dsh.tool-run', 'dsh.permission-pwsh', 'dsh.subagent']
+    .map((b) => ({ id: `pd-${dacl}.${b}`, base: b, wsRoot: process.env.ProgramData, grants }))),
 ];
 
 function resolveRun(r) {
@@ -272,9 +280,14 @@ async function runOne(r, cli) {
     write(path.join(out, 'connect.log'), `exit ${connect.status}\n${connect.out}`);
     result.connect = connect.status;
 
-    const ws = path.join(ROOT, 'pixtuoid-capture', 'proj');
+    const ws = path.join(r.wsRoot ?? ROOT, 'pixtuoid-capture', 'proj');
     fs.rmSync(path.dirname(ws), { recursive: true, force: true });
-    fs.mkdirSync(ws, { recursive: true });
+    fs.mkdirSync(path.dirname(ws), { recursive: !r.wsRoot });
+    if (r.grants) {
+      const g = sh('icacls', [path.dirname(ws), '/inheritance:r', ...r.grants.flatMap((x) => ['/grant:r', x])]);
+      if (g.status !== 0) throw new Error(`icacls: ${g.out}`);
+    }
+    fs.mkdirSync(ws);
     fs.writeFileSync(path.join(ws, 'NOTE.txt'), 'pong\n');
     const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: 'NUL', GIT_CONFIG_SYSTEM: 'NUL' };
     for (const a of [['init', '-q'], ['add', '-A'], ['-c', 'user.email=fixture@pixtuoid', '-c', 'user.name=fixture', 'commit', '-qm', 'init']]) {
@@ -330,6 +343,7 @@ async function runOne(r, cli) {
     result.requests = journal.length;
     result.unmatched = journal.filter((e) => e.response?.fixture == null).length;
     result.events = eventsOf(payloads);
+    if (r.grants) result.acl = sh('icacls', [path.dirname(ws)]).out + sh('icacls', [ws]).out;
     const frames = fs.readFileSync(path.join(out, 'scene.log'), 'utf8').split('\n').filter((l) => l.startsWith('agents='));
     result.sceneFrames = [...new Set(frames)].slice(0, 12);
   } catch (e) {
