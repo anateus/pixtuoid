@@ -1,0 +1,46 @@
+name: pilot-hermetic-windows
+
+# Temporary, never merged: the hermetic tier's Windows pilot
+# (.github/pilot/probe.mjs), answering the spec's Windows unknowns on a real
+# runner before the design.
+
+on:
+  push:
+    branches: [pilot/hermetic-windows]
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'A regex over run ids; empty runs every probe'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-cargo-just
+      - uses: ./.github/actions/setup-npm
+        with:
+          directory: crates/pixtuoid-core/tests/sources/hermetic/aimock
+      - name: Build the binary and the shim
+        shell: bash
+        run: cargo build -q -p pixtuoid -p pixtuoid-hook
+      - name: Probe every CLI
+        shell: bash
+        env:
+          PILOT_ONLY: ${{ inputs.only }}
+        run: node .github/pilot/probe.mjs
+      - if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: pilot-out-${{ github.run_attempt }}
+          path: pilot-out
+          retention-days: 7
+          if-no-files-found: warn
