@@ -35,8 +35,13 @@ jobs:
       - name: Probe every CLI
         shell: bash
         env:
-          PILOT_ONLY: ${{ inputs.only }}
+          PILOT_ONLY: ${{ inputs.only || 'codex[.]windows|codex[.]danger|in-temp' }}
         run: node .github/pilot/probe.mjs
+      - name: Probe Rust std
+        shell: bash
+        run: |
+          rustc --edition 2024 .github/pilot/std_probe.rs -o "$RUNNER_TEMP/std_probe.exe"
+          "$RUNNER_TEMP/std_probe.exe" > pilot-out/std-probe.txt 2>&1
       - if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:

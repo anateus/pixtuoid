@@ -71,10 +71,20 @@ const RUNS = [
     env: (port) => ({ ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`, ANTHROPIC_API_KEY: KEY, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: '1' }) },
   { id: 'claude-code.no-git-on-path', base: 'claude-code.tool-run', pathFilter: noGit },
   { id: 'claude-code.git-bash-path-only', base: 'claude-code.tool-run', pathFilter: noGit, extra: { CLAUDE_CODE_GIT_BASH_PATH: GIT_BASH } },
+  // Round 2: the sandbox under %TEMP%, which the runner spells in 8.3 form.
+  { id: 'claude-code.sandbox-in-temp', base: 'claude-code.tool-run', sandboxRoot: process.env.TEMP },
   { id: 'codex.tool-run', source: 'codex', script: 'codex/tool-run.json', args: ['exec', '--dangerously-bypass-hook-trust', PROMPT],
     env: () => ({ HERMETIC_API_KEY: KEY }), config: [{ home: 'CODEX_HOME', path: 'config.toml', body: CODEX_CONFIG }] },
   // CODEX_HOME unset: does codex find `~/.codex` through USERPROFILE (the sandbox) or the known-folder API (the runner's)?
   { id: 'codex.home-from-userprofile', base: 'codex.tool-run', noHomeEnv: true, config: [{ home: 'USERPROFILE', path: '.codex/config.toml', body: CODEX_CONFIG }] },
+  // Round 2: read-only exec on Windows is Forbidden without a sandbox backend
+  // (codex-rs/core/src/exec_policy.rs:789-806 at rust-v0.155.1); `[windows]
+  // sandbox` picks one (core/src/windows_sandbox.rs:25-49).
+  ...['unelevated', 'elevated'].map((mode) => ({
+    id: `codex.windows-sandbox-${mode}`, base: 'codex.tool-run',
+    config: [{ home: 'CODEX_HOME', path: 'config.toml', body: (port) => `${CODEX_CONFIG(port)}\n[windows]\nsandbox = "${mode}"\n` }],
+  })),
+  { id: 'codex.danger-full-access', base: 'codex.tool-run', args: ['exec', '--dangerously-bypass-hook-trust', '--sandbox', 'danger-full-access', PROMPT] },
   ...[1, 2, 3].map((n) => ({
     id: `opencode.tool-run-${n}`, source: 'opencode', script: 'opencode/tool-run.json',
     args: ['run', '--standalone', '--model', 'openai/gpt-5.2', PROMPT],
@@ -229,7 +239,7 @@ async function runOne(r, cli) {
   const out = path.join(OUT, 'runs', r.id);
   fs.mkdirSync(out, { recursive: true });
   const result = { id: r.id };
-  const sb = path.join(ROOT, 'sandbox', r.id);
+  const sb = path.join(r.sandboxRoot ?? ROOT, 'sandbox', r.id);
   fs.rmSync(sb, { recursive: true, force: true });
   const at = (rel) => { const d = path.join(sb, rel); fs.mkdirSync(d, { recursive: true }); return d; };
   const port = await freePort();
