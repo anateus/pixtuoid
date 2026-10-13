@@ -1,0 +1,59 @@
+name: w2-windows-check
+
+# Temporary, never merged: the W2 branch's Windows proof before its PR — core's
+# tests and `just hermetic` on windows-latest.
+
+on:
+  push:
+    branches: [check/hermetic-windows]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core-tests:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-cargo-just
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-nextest
+      - name: Core tests
+        shell: bash
+        run: just test -p pixtuoid-core
+
+  hermetic:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-cargo-just
+      - uses: ./.github/actions/setup-npm
+        with:
+          directory: crates/pixtuoid-core/tests/sources/hermetic/aimock
+      - name: Run every profile
+        run: |
+          start=$(date +%s)
+          set +e
+          just hermetic
+          code=$?
+          echo "wall seconds: $(( $(date +%s) - start ))"
+          exit "$code"
+      - if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: w2-hermetic-runs-${{ github.run_attempt }}
+          path: target/hermetic/runs
+          retention-days: 7
+          if-no-files-found: warn
