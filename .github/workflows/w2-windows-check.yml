@@ -5,7 +5,7 @@ name: w2-windows-check
 
 on:
   push:
-    branches: [check/hermetic-windows]
+    branches: ["check/hermetic-windows**"]
   workflow_dispatch:
 
 permissions:
