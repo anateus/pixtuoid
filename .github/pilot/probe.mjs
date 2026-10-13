@@ -215,17 +215,23 @@ async function tee(name, file, sceneName) {
   return { got, server, forwardErrors, drained: () => chain };
 }
 
-function copySmallTree(from, to, budget = { files: 400 }) {
-  if (!fs.existsSync(from)) return;
-  for (const e of fs.readdirSync(from, { withFileTypes: true })) {
-    if (budget.files <= 0) return;
-    const src = path.join(from, e.name);
-    const dst = path.join(to, e.name);
-    if (e.isDirectory()) { if (e.name !== 'node_modules') copySmallTree(src, dst, budget); continue; }
-    const st = fs.statSync(src);
-    budget.files -= 1;
-    if (st.size < 2_000_000) { fs.mkdirSync(to, { recursive: true }); fs.copyFileSync(src, dst); }
-  }
+// Every file's path and size, and a copy of the readable ones.
+function copySmallTree(from, to) {
+  const listing = [];
+  const walk = (d) => {
+    let entries; try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const src = path.join(d, e.name);
+      if (e.isDirectory()) { walk(src); continue; }
+      const st = fs.statSync(src);
+      const rel = path.relative(from, src);
+      listing.push(`${st.size}\t${rel}`);
+      const readable = /\.(jsonl|json|toml|ya?ml|ts|mjs|js|log|txt|md)$/i.test(e.name) && !/node_modules|plugins-clone|[\\/]\.tmp[\\/]/.test(rel);
+      if (readable && st.size < 2_000_000) write(path.join(to, rel), fs.readFileSync(src));
+    }
+  };
+  walk(from);
+  write(path.join(to, '..', 'sandbox-files.txt'), `${listing.join('\n')}\n`);
 }
 
 function eventsOf(file) {
