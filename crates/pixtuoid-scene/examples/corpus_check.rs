@@ -356,6 +356,7 @@ mod tests {
                 "openclaw\tok\thook\t-\topenclaw --version",
                 "grok\tgk\ttranscript\tGROK_HOME\tgrok --version",
                 "kimi\tkm\thook\t-\tkimi --version",
+                "jcode\tjc\thook\t-\tjcode --version",
             ],
             "the --roster columns are indexed POSITIONALLY by \
              tier-live-sources.sh and `just corpus-all`. Update every consumer in \

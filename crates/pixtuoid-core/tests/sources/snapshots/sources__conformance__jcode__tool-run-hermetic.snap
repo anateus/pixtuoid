@@ -1,0 +1,77 @@
+---
+source: crates/pixtuoid-core/tests/sources/conformance.rs
+expression: events
+---
+- Identity:
+    agent_id: 950273923768593490
+    source: jcode
+    session_id: session_hatchling_1791936812405_dbe61d94b91186f8
+    cwd: /private/tmp/pixtuoid-capture/proj
+- Rename:
+    agent_id: 950273923768593490
+    label: 🐣 hatchling
+- ActivityStart:
+    agent_id: 950273923768593490
+    tool_use_id: ~
+    detail:
+      Generic:
+        display: read
+- SessionStart:
+    agent_id: 950273923768593490
+    source: jcode
+    session_id: session_hatchling_1791936812405_dbe61d94b91186f8
+    cwd: /private/tmp/pixtuoid-capture/proj
+    parent_id: ~
+- Rename:
+    agent_id: 950273923768593490
+    label: 🐣 hatchling
+- ModelInfo:
+    agent_id: 950273923768593490
+    model: hermetic
+    effort: ~
+- SessionStart:
+    agent_id: 950273923768593490
+    source: jcode
+    session_id: session_hatchling_1791936812405_dbe61d94b91186f8
+    cwd: /private/tmp/pixtuoid-capture/proj
+    parent_id: ~
+- Rename:
+    agent_id: 950273923768593490
+    label: 🐣 hatchling
+- ModelInfo:
+    agent_id: 950273923768593490
+    model: hermetic
+    effort: ~
+- ActivityStart:
+    agent_id: 950273923768593490
+    tool_use_id: ~
+    detail: ~
+- Identity:
+    agent_id: 950273923768593490
+    source: jcode
+    session_id: session_hatchling_1791936812405_dbe61d94b91186f8
+    cwd: /private/tmp/pixtuoid-capture/proj
+- Rename:
+    agent_id: 950273923768593490
+    label: 🐣 hatchling
+- ActivityEnd:
+    agent_id: 950273923768593490
+    tool_use_id: ~
+- Identity:
+    agent_id: 950273923768593490
+    source: jcode
+    session_id: session_hatchling_1791936812405_dbe61d94b91186f8
+    cwd: /private/tmp/pixtuoid-capture/proj
+- Rename:
+    agent_id: 950273923768593490
+    label: 🐣 hatchling
+- ModelInfo:
+    agent_id: 950273923768593490
+    model: hermetic
+    effort: ~
+- ActivityEnd:
+    agent_id: 950273923768593490
+    tool_use_id: ~
+- SessionEnd:
+    agent_id: 950273923768593490
+    as_child: false

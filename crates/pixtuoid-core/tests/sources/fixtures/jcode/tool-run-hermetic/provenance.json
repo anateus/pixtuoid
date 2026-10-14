@@ -1,0 +1,13 @@
+{
+  "origin": "recorded",
+  "cli": "jcode",
+  "version": "jcode v0.95.0 (6487bbd7e)",
+  "captured": "2026-10-14",
+  "command": "just hermetic --record jcode",
+  "deidentified": {
+    "method": "decoder-allowlist",
+    "blanked": 2
+  },
+  "aimock": "1.43.0",
+  "script": "tests/sources/hermetic/jcode/tool-run.json"
+}

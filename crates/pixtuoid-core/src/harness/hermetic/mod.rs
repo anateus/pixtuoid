@@ -195,6 +195,65 @@ fn dsh_event(v: &Value) -> Option<&str> {
 /// The profiled CLIs.
 pub const PROFILES: &[Profile] = &[
     Profile {
+        source: "jcode",
+        package: Package::GithubRelease {
+            repo: "1jehuang/jcode",
+            binary: "jcode",
+        },
+        invocation: &[
+            "jcode",
+            "--no-update",
+            "--no-selfdev",
+            "--socket",
+            "jcode.sock",
+            "--provider-profile",
+            "hermetic",
+            "--tools",
+            "read",
+            "run",
+            "{prompt}",
+        ],
+        env: &[
+            ("JCODE_RUN_MCP", "0"),
+            ("JCODE_RUN_AUTO_POKE", "0"),
+            ("JCODE_NO_TELEMETRY", "1"),
+            ("JCODE_NO_AUTO_UPDATE", "1"),
+        ],
+        homes: &["JCODE_HOME"],
+        system_config: &[],
+        ancestor_config: &[],
+        config: &[ConfigFile {
+            home: "JCODE_HOME",
+            path: "config.toml",
+            // v0.95.0: NamedProviderConfig -> new_named_openai_compatible;
+            // a named profile bypasses ambient provider selection and catalogs.
+            template: r#"[providers.hermetic]
+type = "openai-compatible"
+base_url = "http://127.0.0.1:{port}/v1"
+api_key = "{key}"
+default_model = "hermetic"
+model_catalog = false
+[menubar]
+enabled = false
+"#,
+        }],
+        scenarios: &[Scenario {
+            shape: Shape::ToolRun,
+            expects: &[
+                "session_start",
+                "session_end",
+                "turn_start",
+                "turn_end",
+                "pre_tool",
+                "post_tool",
+            ],
+            fixture: "fixtures/jcode/tool-run-hermetic",
+        }],
+        not_yet: &[],
+        event_name: |v| v.get("event")?.as_str(),
+        not_yet_fields: &[],
+    },
+    Profile {
         source: "claude-code",
         package: Package::Npm("@anthropic-ai/claude-code"),
         invocation: &["claude", "-p", "{prompt}"],
@@ -497,6 +556,17 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn jcode_runs_locally_without_user_mcp_or_auto_poke() {
+        let p = profile("jcode").expect("Jcode needs a real CLI profile, not an exemption");
+        assert!(p.invocation.contains(&"--no-update"));
+        assert!(p.invocation.contains(&"--no-selfdev"));
+        assert!(p.invocation.contains(&"run"));
+        assert!(p.env.contains(&("JCODE_RUN_MCP", "0")));
+        assert!(p.env.contains(&("JCODE_RUN_AUTO_POKE", "0")));
+        assert!(p.not_yet.is_empty());
+    }
 
     #[test]
     fn every_registered_source_is_profiled_or_says_why_not_and_never_both() {
