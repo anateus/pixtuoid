@@ -13,7 +13,7 @@ use crate::source::decoder::{
 };
 use crate::source::{
     AgentEvent, antigravity, claude_code, codewhale, codex, copilot, cursor, dsh, grok, hermes,
-    kimi, omp, openclaw, opencode, reasonix,
+    jcode, kimi, omp, openclaw, opencode, reasonix,
 };
 #[cfg(any(test, feature = "upstream"))]
 use crate::source::{
@@ -356,6 +356,7 @@ pub const REGISTRY: &[SourceDescriptor] = &[
     OPENCLAW,
     GROK,
     KIMI,
+    JCODE,
 ];
 
 /// Linear scan — a handful of entries; a map would cost more ceremony than it
@@ -642,6 +643,31 @@ const REASONIX: SourceDescriptor = SourceDescriptor {
             // Subagents run in-process with hooks disabled upstream, so the slot
             // emits NOTHING until the dispatch tool's PostToolUse.
             delegations_are_hook_silent: true,
+        },
+        focus: FocusChannel::ShimStamp,
+    },
+};
+
+const JCODE: SourceDescriptor = SourceDescriptor {
+    name: jcode::SOURCE_NAME,
+    label_prefix: "jc",
+    verified_version: "0.95.0",
+    version_probe: Some(&["jcode", "--version"]),
+    version_hyphen: Hyphen::Prerelease,
+    home_env: None,
+    #[cfg(any(test, feature = "upstream"))]
+    upstream: Upstream::Watched(&[jcode::UPSTREAM]),
+    kind: SourceKind::Agent {
+        transcript: None,
+        hook: Some(HookDecoding {
+            id_key: IdKey::TranscriptPathThenSessionId,
+            tool_id_key: ToolIdKey::ToolUse,
+            custom: Some(HookCustom::ClaimsAll(jcode::decode_jcode_hook_payload)),
+        }),
+        caps: SourceCaps {
+            has_exit_signal: true,
+            resurrects_on_prompt: true,
+            delegations_are_hook_silent: false,
         },
         focus: FocusChannel::ShimStamp,
     },
@@ -1167,7 +1193,8 @@ mod tests {
         assert_eq!(GROK.name, grok::SOURCE_NAME);
         assert_eq!(KIMI.name, kimi::SOURCE_NAME);
         assert_eq!(DSH.name, dsh::SOURCE_NAME);
-        assert_eq!(REGISTRY.len(), 14, "new row? add its name-pin assert above");
+        assert_eq!(JCODE.name, jcode::SOURCE_NAME);
+        assert_eq!(REGISTRY.len(), 15, "new row? add its name-pin assert above");
     }
 
     #[test]

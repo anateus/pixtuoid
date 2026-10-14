@@ -269,6 +269,44 @@ mod tests {
     }
 
     #[test]
+    fn jcode_source_hue_is_registered_in_every_theme() {
+        for theme in crate::theme::ALL_THEMES {
+            let hue = theme.source.by_prefix("jc").expect("Jcode badge hue");
+            assert_eq!(badge_hue("jc·🌰 chipmunk", theme), Some(hue));
+        }
+    }
+
+    #[test]
+    fn jcode_badge_keeps_its_native_emoji_name() {
+        for label in [
+            "🦊 fox",
+            "🧶 spider",
+            "🌰 chipmunk",
+            "🐣 hatchling",
+            "🦷 sabertooth",
+        ] {
+            let a = slot(label, "session-jcode", 0, active());
+            assert_eq!(Namesakes::of([&a]).text(&a), label);
+        }
+        let mut a = slot("🦷 sabertooth", "session-jcode", 0, active());
+        a.source = Arc::from("jcode");
+        let shown = Namesakes::of([&a]).text(&a);
+        assert_eq!(super::span(&shown) + 1, super::BADGE_CELLS);
+        assert_eq!(&*a.label, "🦷 sabertooth");
+        let scene = scene_of(vec![a.clone()]);
+        let card = crate::tooltip::agent(&scene, a.agent_id, now())
+            .expect("agent tooltip")
+            .card(&crate::theme::NORMAL);
+        assert!((0..card.height()).any(|y| {
+            (0..card.width())
+                .filter_map(|x| card.get(x, y))
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+                .contains(&*a.label)
+        }));
+    }
+
+    #[test]
     fn badge_hue_is_none_for_a_bare_prefix_without_separator() {
         assert_eq!(badge_hue("cx", &crate::theme::NORMAL), None);
     }

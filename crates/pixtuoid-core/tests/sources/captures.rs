@@ -971,6 +971,7 @@ const TOOL_ID_KEY_UNPROVEN: &[&str] = &[
     "codewhale",
     "dsh",
     "hermes",
+    "jcode",
     "omp",
     "opencode",
     "reasonix",
