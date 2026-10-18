@@ -5,8 +5,7 @@ use super::health::FailureLatch;
 use super::liveness::{ProbeLadder, ProbeSnapshot, emit_session_exit, revouch_gated_files};
 use super::unclaim::drain_child_end_unclaims;
 use super::walk::{
-    TASK_SCAN_BYTES, detect_parent_id, extract_cwd, park_if_truncated_below_cursor, scan_root,
-    walk_jsonl,
+    TASK_SCAN_BYTES, detect_parent_id, park_if_truncated_below_cursor, scan_root, walk_jsonl,
 };
 use super::*;
 use crate::AgentId;
@@ -308,25 +307,25 @@ fn detect_parent_id_handles_backslash_paths() {
 }
 
 #[test]
-fn extract_cwd_dispatches_the_scanned_sources_shape() {
+fn the_head_scan_dispatches_the_scanned_sources_shape() {
     let top = br#"{"cwd":"/repo/a"}"#;
     assert_eq!(
-        extract_cwd(top, cwd_extractor_for("claude-code")),
+        super::walk::extract_head_fields(top, cwd_extractor_for("claude-code"), None, None).cwd,
         Some(PathBuf::from("/repo/a"))
     );
     assert_eq!(
-        extract_cwd(top, cwd_extractor_for("test")),
+        super::walk::extract_head_fields(top, cwd_extractor_for("test"), None, None).cwd,
         Some(PathBuf::from("/repo/a")),
         "an unregistered harness source keeps the shared top-level default"
     );
     let nested = br#"{"type":"session_meta","payload":{"cwd":"/repo/b","id":"u"}}"#;
     assert_eq!(
-        extract_cwd(nested, cwd_extractor_for("codex")),
+        super::walk::extract_head_fields(nested, cwd_extractor_for("codex"), None, None).cwd,
         Some(PathBuf::from("/repo/b"))
     );
     let mixed = b"not-json\n{\"type\":\"noise\"}\n{\"cwd\":\"/repo/c\"}\n";
     assert_eq!(
-        extract_cwd(mixed, cwd_extractor_for("claude-code")),
+        super::walk::extract_head_fields(mixed, cwd_extractor_for("claude-code"), None, None).cwd,
         Some(PathBuf::from("/repo/c"))
     );
 }
@@ -335,7 +334,13 @@ fn extract_cwd_dispatches_the_scanned_sources_shape() {
 fn cc_head_scan_ignores_codex_shaped_payload_cwd() {
     let codex_shaped = br#"{"type":"session_meta","payload":{"cwd":"/foreign/repo","id":"u"}}"#;
     assert_eq!(
-        extract_cwd(codex_shaped, cwd_extractor_for("claude-code")),
+        super::walk::extract_head_fields(
+            codex_shaped,
+            cwd_extractor_for("claude-code"),
+            None,
+            None
+        )
+        .cwd,
         None,
         "a foreign source's cwd shape must not extract for a CC transcript"
     );
@@ -934,30 +939,38 @@ fn t_head_label(v: &serde_json::Value) -> Option<String> {
 #[test]
 fn a_head_read_yields_cwd_and_the_optional_title_in_one_pass() {
     let plain = "{\"type\":\"session\",\"cwd\":\"/repo/head\"}\n{\"type\":\"assistant\"}\n";
-    let (cwd, label) =
-        super::walk::extract_head_fields(plain.as_bytes(), cwd_extractor_for("test"), None);
-    assert_eq!(cwd.as_deref(), Some(Path::new("/repo/head")));
-    assert_eq!(label, None, "a source with no head label must name nothing");
+    let head =
+        super::walk::extract_head_fields(plain.as_bytes(), cwd_extractor_for("test"), None, None);
+    assert_eq!(head.cwd.as_deref(), Some(Path::new("/repo/head")));
+    assert_eq!(
+        head.label, None,
+        "a source with no head label must name nothing"
+    );
 
     let titled = "{\"type\":\"title\",\"title\":\"Ship it\"}\n{\"type\":\"session\",\"cwd\":\"/repo/head\"}\n";
-    let (cwd, label) = super::walk::extract_head_fields(
+    let head = super::walk::extract_head_fields(
         titled.as_bytes(),
         cwd_extractor_for("test"),
         Some(t_head_label),
+        None,
     );
-    assert_eq!(cwd.as_deref(), Some(Path::new("/repo/head")));
-    assert_eq!(label.as_deref(), Some("t·Ship it"));
+    assert_eq!(head.cwd.as_deref(), Some(Path::new("/repo/head")));
+    assert_eq!(head.label.as_deref(), Some("t·Ship it"));
 
     // The title slot exists but is EMPTY (omp's subagents, forever): the head
     // read must fall through to the cwd-basename deriver, not name it "".
     let empty =
         "{\"type\":\"title\",\"title\":\"\"}\n{\"type\":\"session\",\"cwd\":\"/repo/head\"}\n";
-    let (_, label) = super::walk::extract_head_fields(
+    let head = super::walk::extract_head_fields(
         empty.as_bytes(),
         cwd_extractor_for("test"),
         Some(t_head_label),
+        None,
     );
-    assert_eq!(label, None, "an empty slot must not become an empty name");
+    assert_eq!(
+        head.label, None,
+        "an empty slot must not become an empty name"
+    );
 }
 
 async fn walk_once_with_head_label(
@@ -993,6 +1006,117 @@ async fn walk_once_with_head_label(
         events.push(ev);
     }
     events
+}
+
+const CODEX_CHILD: &str = "01a14e51-6b67-7d71-bf09-674db3be3c5e";
+const CODEX_ROOT: &str = "01a14e51-5f02-7a71-aed3-a441edeac91d";
+
+/// A codex child's head: its rollout path is flat, so its parent rides this
+/// `session_meta` line (the shape a recorded 0.163.0 child rollout carries).
+fn codex_child_head() -> String {
+    format!(
+        "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{CODEX_CHILD}\",\
+         \"parent_thread_id\":\"{CODEX_ROOT}\",\"cwd\":\"/repo\"}}}}\n"
+    )
+}
+
+fn codex_child_path(dir: &Path) -> PathBuf {
+    dir.join(format!("rollout-2026-10-18T02-22-01-{CODEX_CHILD}.jsonl"))
+}
+
+/// One codex walk of `path`: each first sight's `(agent, parent)`.
+async fn codex_first_sights(
+    path: &Path,
+    cursors: &Arc<Mutex<HashMap<PathBuf, u64>>>,
+    seen: &Arc<Mutex<HashMap<PathBuf, Sight>>>,
+) -> Vec<(AgentId, Option<AgentId>)> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(64);
+    let source: Arc<str> = Arc::from(crate::source::codex::SOURCE_NAME);
+    let decoders = SourceDecoders {
+        decode_line: crate::source::codex::decode_codex_line,
+        derive_label: t_label,
+        check_ended: t_ended,
+        activity_recency: super::no_activity_recency,
+        id_derive: super::folded::FoldedDeriver::new(crate::source::codex::codex_id_from_path),
+        path_filter: accept_all_paths,
+        cwd_derive: no_cwd_from_path,
+        head_label: None,
+    };
+    let live = Arc::new(Mutex::new(HashSet::new()));
+    let ctx = WatchCtx {
+        source: &source,
+        cursors,
+        seen,
+        tx: &tx,
+        window: Duration::from_secs(3600),
+        live: &live,
+    };
+    walk_jsonl(path, decoders, &ctx).await;
+    drop(tx);
+    let mut starts = Vec::new();
+    while let Ok((_, e)) = rx.try_recv() {
+        if let AgentEvent::SessionStart {
+            agent_id,
+            parent_id,
+            ..
+        } = e
+        {
+            starts.push((agent_id, parent_id));
+        }
+    }
+    starts
+}
+
+fn the_parented_child() -> Vec<(AgentId, Option<AgentId>)> {
+    vec![(
+        AgentId::from_parts("codex", CODEX_CHILD),
+        Some(AgentId::from_parts("codex", CODEX_ROOT)),
+    )]
+}
+
+#[tokio::test]
+async fn a_codex_child_rollouts_first_sight_names_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = codex_child_path(dir.path());
+    tokio::fs::write(&path, codex_child_head()).await.unwrap();
+    let (cursors, seen) = Default::default();
+    assert_eq!(
+        codex_first_sights(&path, &cursors, &seen).await,
+        the_parented_child()
+    );
+}
+
+/// The oversized path reads only the head, which must still carry the parent.
+#[tokio::test]
+async fn an_oversized_codex_child_rollouts_first_sight_names_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = codex_child_path(dir.path());
+    let mut full = codex_child_head();
+    full.push_str(&"{\"type\":\"event_msg\"}\n".repeat(60_000));
+    assert!(full.len() as u64 > super::walk::MAX_PENDING_BYTES);
+    tokio::fs::write(&path, &full).await.unwrap();
+    let (cursors, seen) = Default::default();
+    assert_eq!(
+        codex_first_sights(&path, &cursors, &seen).await,
+        the_parented_child()
+    );
+}
+
+/// A revived gated rollout reads its parent off the head too: the append
+/// carries none, though its `turn_context` carries a cwd.
+#[tokio::test]
+async fn a_revived_codex_child_rollout_names_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = codex_child_path(dir.path());
+    let (cursors, seen) = gated_fixture(&path, &codex_child_head()).await;
+    let mut full = codex_child_head();
+    full.push_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n");
+    full.push_str("{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/repo\"}}\n");
+    tokio::fs::write(&path, &full).await.unwrap();
+    assert_eq!(
+        codex_first_sights(&path, &cursors, &seen).await,
+        the_parented_child()
+    );
 }
 
 fn first_rename(events: &[(Transport, AgentEvent)]) -> Option<&str> {

@@ -164,7 +164,7 @@ pub(crate) fn decode_cc_hook_custom(v: &Value) -> Result<Option<Vec<AgentEvent>>
         .and_then(|s| s.as_str())
         .unwrap_or("");
     if event != "SubagentStart" && event != "SubagentStop" {
-        return subagent_fired(obj);
+        return crate::source::decoder::subagent_fired(obj, SOURCE_NAME, subagent_session);
     }
     // Registry contract: claim our two events FULLY (Err on malformed), never
     // fall through — an empty id mints a phantom that never coalesces.
@@ -174,10 +174,12 @@ pub(crate) fn decode_cc_hook_custom(v: &Value) -> Result<Option<Vec<AgentEvent>>
         .filter(|s| !s.is_empty())
         .ok_or_else(|| DecodeError::missing_in(SOURCE_NAME, event, "session_id"))?;
     let wire_agent_id = obj
-        .get("agent_id")
+        .get(crate::source::decoder::SUBAGENT_ID)
         .and_then(|s| s.as_str())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| DecodeError::missing_in(SOURCE_NAME, event, "agent_id"))?;
+        .ok_or_else(|| {
+            DecodeError::missing_in(SOURCE_NAME, event, crate::source::decoder::SUBAGENT_ID)
+        })?;
     let prefixed = subagent_session(wire_agent_id);
     if event == "SubagentStart" {
         let cwd = obj.get("cwd").and_then(|s| s.as_str()).unwrap_or("").into();
@@ -225,25 +227,6 @@ fn subagent_session(wire_agent_id: &str) -> String {
     } else {
         format!("agent-{wire_agent_id}")
     }
-}
-
-/// An event a subagent fired, decoded as its own session's.
-fn subagent_fired(obj: &serde_json::Map<String, Value>) -> Result<Option<Vec<AgentEvent>>> {
-    let Some(agent) = obj
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(None);
-    };
-    let mut own = obj.clone();
-    own.insert("session_id".into(), Value::from(subagent_session(agent)));
-    crate::source::decoder::shared_hook_arms(
-        &own,
-        SOURCE_NAME,
-        crate::source::registry::descriptor_for(SOURCE_NAME),
-    )
-    .map(Some)
 }
 
 /// Resolve `CLAUDE_CONFIG_DIR`. Upstream (read out of the 2.1.226 binary) is

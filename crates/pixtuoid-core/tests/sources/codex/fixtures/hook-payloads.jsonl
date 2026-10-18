@@ -1,4 +1,0 @@
-{"hook_event_name":"UserPromptSubmit","session_id":"01000000-0000-7000-8000-000000000001","_pixtuoid_source":"codex","cwd":"/home/user/demo-project","model":"","permission_mode":"","transcript_path":""}
-{"hook_event_name":"SubagentStart","session_id":"01000000-0000-7000-8000-000000000001","agent_id":"01000000-0000-7000-8000-000000000002","agent_type":"","turn_id":"","_pixtuoid_source":"codex","cwd":"/home/user/demo-project","model":"","permission_mode":"","transcript_path":""}
-{"hook_event_name":"SubagentStop","session_id":"01000000-0000-7000-8000-000000000001","agent_id":"01000000-0000-7000-8000-000000000002","agent_type":"","turn_id":"","stop_hook_active":false,"last_assistant_message":"","_pixtuoid_source":"codex","cwd":"","model":"","permission_mode":"","agent_transcript_path":"","transcript_path":""}
-{"hook_event_name":"Stop","session_id":"01000000-0000-7000-8000-000000000001","_pixtuoid_source":"codex"}

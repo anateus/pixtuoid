@@ -8,8 +8,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::AgentId;
-use crate::source::decoder::{CwdExtractor, LineDecoder, SUBAGENTS_DIR};
-use crate::source::registry::cwd_extractor_for;
+use crate::source::decoder::{CwdExtractor, LineDecoder, ParentExtractor, SUBAGENTS_DIR};
+use crate::source::registry::{cwd_extractor_for, parent_extractor_for};
 use crate::source::{AgentEvent, TaggedSender, Transport};
 
 use super::health::FailureLatch;
@@ -286,13 +286,16 @@ pub(super) async fn walk_jsonl(path: &Path, decoders: SourceDecoders, ctx: &Watc
         if sight != Some(Sight::Claimed) && !metadata_only && revives {
             // The decoder never reaches a head-borne title once the backlog is
             // skipped, so this bounded read is its only carrier.
-            let (head_cwd, head_label) = match read_head(path, MAX_PENDING_BYTES).await {
-                Some(head) => {
-                    extract_head_fields(&head, cwd_extractor_for(source), decoders.head_label)
-                }
-                None => (None, None),
+            let head = match read_head(path, MAX_PENDING_BYTES).await {
+                Some(head) => extract_head_fields(
+                    &head,
+                    cwd_extractor_for(source),
+                    decoders.head_label,
+                    parent_extractor_for(source),
+                ),
+                None => HeadFields::default(),
             };
-            emit_first_sight(path, source, decoders, seen, tx, head_cwd, head_label).await;
+            emit_first_sight(path, source, decoders, seen, tx, head).await;
         }
         // #222: the skipped span may bury an IN-FLIGHT Task dispatch. Only when
         // registered — JSONL events for an unknown id are reducer no-ops.
@@ -337,18 +340,18 @@ pub(super) async fn walk_jsonl(path: &Path, decoders: SourceDecoders, ctx: &Watc
     // per-line key disagree and every JSONL event lands on a phantom id.
     let transcript_path_str = crate::id::normalize_path_key(&path.to_string_lossy());
 
-    // A revived GATED file reads only the tail, but Codex rollouts carry cwd ONLY
-    // on the head `session_meta` line — so the revive would register empty-cwd onto
-    // the short reap. The same bounded head read also carries the title, which the
-    // tail is likewise past.
+    // A revived GATED file reads only the tail, which may lack what only a head
+    // carries: Codex's `session_meta` cwd and parent, and the title. Without
+    // them the revive registers empty-cwd onto the short reap, or a child as a
+    // root.
     let extract = cwd_extractor_for(source);
-    let mut first_sight_cwd = extract_cwd(new_bytes, extract);
-    let mut head_label = None;
-    if first_sight_cwd.is_none()
+    let parent = parent_extractor_for(source);
+    let mut first_sight = extract_head_fields(new_bytes, extract, None, parent);
+    if (first_sight.cwd.is_none() || (parent.is_some() && first_sight.parent.is_none()))
         && seen.lock().await.get(path) != Some(&Sight::Claimed)
         && let Some(head) = read_head(path, MAX_PENDING_BYTES).await
     {
-        (first_sight_cwd, head_label) = extract_head_fields(&head, extract, decoders.head_label);
+        first_sight = extract_head_fields(&head, extract, decoders.head_label, parent);
     }
 
     let path_agent_id = AgentId::from_parts(source, &decoders.id_derive.id_for(path));
@@ -389,16 +392,7 @@ pub(super) async fn walk_jsonl(path: &Path, decoders: SourceDecoders, ctx: &Watc
             super::TailActivity::SidecarOnly
         )
     {
-        emit_first_sight(
-            path,
-            source,
-            decoders,
-            seen,
-            tx,
-            first_sight_cwd,
-            head_label,
-        )
-        .await;
+        emit_first_sight(path, source, decoders, seen, tx, first_sight).await;
     }
 
     let session_ended = decoded.iter().any(ends_this_agent);
@@ -462,8 +456,7 @@ async fn emit_first_sight(
     decoders: SourceDecoders,
     seen: &Arc<Mutex<HashMap<PathBuf, Sight>>>,
     tx: &TaggedSender,
-    cwd: Option<PathBuf>,
-    head_label: Option<String>,
+    head: HeadFields,
 ) {
     // An `Ended` claim registers like an absent one: the walk calls here for it
     // only on an append that shows activity.
@@ -479,10 +472,12 @@ async fn emit_first_sight(
     let id = AgentId::from_parts(source, &session_id);
     // Content-derived cwd wins; the PATH deriver covers sources carrying none, an
     // empty cwd being what puts a slot on the unknown-cwd short reap.
-    let cwd = cwd
+    let cwd = head
+        .cwd
         .or_else(|| (decoders.cwd_derive)(path))
         .unwrap_or_default();
-    let parent_id = detect_parent_id(path, source);
+    let parent_id = detect_parent_id(path, source)
+        .or_else(|| head.parent.map(|p| AgentId::from_parts(source, &p)));
     let _ = tx
         .send((
             Transport::Jsonl,
@@ -498,7 +493,9 @@ async fn emit_first_sight(
 
     // A head-read name beats the cwd deriver: it is the session's OWN title,
     // while the cwd basename is shared by every concurrent session in a repo.
-    let label = head_label.unwrap_or_else(|| (decoders.derive_label)(path, source, &cwd));
+    let label = head
+        .label
+        .unwrap_or_else(|| (decoders.derive_label)(path, source, &cwd));
     let _ = tx
         .send((
             Transport::Jsonl,
@@ -636,20 +633,6 @@ pub(super) fn detect_parent_id(path: &Path, source: &str) -> Option<AgentId> {
     None
 }
 
-/// Scan a byte span line-by-line and return the first cwd the SCANNED source's
-/// own extractor finds. The per-source shape knowledge stays in the registry
-/// row (invariant #3): an if-chain trying every source's shape against every
-/// transcript lets a foreign-shaped line label a session with a foreign,
-/// identity-bearing cwd.
-pub(super) fn extract_cwd(bytes: &[u8], extract: CwdExtractor) -> Option<PathBuf> {
-    let mut found = None;
-    scan_jsonl(bytes, |v| {
-        found = extract(v);
-        found.is_some()
-    });
-    found
-}
-
 /// Walk a byte span's JSONL lines, handing each parsed line to `visit` until it
 /// returns `true`. Malformed/non-UTF-8 lines are skipped — a transcript head can
 /// straddle a partial write.
@@ -681,7 +664,10 @@ fn head_scan_complete(cwd: Option<&Path>, label: Option<&str>, wants_label: bool
 }
 
 /// The first-sight fields a HEAD read yields, pulled in ONE parse pass: scanning
-/// a 1 MiB head once per field is a real cost. For a TITLED omp root — the only
+/// a 1 MiB head once per field is a real cost. Each comes from the SCANNED
+/// source's own extractor (invariant #3): an if-chain trying every source's
+/// shape against every transcript lets a foreign-shaped line label a session
+/// with a foreign, identity-bearing cwd. For a TITLED omp root — the only
 /// source with a head label — the two land on adjacent lines (`title`, then
 /// `session`) and the scan stops there. A title-less head (every subagent, and
 /// legacy files with no slot) has no label to find, so it scans to the byte cap:
@@ -690,18 +676,35 @@ pub(super) fn extract_head_fields(
     bytes: &[u8],
     extract: CwdExtractor,
     head_label: Option<HeadLabel>,
-) -> (Option<PathBuf>, Option<String>) {
-    let (mut cwd, mut label) = (None, None);
+    head_parent: Option<ParentExtractor>,
+) -> HeadFields {
+    let mut head = HeadFields::default();
     scan_jsonl(bytes, |v| {
-        if cwd.is_none() {
-            cwd = extract(v);
+        if head.cwd.is_none() {
+            head.cwd = extract(v);
         }
-        if let (Some(f), None) = (head_label, &label) {
-            label = f(v);
+        if let (Some(f), None) = (head_label, &head.label) {
+            head.label = f(v);
         }
-        head_scan_complete(cwd.as_deref(), label.as_deref(), head_label.is_some())
+        if let (Some(f), None) = (head_parent, &head.parent) {
+            head.parent = f(v);
+        }
+        head_scan_complete(
+            head.cwd.as_deref(),
+            head.label.as_deref(),
+            head_label.is_some(),
+        )
     });
-    (cwd, label)
+    head
+}
+
+/// What a first sight reads off a transcript's head, or off a revived file's
+/// new bytes.
+#[derive(Debug, Default)]
+pub(super) struct HeadFields {
+    pub(super) cwd: Option<PathBuf>,
+    pub(super) label: Option<String>,
+    pub(super) parent: Option<String>,
 }
 
 #[cfg(test)]

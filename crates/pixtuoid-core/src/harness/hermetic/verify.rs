@@ -787,6 +787,9 @@ mod tests {
 
     const CX_SCENE: &str = "agents=[cx\u{b7}proj@0:active(Bash: cat NOTE.txt)]\n\
                             agents=[cx\u{b7}proj@0:idle]\nagents=[] daemons=[]\n";
+    const CX_DELEGATE_SCENE: &str = "agents=[cx\u{b7}proj@0:active(Delegating), \
+                                     cx\u{b7}proj@1:active(Bash: cat NOTE.txt)]\n\
+                                     agents=[] daemons=[]\n";
     const CC_SCENE: &str = "agents=[cc\u{b7}proj@0:active(Read: NOTE.txt)]\nagents=[] daemons=[]\n";
 
     const DS_WAIT_SCENE: &str =
@@ -1053,6 +1056,13 @@ mod tests {
     #[test]
     fn a_recorded_codex_tool_run_passes() {
         let d = run_from("codex", "tool-run-recorded", CX_SCENE);
+        let v = verify(d.path()).expect("verify");
+        assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
+    }
+
+    #[test]
+    fn a_recorded_codex_subagent_run_passes() {
+        let d = recorded("codex", Shape::Subagent, CX_DELEGATE_SCENE);
         let v = verify(d.path()).expect("verify");
         assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
     }
@@ -1354,7 +1364,7 @@ mod tests {
         let mut first = true;
         edit_hooks(d.path(), |mut v| {
             if std::mem::take(&mut first) {
-                v["hook_event_name"] = "SubagentStart".into();
+                v["hook_event_name"] = "PermissionRequest".into();
             }
             Some(v)
         });
@@ -1363,7 +1373,11 @@ mod tests {
             &[d.path().to_path_buf()],
         )
         .expect("verify");
-        assert!(has(&v, Label::Stale, "SubagentStart"), "{:?}", v.findings());
+        assert!(
+            has(&v, Label::Stale, "PermissionRequest"),
+            "{:?}",
+            v.findings()
+        );
     }
 
     #[test]
