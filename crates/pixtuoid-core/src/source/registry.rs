@@ -940,7 +940,7 @@ const CURSOR: SourceDescriptor = SourceDescriptor {
 const HERMES: SourceDescriptor = SourceDescriptor {
     name: hermes::SOURCE_NAME,
     label_prefix: "hm",
-    verified_version: "0.21.0",
+    verified_version: "0.22.2",
     version_probe: Some(&["hermes", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: Some("HERMES_HOME"),
@@ -1149,7 +1149,10 @@ mod tests {
             ("codex-cli 0.155.1", Some("0.155.1")),
             ("0.135", Some("0.135.0")),
             ("omp/18.2.6", Some("18.2.6")),
-            ("Hermes Agent v0.21.0 (2026.8.31)", Some("0.21.0")),
+            (
+                "Hermes Agent v0.22.2 (2026.9.24) · stable · local d923a5eb487a",
+                Some("0.22.2"),
+            ),
             ("grok 1.0.25 (f7e67d6988e2) [stable]", Some("1.0.25")),
             ("0.2.0-rc.2", Some("0.2.0-rc.2")),
             // copilot's, which no capture records: a dot no digit follows ends it.

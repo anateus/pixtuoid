@@ -42,7 +42,7 @@ mod run {
         CAPTURE_RECORD, CORPUS_REFUSAL, CaptureRecord, capture_workspace, recorder_flag,
         required_version_probe, version_answer,
     };
-    use pixtuoid_core::source::upstream;
+    use pixtuoid_core::source::upstream::{self, Release};
     use semver::Version;
 
     /// How long a server gets to come up before the run gives up.
@@ -85,9 +85,10 @@ mod run {
             "TEMP",
         ],
     };
-    /// What the tier's tools (npm, curl, aimock) inherit beyond [`inherited`]:
-    /// network settings, with npm's home in [`PLATFORM_TOOL_INHERITED`]. A CLI's install scripts and the
-    /// npm-installed aimock are untrusted code, so no provider key reaches them.
+    /// What the tier's tools inherit beyond [`inherited`]: network settings,
+    /// with their homes in [`PLATFORM_TOOL_INHERITED`]. A CLI's install scripts
+    /// and the npm-installed aimock are untrusted code, so no provider key
+    /// reaches them.
     const TOOL_INHERITED: &[&str] = &[
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -96,9 +97,12 @@ mod run {
         "https_proxy",
         "no_proxy",
         "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+        "UV_SYSTEM_CERTS",
     ];
-    /// npm's home, whose `cache` is `~/.npm`, or `%LocalAppData%\npm-cache` on
-    /// Windows (docs.npmjs.com/cli/v11/using-npm/config).
+    /// npm's and uv's homes, whose caches are `~/.npm` and `~/.cache/uv`, or
+    /// `%LocalAppData%\npm-cache` and `%LOCALAPPDATA%\uv\cache` on Windows
+    /// (docs.npmjs.com/cli/v11/using-npm/config, docs.astral.sh/uv/reference/storage).
     const PLATFORM_TOOL_INHERITED: PerOs<&[&str]> = PerOs {
         unix: &["HOME"],
         windows: &["USERPROFILE", "APPDATA", "LOCALAPPDATA"],
@@ -656,7 +660,13 @@ mod run {
                     .map_err(|e| format!("npm view {spec}: {e}"))?;
                 npm_release(&spec, out.status, &out.stdout, &out.stderr)
             }
-            (Versions::Latest, Package::GithubRelease { repo, .. }) => {
+            (Versions::Latest, Package::GithubRelease { repo, .. } | Package::UvLocked(repo)) => {
+                if repo.release != Release::GithubLatest {
+                    return Err(format!(
+                        "{} releases as {:?}, which `--cli latest` can't read",
+                        repo.name, repo.release
+                    ));
+                }
                 // It redirects to the latest release
                 // (docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases).
                 let url = format!("https://github.com/{}/releases/latest", repo.name);
@@ -678,6 +688,8 @@ mod run {
     }
 
     const CURL: &str = "curl";
+    const GIT: &str = "git";
+    const UV: &str = "uv";
 
     /// The release a `releases/latest` response's `location` names.
     fn latest_tag(headers: &str) -> Option<Version> {
@@ -807,6 +819,41 @@ mod run {
                         env: Vec::new(),
                     },
                     bin: prefix,
+                })
+            }
+            Package::UvLocked(repo) => {
+                let src = prefix.join("src");
+                install_once(&prefix, |_| {
+                    let mut clone = tool(GIT);
+                    clone
+                        .args(["clone", "--quiet", "--depth", "1", "--branch"])
+                        .arg(format!("v{version}"))
+                        .arg(format!("https://github.com/{}.git", repo.name))
+                        .arg(&src);
+                    succeed(clone)?;
+                    // A workspace's members, a Python of uv's own at the tag's pin and
+                    // no operator's uv config, as hermes's installer syncs
+                    // (`pm/environment.py:406-409`, `scripts/install.sh:21` at v0.22.2);
+                    // `UV_NO_CONFIG` is `--no-config`, which disables `.python-version`
+                    // discovery too (docs.astral.sh/uv/concepts/python-versions).
+                    let python = std::fs::read_to_string(src.join(".python-version"))?;
+                    let mut sync = tool(UV);
+                    sync.args(["sync", "--frozen", "--all-packages", "--managed-python"])
+                        .args(["--python", python.trim()])
+                        .env("UV_NO_CONFIG", "1")
+                        .current_dir(&src);
+                    succeed(sync)
+                })?;
+                let bin = src
+                    .join(".venv")
+                    .join(if cfg!(windows) { "Scripts" } else { "bin" });
+                Ok(Installed {
+                    launch: Launch {
+                        program: bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                    },
+                    bin,
                 })
             }
         }
@@ -1185,10 +1232,7 @@ mod run {
             serde_json::to_string_pretty(&journal)?,
         )?;
         let entries = journal.as_array().cloned().unwrap_or_default();
-        let unmatched = entries
-            .iter()
-            .filter(|e| e["response"]["fixture"].is_null())
-            .count();
+        let (requests, unmatched) = model_requests(&entries);
 
         // The recorder writes its record whenever the CLI ran, so a missing
         // one means the CLI never did; it fails past one only on a capture it
@@ -1213,7 +1257,7 @@ mod run {
             scenario: scenario.shape.name().into(),
             capture,
             aimock: aimock.version.clone(),
-            requests: entries.len(),
+            requests,
             unmatched,
         };
         std::fs::write(dir.join(MANIFEST), serde_json::to_string_pretty(&manifest)?)?;
@@ -1328,6 +1372,19 @@ mod run {
         args.extend(run.launch.argv());
         args.extend(p.invocation[1..].iter().map(OsString::from));
         args
+    }
+
+    /// The requests aimock answered and those no script line matched, every
+    /// GET aside: a GET is a model catalog's, which no script answers (hermes
+    /// probes LM Studio's `/api/v1/models`, `agent/model_metadata.py:745` at
+    /// v0.22.2).
+    fn model_requests(journal: &[serde_json::Value]) -> (usize, usize) {
+        let requests: Vec<_> = journal.iter().filter(|e| e["method"] != "GET").collect();
+        let unmatched = requests
+            .iter()
+            .filter(|e| e["response"]["fixture"].is_null())
+            .count();
+        (requests.len(), unmatched)
     }
 
     /// The scenario's script with its placeholders expanded in every string,
@@ -2006,6 +2063,17 @@ mod run {
                     .is_err_and(|why| why.contains(&format!("exited {failed}"))),
                 "no npm error line still says why"
             );
+        }
+
+        #[test]
+        fn a_get_is_no_model_request_and_a_websocket_request_is_one() {
+            let journal = serde_json::json!([
+                {"method": "GET", "path": "/api/v1/models", "response": {"status": 200, "fixture": null}},
+                {"method": "POST", "path": "/v1/chat/completions", "response": {"status": 200, "fixture": {"match": {}}}},
+                {"method": "POST", "path": "/v1/chat/completions", "response": {"status": 404, "fixture": null}},
+                {"method": "WS", "path": "/v1/responses", "response": {"status": 404, "fixture": null}},
+            ]);
+            assert_eq!(model_requests(journal.as_array().expect("entries")), (3, 2));
         }
 
         #[test]

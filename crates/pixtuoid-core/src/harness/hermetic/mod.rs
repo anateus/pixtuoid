@@ -82,6 +82,9 @@ pub enum Package {
         /// ([`crate::source::upstream::vouches`]).
         sums: &'static str,
     },
+    /// The `v<version>` tag of a source's drift-watched repository, synced from
+    /// its committed `uv.lock`.
+    UvLocked(&'static crate::source::upstream::Repo),
 }
 
 /// What a scenario's script drives a CLI through. Shared by every CLI, so one CLI
@@ -231,9 +234,9 @@ pub struct Manifest {
     pub capture: CaptureRecord,
     /// The aimock version that played the model.
     pub aimock: String,
-    /// Requests aimock answered.
+    /// Requests aimock answered, every GET aside.
     pub requests: usize,
-    /// Requests no script fixture matched.
+    /// Of those, the requests no script line matched.
     pub unmatched: usize,
 }
 
@@ -1024,6 +1027,60 @@ async:
         ],
         children_inherit_cwd: false,
     },
+    // hermes's cites are `NousResearch/hermes-agent` at `v0.22.2`.
+    Profile {
+        source: "hermes",
+        // Its build refuses a wheel (`setup.py:37`), so no index carries a
+        // current release; a source checkout tracks the latest `vX.Y.Z` tag
+        // (`website/docs/getting-started/updating.md:33-36`). Its installer
+        // would rewrite the operator's shell rc files and run `sudo -n -v`
+        // (`scripts/install.sh:851-853`, `:882-908`).
+        package: Package::UvLocked(&crate::source::hermes::REPO),
+        // `-z` is one turn that approves every tool (`hermes_cli/oneshot.py:275-277`),
+        // and a hook runs only once accepted.
+        invocation: &["hermes", "--accept-hooks", "-z", "{prompt}"],
+        env: &[],
+        // The managed scope, which otherwise is `/etc/hermes`
+        // (`hermes_cli/managed_scope.py:31`, `:45-58`).
+        homes: &["HERMES_MANAGED_DIR"],
+        // Read there whatever the managed scope is (`hermes_cli/image_provenance.py:16`).
+        system_config: PerOs {
+            unix: &[HostConfig::Path("/etc/hermes")],
+            windows: &[],
+        },
+        // Context files stop at the git root (`agent/prompt_builder.py:141`,
+        // `:1722-1732`), which the recorder's `git init` makes the workspace.
+        ancestor_config: &[],
+        config: &[ConfigFile {
+            home: "HERMES_HOME",
+            path: "config.yaml",
+            template: r#"model:
+  default: hermetic
+  provider: custom
+  base_url: http://127.0.0.1:{port}/v1
+  api_key: "{key}"
+"#,
+        }],
+        scenarios: &[Scenario {
+            shape: Shape::ToolRun,
+            expects: &[
+                "on_session_start",
+                "pre_tool_call",
+                "post_tool_call",
+                "on_session_end",
+                "on_session_finalize",
+            ],
+            fixture: "fixtures/hermes/tool-run-hermetic",
+        }],
+        script_vars: &[],
+        // `-z` approves every call before the gate's hook
+        // (`tools/approval.py:967`).
+        not_yet: &["pre_approval_request"],
+        event_name: hook_event_name,
+        // A terminal call's; the scripted turn reads a file.
+        not_yet_fields: &[("hook:pre_tool_call", "/tool_input/command")],
+        children_inherit_cwd: false,
+    },
 ];
 
 /// Every registered source without a profile, and why.
@@ -1035,7 +1092,6 @@ pub const NOT_HERMETIC: &[(&str, Absence)] = &[
     // `shell_env` (codewhale-hq/Codewhale `docs/HOOKS.md:33-42` at v0.10.1).
     ("codewhale", Absence::NoHeadlessLifecycle),
     ("openclaw", Absence::AwaitingProfile),
-    ("hermes", Absence::AwaitingProfile),
 ];
 
 /// The profile for `source`, if it has one.
