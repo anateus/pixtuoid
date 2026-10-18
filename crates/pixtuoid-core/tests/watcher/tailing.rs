@@ -7,19 +7,17 @@ use tokio::sync::mpsc;
 use pixtuoid_core::source::AgentEvent;
 use pixtuoid_core::source::Transport;
 
-use crate::cc_watcher;
+use crate::{copilot_start_line, copilot_tool_line, spawn_copilot};
 
 #[tokio::test]
 async fn watcher_emits_session_start_then_activity_for_tool_use() {
     let dir = TempDir::new().unwrap();
-    let projects_root = dir.path().to_path_buf();
-    let project_dir = projects_root.join("proj-x");
-    tokio::fs::create_dir_all(&project_dir).await.unwrap();
-    let transcript = project_dir.join("ses-abc.jsonl");
+    let session_dir = dir.path().join("ses-abc");
+    tokio::fs::create_dir_all(&session_dir).await.unwrap();
+    let transcript = session_dir.join("events.jsonl");
 
     let (tx, mut rx) = mpsc::channel::<(Transport, AgentEvent)>(32);
-    let watcher = cc_watcher(projects_root.clone());
-    let handle = tokio::spawn(async move { watcher.run(tx).await });
+    let handle = spawn_copilot(dir.path().to_path_buf(), tx);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -29,94 +27,63 @@ async fn watcher_emits_session_start_then_activity_for_tool_use() {
         .open(&transcript)
         .await
         .unwrap();
-    let start_line = serde_json::json!({
-        "type": "system",
-        "subtype": "session_start",
-        "sessionId": "ses-abc",
-        "cwd": "/repo"
-    });
-    f.write_all(format!("{start_line}\n").as_bytes())
-        .await
-        .unwrap();
-    let assistant_line = serde_json::json!({
-        "type": "assistant",
-        "sessionId": "ses-abc",
-        "cwd": "/repo",
-        "message": {
-            "role": "assistant",
-            "content": [
-                { "type": "tool_use", "id": "tu_1", "name": "Bash",
-                  "input": { "command": "ls" } }
-            ]
-        }
-    });
-    f.write_all(format!("{assistant_line}\n").as_bytes())
-        .await
-        .unwrap();
+    let lines = [
+        copilot_start_line("ses-abc", "/repo"),
+        copilot_tool_line("tu_1", "bash"),
+    ];
+    for line in lines {
+        f.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+    }
     f.flush().await.unwrap();
     drop(f);
 
-    let mut start_id = None;
-    let mut activity_id = None;
-    let mut start_transport = Transport::Hook;
-    let mut activity_transport = Transport::Hook;
+    let mut starts = Vec::new();
+    let mut activity = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
             Ok(Some((t, AgentEvent::SessionStart { agent_id, .. }))) => {
-                start_id = Some(agent_id);
-                start_transport = t;
+                starts.push((t, agent_id));
             }
             Ok(Some((t, AgentEvent::ActivityStart { agent_id, .. }))) => {
-                activity_id = Some(agent_id);
-                activity_transport = t;
+                activity = Some((t, agent_id));
+                break;
             }
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => {}
         }
-        if start_id.is_some() && activity_id.is_some() {
-            break;
-        }
     }
-    let start_id = start_id.expect("expected SessionStart from JSONL watcher");
-    let activity_id = activity_id.expect("expected ActivityStart from JSONL watcher");
+    let activity = activity.expect("expected ActivityStart from JSONL watcher");
+    assert!(
+        !starts.is_empty(),
+        "expected SessionStart from JSONL watcher"
+    );
     // The SessionStart key (id_derive) and the per-line decode key
     // (transcript_path_str) are computed at two different walk_jsonl sites —
     // they diverged on the windows runner.
-    assert_eq!(
-        start_id, activity_id,
-        "SessionStart and per-line events must share one AgentId"
+    assert!(
+        starts
+            .iter()
+            .all(|start| *start == (Transport::Jsonl, activity.1)),
+        "SessionStart and per-line events must share one AgentId: {starts:?} vs {activity:?}"
     );
-    assert_eq!(start_transport, Transport::Jsonl);
-    assert_eq!(activity_transport, Transport::Jsonl);
+    assert_eq!(activity.0, Transport::Jsonl);
     handle.abort();
 }
 
 #[tokio::test]
 async fn watcher_does_not_consume_partial_trailing_line() {
     let dir = TempDir::new().unwrap();
-    let projects_root = dir.path().to_path_buf();
-    let project_dir = projects_root.join("proj-x");
-    tokio::fs::create_dir_all(&project_dir).await.unwrap();
-    let transcript = project_dir.join("ses-abc.jsonl");
+    let session_dir = dir.path().join("ses-abc");
+    tokio::fs::create_dir_all(&session_dir).await.unwrap();
+    let transcript = session_dir.join("events.jsonl");
 
     let (tx, mut rx) = mpsc::channel::<(Transport, AgentEvent)>(32);
-    let watcher = cc_watcher(projects_root.clone());
-    let handle = tokio::spawn(async move { watcher.run(tx).await });
+    let handle = spawn_copilot(dir.path().to_path_buf(), tx);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let complete = serde_json::json!({
-        "type": "assistant",
-        "sessionId": "ses-abc",
-        "cwd": "/repo",
-        "message": {
-            "role": "assistant",
-            "content": [
-                { "type": "tool_use", "id": "tu_1", "name": "Bash", "input": { "command": "ls" } }
-            ]
-        }
-    });
-    let partial_head = r#"{"type":"assistant","sessionId":"ses-abc","cwd":"/repo","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_2","name":"Read","input":{"file_path":"/etc/host"#;
+    let complete = copilot_tool_line("tu_1", "bash");
+    let partial_head = r#"{"type":"tool.execution_start","data":{"toolCallId":"tu_2","toolName":"view","arguments":{"path":"/etc/host"#;
     let mut f = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -150,7 +117,7 @@ async fn watcher_does_not_consume_partial_trailing_line() {
         "tu_2 came from a partial line and must not be emitted yet"
     );
 
-    let partial_tail = "s\"}}]}}\n";
+    let partial_tail = "s\"}}}\n";
     let mut f = tokio::fs::OpenOptions::new()
         .append(true)
         .open(&transcript)
@@ -181,30 +148,15 @@ async fn watcher_does_not_consume_partial_trailing_line() {
 #[tokio::test]
 async fn watcher_resets_cursor_on_truncation_below_cursor() {
     let dir = TempDir::new().unwrap();
-    let projects_root = dir.path().to_path_buf();
-    let project_dir = projects_root.join("proj-trunc");
-    tokio::fs::create_dir_all(&project_dir).await.unwrap();
-    let transcript = project_dir.join("trunc.jsonl");
+    let session_dir = dir.path().join("trunc");
+    tokio::fs::create_dir_all(&session_dir).await.unwrap();
+    let transcript = session_dir.join("events.jsonl");
 
     let (tx, mut rx) = mpsc::channel::<(Transport, AgentEvent)>(64);
-    let watcher = cc_watcher(projects_root.clone());
-    let handle = tokio::spawn(async move { watcher.run(tx).await });
+    let handle = spawn_copilot(dir.path().to_path_buf(), tx);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let tool_line = |id: &str| {
-        serde_json::json!({
-            "type": "assistant",
-            "sessionId": "trunc",
-            "cwd": "/repo",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": id, "name": "Bash", "input": { "command": "ls" } }
-                ]
-            }
-        })
-        .to_string()
-    };
+    let tool_line = |id: &str| copilot_tool_line(id, "bash").to_string();
 
     // Long first line so the cursor advances well past a later short one.
     let long = tool_line("tu_long") + &" ".repeat(400);
@@ -251,27 +203,15 @@ async fn watcher_resets_cursor_on_truncation_below_cursor() {
 #[tokio::test]
 async fn watcher_skips_non_utf8_line_and_keeps_going() {
     let dir = TempDir::new().unwrap();
-    let projects_root = dir.path().to_path_buf();
-    let project_dir = projects_root.join("proj-nonutf8");
-    tokio::fs::create_dir_all(&project_dir).await.unwrap();
-    let transcript = project_dir.join("nonutf8.jsonl");
+    let session_dir = dir.path().join("nonutf8");
+    tokio::fs::create_dir_all(&session_dir).await.unwrap();
+    let transcript = session_dir.join("events.jsonl");
 
     let (tx, mut rx) = mpsc::channel::<(Transport, AgentEvent)>(32);
-    let watcher = cc_watcher(projects_root.clone());
-    let handle = tokio::spawn(async move { watcher.run(tx).await });
+    let handle = spawn_copilot(dir.path().to_path_buf(), tx);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let valid = serde_json::json!({
-        "type": "assistant",
-        "sessionId": "nonutf8",
-        "cwd": "/repo",
-        "message": {
-            "role": "assistant",
-            "content": [
-                { "type": "tool_use", "id": "tu_valid", "name": "Bash", "input": { "command": "ls" } }
-            ]
-        }
-    });
+    let valid = copilot_tool_line("tu_valid", "bash");
     // Invalid-UTF8 bytes can't go through serde_json — write them raw.
     let mut bytes: Vec<u8> = vec![0xff, 0xfe, b'\n'];
     bytes.extend_from_slice(format!("{valid}\n").as_bytes());
