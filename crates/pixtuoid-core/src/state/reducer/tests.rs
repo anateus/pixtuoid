@@ -70,6 +70,7 @@ fn delegating_slot_with_hook_silent_caps_gets_waiting_window() {
         has_exit_signal: true,
         resurrects_on_prompt: true,
         delegations_are_hook_silent: true,
+        child_ends_unannounced: false,
     };
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
@@ -139,6 +140,7 @@ fn generic_tool_displaying_delegating_keeps_the_active_window() {
         has_exit_signal: true,
         resurrects_on_prompt: true,
         delegations_are_hook_silent: true,
+        child_ends_unannounced: false,
     };
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
@@ -271,14 +273,17 @@ fn authorizes_decides_each_attempt_by_the_end_it_meets() {
     use std::time::{Duration, SystemTime};
 
     let id = AgentId::from_parts("codex", "s");
+    let parent = AgentId::from_parts("codex", "p");
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let ms = Duration::from_millis(1);
     let (root, child) = (
-        Attempt::Start { parented: false },
-        Attempt::Start { parented: true },
+        Attempt::Start { parent: None },
+        Attempt::Start {
+            parent: Some(parent),
+        },
     );
     let (hook, jsonl) = (Transport::Hook, Transport::Jsonl);
-    use Verdict::{Create, Refuse};
+    use Verdict::{Create, Readmit, Refuse};
 
     // No slot: the attempt meets only the recorded end.
     for (end, rows) in [
@@ -346,7 +351,13 @@ fn authorizes_decides_each_attempt_by_the_end_it_meets() {
                     t0 + STRAGGLER_TTL - ms,
                     Refuse(Refusal::Straggler),
                 ),
-                (Attempt::HookActivity, hook, t0 + STRAGGLER_TTL, Create),
+                (
+                    Attempt::HookActivity,
+                    hook,
+                    t0 + STRAGGLER_TTL,
+                    Refuse(Refusal::ChildEnded),
+                ),
+                (Attempt::HookActivity, hook, t0 + CHILD_END_GATE_TTL, Create),
                 (
                     child,
                     jsonl,
@@ -376,6 +387,38 @@ fn authorizes_decides_each_attempt_by_the_end_it_meets() {
                 now.duration_since(t0)
             );
         }
+    }
+
+    // An end pixtuoid only inferred: no straggler window, and a hook re-admits
+    // the child under its live parent, explicit or remembered.
+    let mut r = super::Reducer::new();
+    let mut scene = SceneState::uniform(4);
+    r.apply(
+        &mut scene,
+        AgentEvent::SessionStart {
+            agent_id: parent,
+            source: "codex".into(),
+            session_id: "p".into(),
+            cwd: PathBuf::from("/repo"),
+            parent_id: None,
+        },
+        t0,
+        Transport::Hook,
+    );
+    r.corr.link_applied_parent(id, parent);
+    r.corr.note_removed(id, t0);
+    for (attempt, from, want) in [
+        (child, hook, Readmit(parent)),
+        (child, jsonl, Refuse(Refusal::ChildEnded)),
+        (Attempt::Identity, hook, Readmit(parent)),
+        (Attempt::HookActivity, hook, Readmit(parent)),
+        (root, jsonl, Create),
+    ] {
+        assert_eq!(
+            r.authorizes(&scene, id, attempt, from, t0 + ms),
+            want,
+            "{from:?}"
+        );
     }
 
     // A slot: only a parentless start of an exiting root revives it, and a
@@ -762,6 +805,7 @@ fn child_lifecycle_is_stamped_on_sweep_and_pruned_by_gc() {
     use crate::AgentId;
     use crate::source::{AgentEvent, Transport};
     use crate::state::SceneState;
+    use crate::state::correlation::ChildEnd;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
@@ -795,7 +839,7 @@ fn child_lifecycle_is_stamped_on_sweep_and_pruned_by_gc() {
     );
     let entry = r.corr.lifecycles.get(&child).expect("child link recorded");
     assert_eq!(entry.parent_id, Some(parent));
-    assert!(entry.child_ended_at.is_none(), "alive — no gc clock yet");
+    assert!(entry.child_end.is_none(), "alive — no gc clock yet");
 
     // Neither end below is `as_child`, so only sweep_exited can stamp the clock.
     r.apply(
@@ -814,8 +858,8 @@ fn child_lifecycle_is_stamped_on_sweep_and_pruned_by_gc() {
         r.corr
             .lifecycles
             .get(&child)
-            .is_some_and(|e| e.child_ended_at.is_some()),
-        "sweep_exited must stamp child_ended_at for a child whose end wasn't as_child"
+            .is_some_and(|e| matches!(e.child_end, Some(ChildEnd::Inferred(_)))),
+        "sweep_exited must stamp an inferred end for a child whose end wasn't as_child"
     );
 
     r.tick(

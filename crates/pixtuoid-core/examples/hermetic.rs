@@ -850,10 +850,13 @@ mod run {
         ("USERPROFILE", "home"),
         ("APPDATA", "home/AppData/Roaming"),
         ("LOCALAPPDATA", "home/AppData/Local"),
-        ("XDG_CONFIG_HOME", "xdg/config"),
-        ("XDG_DATA_HOME", "xdg/data"),
-        ("XDG_STATE_HOME", "xdg/state"),
-        ("XDG_CACHE_HOME", "xdg/cache"),
+        // Each at its default under the home: reasonix refuses to link a
+        // plugin from outside it
+        // (`internal/ext/installsource/plugin_package.go:480-481` at v2.39.0).
+        ("XDG_CONFIG_HOME", "home/.config"),
+        ("XDG_DATA_HOME", "home/.local/share"),
+        ("XDG_STATE_HOME", "home/.local/state"),
+        ("XDG_CACHE_HOME", "home/.cache"),
     ];
 
     impl Sandbox {

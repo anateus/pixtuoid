@@ -5,7 +5,9 @@ use std::time::{Duration, SystemTime};
 use crate::AgentId;
 use crate::source::decoder::label_prefix_for;
 use crate::source::{AgentEvent, Transport};
-use crate::state::correlation::{Correlation, ToolEventKind, elapsed_at_least, elapsed_past};
+use crate::state::correlation::{
+    ChildEnd, Correlation, ToolEventKind, elapsed_at_least, elapsed_past,
+};
 use crate::state::{ActivityState, AgentSlot, SceneState, ToolKind, fsm, scope};
 
 #[doc(hidden)]
@@ -148,7 +150,7 @@ fn backfill_identity<'a>(slot: &mut AgentSlot, ctx: IdentityCtx<'a>) -> Option<&
 enum Attempt {
     /// A `SessionStart`, judged on the parent it names itself, before its
     /// remembered parent is adopted.
-    Start { parented: bool },
+    Start { parent: Option<AgentId> },
     /// A hook `Identity` (#221), which names no parent.
     Identity,
     /// A hook tool or permission event that shows activity, synthesizing a slot.
@@ -159,6 +161,9 @@ enum Attempt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verdict {
     Create,
+    /// Create under this live parent, explicit or remembered: a hook disproved
+    /// an end pixtuoid only inferred.
+    Readmit(AgentId),
     /// Fold into the id's slot, and resurrect it in place when `revive`.
     Enrich {
         revive: bool,
@@ -172,7 +177,7 @@ enum Verdict {
 enum Refusal {
     /// An event of a life that ended within the straggler window (#242).
     Straggler,
-    /// A parented re-registration of a child that already ended (#244).
+    /// A re-registration of a child that already ended (#244).
     ChildEnded,
     /// A transcript sight of a top-level life a hook ended.
     HookOwnsRevival,
@@ -230,7 +235,9 @@ struct TaskTracking {
 #[derive(Debug, Default)]
 pub struct Reducer {
     corr: Correlation,
-    /// Parents whose last Task drained, awaiting the deferred b1 cascade
+    /// Parents whose last Task drained, or whose id-less Task ended on a
+    /// [`child_ends_unannounced`](crate::source::registry::SourceCaps::child_ends_unannounced)
+    /// source, awaiting the deferred b1 cascade
     /// ([`B1_CASCADE_GRACE`]) — fired only if `active_tasks` is STILL empty at
     /// fire time, which is how a Task insert inside the grace defuses it
     /// (#151).
@@ -447,6 +454,25 @@ impl Reducer {
             }
         }
 
+        // Per-connection hook delivery can decode a call's End before its Start
+        // (#242); that Start would open a call that already returned.
+        if from == Transport::Hook
+            && let AgentEvent::ActivityStart {
+                tool_use_id: Some(tuid),
+                detail,
+                ..
+            } = event
+            && self
+                .corr
+                .recent_hook_tool_uses
+                .get(&(id, tuid.clone()))
+                .is_some_and(|(_, kind)| *kind == ToolEventKind::End)
+        {
+            // The call did run.
+            self.count_call(scene, id, Some(tuid), detail, now);
+            return Preprocessed::Drop;
+        }
+
         // Gated on the slot EXISTING: a synthesis REFUSED for desk exhaustion
         // would leave a record that dedup-eats the JSONL registration's Start.
         if from == Transport::Hook
@@ -605,6 +631,20 @@ impl Reducer {
         // Idle: nothing would restore Delegating for the rest of the run.
         let delegating_tuid = self.corr.any_active_task(&agent_id);
         if let Some(slot) = scene.agents.get_mut(&agent_id) {
+            let untracked_task = matches!(
+                slot.state,
+                ActivityState::Active {
+                    kind: ToolKind::Task,
+                    tool_use_id: None,
+                    ..
+                }
+            );
+            if untracked_task
+                && crate::source::registry::descriptor_for(&slot.source)
+                    .is_some_and(|d| d.caps().child_ends_unannounced)
+            {
+                self.pending_b1_cascades.insert(agent_id, now);
+            }
             if matches!(slot.state, ActivityState::Active { .. }) || resolves_wait {
                 match delegating_tuid {
                     Some(tuid) => fsm::enter_delegating(slot, Some(tuid), now),
@@ -712,8 +752,9 @@ impl Reducer {
             // Identity is hook-only, so the process is alive: a JSONL-seeded
             // unknown-cwd flag must not keep `STALE_UNKNOWN_CWD_TIMEOUT` armed.
             slot.unknown_cwd = false;
-        } else if self.authorizes(scene, agent_id, Attempt::Identity, from, now) == Verdict::Create
-            && self.register_slot(scene, agent_id, ctx, None, now)
+        } else if let Some(parent) =
+            self.parent_to_create(scene, agent_id, ctx, Attempt::Identity, from, now)
+            && self.register_and_link(scene, agent_id, ctx, parent, now)
             && let Some(slot) = scene.agents.get_mut(&agent_id)
         {
             slot.unknown_cwd = false;
@@ -767,8 +808,8 @@ impl Reducer {
         from: Transport,
         now: SystemTime,
     ) {
-        let parented = parent_id.is_some();
-        let verdict = self.authorizes(scene, agent_id, Attempt::Start { parented }, from, now);
+        let attempt = Attempt::Start { parent: parent_id };
+        let verdict = self.authorizes(scene, agent_id, attempt, from, now);
         if let Verdict::Refuse(refusal) = verdict {
             refusal.log_start(agent_id, ctx, parent_id);
             return;
@@ -776,11 +817,9 @@ impl Reducer {
         let parent_id = self.resolve_parent_link(scene, agent_id, ctx, parent_id);
         if let Verdict::Enrich { revive } = verdict {
             self.enrich_existing_start(scene, agent_id, ctx, parent_id, revive, now);
-        } else if self.register_slot(scene, agent_id, ctx, parent_id, now) {
+        } else {
             // A desk-exhaustion refusal records nothing — nothing registered.
-            if let Some(p) = parent_id {
-                self.corr.link_applied_parent(agent_id, p);
-            }
+            self.register_and_link(scene, agent_id, ctx, parent_id, now);
         }
     }
 
@@ -796,7 +835,7 @@ impl Reducer {
         now: SystemTime,
     ) -> Verdict {
         let corr = &self.corr;
-        let starts_fresh = attempt == Attempt::Start { parented: false };
+        let starts_fresh = attempt == Attempt::Start { parent: None };
         // A transcript's first sight proves only that a file exists: codex
         // writes its rollout at exit, after its hook end.
         let revival_owned =
@@ -811,21 +850,33 @@ impl Reducer {
             return Verdict::Enrich { revive };
         }
         let refusal = match attempt {
-            Attempt::Start { parented: false } if revival_owned => Some(Refusal::HookOwnsRevival),
-            Attempt::Start { parented: false } => None,
+            Attempt::Start { parent: None } if revival_owned => Some(Refusal::HookOwnsRevival),
+            Attempt::Start { parent: None } => None,
             // #242: hook deliveries ride per-connection tasks, so an end can be
             // DECODED ahead of its life's trailing events.
             _ if corr.ended_within_straggler_window(id, now) => Some(Refusal::Straggler),
-            Attempt::HookActivity => None,
-            // #244-w2: an Identity carries no parent, so without this an omp
-            // batch whose parented Start was just refused would re-register the
-            // ended child parentless one event later.
-            Attempt::Start { parented: true } | Attempt::Identity
-                if corr.child_recently_ended(id, now) =>
-            {
-                Some(Refusal::ChildEnded)
-            }
-            Attempt::Start { parented: true } | Attempt::Identity => None,
+            // #244-w2: inside the child gate a registration is the dead child's
+            // late echo; an Identity or a hook activity names no parent, so
+            // without this an omp batch whose parented Start was just refused
+            // would re-register the ended child parentless one event later.
+            _ => match corr.recent_child_end(id, now) {
+                None => None,
+                // A hook after an end pixtuoid only inferred proves the child
+                // alive, under a parent that still is.
+                Some(ChildEnd::Inferred(_)) if from == Transport::Hook => {
+                    let parent = match attempt {
+                        Attempt::Start { parent } => parent,
+                        Attempt::Identity | Attempt::HookActivity => corr.remembered_parent(id),
+                    };
+                    if let Some(p) = parent
+                        && scene.agents.get(&p).is_some_and(|s| s.exiting_at.is_none())
+                    {
+                        return Verdict::Readmit(p);
+                    }
+                    Some(Refusal::ChildEnded)
+                }
+                Some(_) => Some(Refusal::ChildEnded),
+            },
         };
         refusal.map_or(Verdict::Create, Verdict::Refuse)
     }
@@ -935,29 +986,63 @@ impl Reducer {
         id: AgentId,
         now: SystemTime,
     ) {
-        // A blank Idle ghost of a DEAD session is unremovable.
-        if !event.shows_activity()
-            || self.authorizes(scene, id, Attempt::HookActivity, Transport::Hook, now)
-                != Verdict::Create
-        {
+        if !event.shows_activity() {
             return;
         }
-        if self.register_slot(
-            scene,
-            id,
-            IdentityCtx {
-                source: "",
-                session_id: "",
-                cwd: std::path::Path::new(""),
-            },
-            None,
-            now,
-        ) && let Some(slot) = scene.agents.get_mut(&id)
+        let ctx = IdentityCtx {
+            source: "",
+            session_id: "",
+            cwd: std::path::Path::new(""),
+        };
+        // A blank Idle ghost of a DEAD session is unremovable.
+        let Some(parent) =
+            self.parent_to_create(scene, id, ctx, Attempt::HookActivity, Transport::Hook, now)
+        else {
+            return;
+        };
+        if self.register_and_link(scene, id, ctx, parent, now)
+            && let Some(slot) = scene.agents.get_mut(&id)
         {
             // NOT an unknown-cwd ghost: that reap targets startup
             // JSONL-seeding artifacts, and a hook proves this one alive.
             slot.unknown_cwd = false;
         }
+    }
+
+    /// [`Reducer::authorizes`] for an arm whose event names no parent: `None`
+    /// when it may not create, else the parent to create under. A re-admission
+    /// takes its parent through [`Reducer::resolve_parent_link`], so the cycle
+    /// refusal runs on it too.
+    fn parent_to_create(
+        &self,
+        scene: &SceneState,
+        id: AgentId,
+        ctx: IdentityCtx,
+        attempt: Attempt,
+        from: Transport,
+        now: SystemTime,
+    ) -> Option<Option<AgentId>> {
+        match self.authorizes(scene, id, attempt, from, now) {
+            Verdict::Create => Some(None),
+            Verdict::Readmit(p) => Some(self.resolve_parent_link(scene, id, ctx, Some(p))),
+            Verdict::Enrich { .. } | Verdict::Refuse(_) => None,
+        }
+    }
+
+    /// [`Reducer::register_slot`], recording the link it applies.
+    fn register_and_link(
+        &mut self,
+        scene: &mut SceneState,
+        id: AgentId,
+        ctx: IdentityCtx,
+        parent: Option<AgentId>,
+        now: SystemTime,
+    ) -> bool {
+        let registered = self.register_slot(scene, id, ctx, parent, now);
+        if registered && let Some(p) = parent {
+            self.corr.link_applied_parent(id, p);
+        }
+        registered
     }
 
     /// The slot-creation half of the `SessionStart` arm, shared with
