@@ -220,15 +220,17 @@ const USER: &str = "user";
 /// by `the_decoded_set_is_exactly_what_the_arms_match`.
 const DECODED_TYPES: &[&str] = &[ASSISTANT, USER];
 
-/// Does this line carry a turn's payload? `message.role` + `message.content` is
-/// what a renamed [`DECODED_TYPES`] member would still arrive with, so it
-/// separates a rename from a merely-new sidecar type WITHOUT mirroring CC's
-/// vocabulary — the mirror is what put a drift alarm in front of every user the
-/// day CC added `history-suppression` (#935).
-fn carries_turn_payload(obj: &serde_json::Map<String, Value>) -> bool {
-    obj.get("message")
-        .and_then(Value::as_object)
-        .is_some_and(|m| m.contains_key("role") && m.contains_key("content"))
+/// Is this line a turn's record? A timestamped `message.role` +
+/// `message.content` is what a renamed [`DECODED_TYPES`] member would still
+/// arrive with, so it separates a rename from a merely-new sidecar type WITHOUT
+/// mirroring CC's vocabulary (#935); `api-request-blob` stores a request's
+/// message untimestamped (#1694).
+fn is_turn_record(obj: &serde_json::Map<String, Value>) -> bool {
+    obj.contains_key("timestamp")
+        && obj
+            .get("message")
+            .and_then(Value::as_object)
+            .is_some_and(|m| m.contains_key("role") && m.contains_key("content"))
 }
 
 /// The `attributionAgent` label, namespace-stripped and capped. `None` for an
@@ -303,7 +305,7 @@ pub fn decode_cc_line(transcript_path: &str, source: &str, v: Value) -> Result<V
         if message.is_none() {
             crate::source::drift::missing_field(source, ty, "message");
         }
-    } else if !ty.is_empty() && carries_turn_payload(obj) {
+    } else if !ty.is_empty() && is_turn_record(obj) {
         crate::source::drift::unknown_event(source, ty);
     }
 
@@ -397,7 +399,7 @@ pub fn decode_cc_line(transcript_path: &str, source: &str, v: Value) -> Result<V
 
 /// The CC transcript types whose lines are AGENT TURN activity — membership by
 /// TURN-AUTHORSHIP, not by whether we decode the type. Anything else is session
-/// metadata unless it carries the turn payload (see `cc_activity_recency`): a
+/// metadata unless it is a turn record (see `cc_activity_recency`): a
 /// STARTING session writes `bridge-session` / `pr-link` runs into an OTHER,
 /// long-dead transcript, bumping the mtime first-sight trusted as liveness.
 const ACTIVITY_TYPES: &[&str] = &[
@@ -421,13 +423,13 @@ pub(crate) fn admits_transcript(path: &Path) -> bool {
 
 /// Whether one tail line is a turn: `None` when it classifies as NOTHING — a
 /// non-object, or an object with no `type` — which is not evidence the recent
-/// bytes were metadata. An UNNAMED type still counts as a turn when it carries
-/// the turn payload; the day CC renames one, reading it as "not a turn" would
+/// bytes were metadata. An UNNAMED type still counts as a turn when it is a
+/// turn record; the day CC renames one, reading it as "not a turn" would
 /// gate every live session at once.
 fn classifies_as_turn(v: &Value) -> Option<bool> {
     let obj = v.as_object()?;
     let ty = obj.get("type").and_then(|t| t.as_str())?;
-    Some(ACTIVITY_TYPES.contains(&ty) || carries_turn_payload(obj))
+    Some(ACTIVITY_TYPES.contains(&ty) || is_turn_record(obj))
 }
 
 /// When this transcript's SESSION last wrote, read from its tail — the honest
@@ -536,6 +538,7 @@ mod tests {
         let out = crate::test_capture::capture_logs(|| {
             let line = json!({
                 "type": "assistant-v2",
+                "timestamp": "2026-10-17T00:00:00Z",
                 "message": {"role": "assistant", "content": [], "model": "m"},
             });
             let _ = decode_cc_line("/p/s.jsonl", SOURCE_NAME, line);
@@ -561,6 +564,7 @@ mod tests {
             for ty in DECODED_TYPES {
                 let line = json!({
                     "type": ty,
+                    "timestamp": "2026-10-17T00:00:00Z",
                     "message": {"role": "assistant", "content": [block(ty)]},
                 });
                 assert!(
@@ -1119,9 +1123,13 @@ mod tests {
                 // corpus-sampled and abridged).
                 json!({"type": "atis-latch", "atis": "", "sessionId": "s"}),
                 json!({"type": "cost-state", "totalCostUSD": 0.5, "sessionId": "s"}),
+                // #1694's: a request message stored by hash since CC 2.1.300,
+                // message-shaped but untimestamped.
+                json!({"type": "api-request-blob", "hash": "h", "sessionId": "s",
+                       "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}}),
                 // TYPELESS but payload-carrying: the `!ty.is_empty()` guard, or
                 // the breadcrumb names nothing at all.
-                json!({"message": {"role": "assistant", "content": []}}),
+                json!({"timestamp": "t", "message": {"role": "assistant", "content": []}}),
                 json!({"type": "mode", "mode": "acceptEdits"}),
                 json!({"type": "last-prompt", "prompt": "hi"}),
                 json!({"type": "worktree-state"}),
