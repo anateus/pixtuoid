@@ -14,6 +14,8 @@ use crate::harness::CaptureRecord;
 use crate::source::registry;
 
 pub mod bump;
+pub mod digest;
+mod literals;
 pub mod pin;
 pub mod tui;
 pub mod verify;
@@ -79,18 +81,21 @@ pub enum Package {
     Npm(&'static str),
     /// A prebuilt binary attached to a `v<version>` GitHub release.
     GithubRelease {
-        /// The source's drift-watched repository.
-        repo: &'static crate::source::upstream::Repo,
+        /// Its repository's `owner/name` as GitHub spells it now: an old name
+        /// redirects only until it is reused
+        /// (docs.github.com/en/repositories/creating-and-managing-repositories/renaming-a-repository).
+        repo: &'static str,
         /// Each platform's binary, as `(OS, ARCH, asset)` in
         /// [`std::env::consts`]' spelling.
         assets: &'static [(&'static str, &'static str, &'static str)],
         /// The release's file that must vouch for the download
-        /// ([`crate::source::upstream::vouches`]).
+        /// ([`digest::vouches`]).
         sums: &'static str,
     },
-    /// The `v<version>` tag of a source's drift-watched repository, synced from
-    /// its committed `uv.lock`.
-    UvLocked(&'static crate::source::upstream::Repo),
+    /// The `v<version>` tag of the repository it names (spelled as
+    /// [`GithubRelease`](Self::GithubRelease)'s `repo`), synced from its
+    /// committed `uv.lock`.
+    UvLocked(&'static str),
     /// The build an updater's per-platform manifest (`{"version", "url",
     /// "sha512"}`) names: the current one live, a pinned one from the lock
     /// `--record` writes ([`Profile::manifest_lock`]).
@@ -259,6 +264,10 @@ pub struct Profile {
     /// yet, as `(kind, path)` the field census names them. Shrink-only: a run
     /// that carries one is Stale.
     pub(crate) not_yet_fields: &'static [(&'static str, &'static str)],
+    /// Literals a decoder reads that no scenario fixture of this profile holds
+    /// yet and no other owed list names ([`literals`]). Shrink-only: a fixture
+    /// that holds one, or a run that would keep one once stripped, leaves it.
+    pub(crate) not_yet_literals: &'static [&'static str],
     /// Whether a child may name no cwd of its own, running where its parent
     /// does.
     pub(crate) children_inherit_cwd: bool,
@@ -685,8 +694,13 @@ pub const PROFILES: &[Profile] = &[
         event_name: hook_event_name,
         not_yet_fields: &[
             // aimock's Messages usage is input and output tokens alone
-            // (`CopilotKit/aimock` `src/messages.ts:405-414` at v1.43.0).
+            // (`CopilotKit/aimock` `src/messages.ts:413-421` at v1.45.1).
             ("tx:assistant", "/message/usage/cache_creation_input_tokens"),
+        ],
+        not_yet_literals: &[
+            "ultra_effort_enter",
+            "ultra_effort_exit",
+            "ultrathink_effort",
         ],
         children_inherit_cwd: false,
         result_unseen: false,
@@ -824,7 +838,7 @@ trust_level = "trusted"
         not_yet: &[],
         event_name: hook_event_name,
         // aimock's Responses usage has no token details (`CopilotKit/aimock`
-        // `src/responses.ts:266-279` at v1.43.0).
+        // `src/responses.ts:543-556` at v1.45.1).
         not_yet_fields: &[
             (
                 "tx:event_msg",
@@ -835,6 +849,7 @@ trust_level = "trusted"
                 "/payload/info/last_token_usage/reasoning_output_tokens",
             ),
         ],
+        not_yet_literals: &[],
         children_inherit_cwd: false,
         result_unseen: false,
         live: None,
@@ -962,6 +977,7 @@ trust_level = "trusted"
         not_yet: &["session.deleted", "session.execution.interrupted"],
         event_name: type_field,
         not_yet_fields: &[],
+        not_yet_literals: &[],
         children_inherit_cwd: false,
         result_unseen: false,
         live: None,
@@ -1049,6 +1065,7 @@ trust_level = "trusted"
         not_yet: &[],
         event_name: dsh_event,
         not_yet_fields: &[],
+        not_yet_literals: &[],
         children_inherit_cwd: false,
         result_unseen: false,
         live: None,
@@ -1120,6 +1137,7 @@ trust_level = "trusted"
         not_yet: &[],
         event_name: hook_event_name,
         not_yet_fields: &[],
+        not_yet_literals: &[],
         children_inherit_cwd: false,
         result_unseen: false,
         live: None,
@@ -1241,6 +1259,7 @@ trust_level = "trusted"
         not_yet: &["PostToolUseFailure"],
         event_name: grok_event,
         not_yet_fields: &[],
+        not_yet_literals: &["elicitation_dialog", "run_in_background"],
         children_inherit_cwd: false,
         result_unseen: false,
         live: None,
@@ -1365,6 +1384,7 @@ model = "deepseek-v4-flash"
         not_yet: &[],
         event_name: event_field,
         not_yet_fields: &[],
+        not_yet_literals: &[":guardian", ":planner"],
         children_inherit_cwd: false,
         result_unseen: false,
         live: None,
@@ -1454,6 +1474,7 @@ model = "deepseek-v4-flash"
                 "/data/tokenDetails/output/tokenCount",
             ),
         ],
+        not_yet_literals: &["session.resume", "session.task_complete", "subagent.failed"],
         // A `subagent.started` child runs in-process, in the parent's transcript,
         // and no event of it names a cwd.
         children_inherit_cwd: true,
@@ -1469,7 +1490,7 @@ model = "deepseek-v4-flash"
         // `engines`), and `scripts/install.sh` fetches from build.stencil.so
         // and runs `omp --version` under the operator's home (`:21`, `:331`).
         package: Package::GithubRelease {
-            repo: &crate::source::omp::REPO,
+            repo: "can1357/oh-my-pi",
             // `scripts/ci-build-upload.ts:39-48`, glibc's on Linux.
             assets: &[
                 ("macos", "aarch64", "omp-darwin-arm64"),
@@ -1568,6 +1589,7 @@ async:
                 "/message/content/*/arguments/questions/*/question",
             ),
         ],
+        not_yet_literals: &["ask", "previousSessionFile"],
         children_inherit_cwd: false,
         result_unseen: false,
         live: None,
@@ -1581,7 +1603,7 @@ async:
         // (`website/docs/getting-started/updating.md:33-36`). Its installer
         // would rewrite the operator's shell rc files and run `sudo -n -v`
         // (`scripts/install.sh:851-853`, `:882-908`).
-        package: Package::UvLocked(&crate::source::hermes::REPO),
+        package: Package::UvLocked("NousResearch/hermes-agent"),
         // `-z` is one turn that approves every tool (`hermes_cli/oneshot.py:275-277`),
         // and a hook runs only once accepted.
         invocation: &["hermes", "--accept-hooks", "-z", "{prompt}"],
@@ -1650,6 +1672,7 @@ telemetry:
         not_yet: &[],
         event_name: hook_event_name,
         not_yet_fields: &[],
+        not_yet_literals: &[],
         children_inherit_cwd: false,
         result_unseen: false,
         live: None,
@@ -1709,6 +1732,7 @@ telemetry:
         not_yet: &[],
         event_name: shim_stamped_event,
         not_yet_fields: &[],
+        not_yet_literals: &["ask_question"],
         children_inherit_cwd: false,
         // agy returns a result under role `model`, and aimock's Gemini route
         // reads one only under `user` (`@copilotkit/aimock` `dist/gemini.js:55-71`).
@@ -1799,6 +1823,7 @@ telemetry:
         not_yet: &[],
         event_name: type_field,
         not_yet_fields: &[],
+        not_yet_literals: &[],
         children_inherit_cwd: false,
         result_unseen: false,
         live: Some(Live {
@@ -2026,22 +2051,6 @@ mod tests {
         sharded.sort_unstable();
         profiled.sort_unstable();
         assert_eq!(sharded, profiled);
-    }
-
-    #[test]
-    fn the_drift_watchs_npm_release_installs_the_profiles_package() {
-        use crate::source::upstream::Release;
-        for (source, repo) in [
-            ("opencode", crate::source::opencode::REPO),
-            ("dsh", crate::source::dsh::REPO),
-            ("reasonix", crate::source::reasonix::REPO),
-        ] {
-            let Release::Npm { package, .. } = repo.release else {
-                panic!("{source}'s watch reads its npm release");
-            };
-            let p = profile(source).expect("profiled");
-            assert_eq!(p.package, Package::Npm(package), "{source}");
-        }
     }
 
     #[test]

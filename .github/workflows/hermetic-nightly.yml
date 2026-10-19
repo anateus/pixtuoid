@@ -1,7 +1,7 @@
 name: hermetic-nightly
 
-# The drift watch: each profiled CLI's latest release against the scripted
-# model, where a CLI that renamed or reshaped what pixtuoid reads turns a
+# Each profiled CLI's latest release against the scripted model, where a CLI
+# that renamed or reshaped what pixtuoid reads in a recorded scenario turns a
 # verdict red before a user upgrades into it.
 
 on:
@@ -194,7 +194,7 @@ jobs:
   file:
     name: file the hermetic report
     needs: drift
-    # A dispatch on a branch is a pre-merge proof, not the watch.
+    # A dispatch on a branch is a pre-merge proof, not the nightly's verdict.
     if: ${{ always() && github.ref == 'refs/heads/main' && needs.drift.result == 'failure' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
