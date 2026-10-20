@@ -36,14 +36,14 @@ mod recorder {
     const SEED_ENV: &str = "CAPTURE_SEED";
 
     use pixtuoid_core::harness::hermetic::{
-        self, MANIFEST, Manifest, PROMPT_PLACEHOLDER, SESSION_PLACEHOLDER,
+        self, MANIFEST, Manifest, PROMPT_PLACEHOLDER, PerOs, SESSION_PLACEHOLDER,
     };
     use pixtuoid_core::harness::host::{
         RELEASE_PATIENCE, create_private_dir, hold_lock, owned_by_us, remove_once_released,
     };
     use pixtuoid_core::harness::recorder_flag::{
-        CLI_VERSION, DAEMON, DAEMON_READY, ENV, OUT, PREPARE_ROOT, PROMOTE, RESUME, TEE, WITHIN,
-        WORKSPACE,
+        CLI_VERSION, DAEMON, DAEMON_ENV, DAEMON_READY, ENV, OUT, PREPARE_ROOT, PROMOTE, RESUME,
+        TEE, WITHIN, WORKSPACE,
     };
     use pixtuoid_core::harness::tap::{Endpoint, Tap};
     use pixtuoid_core::harness::{
@@ -130,12 +130,13 @@ mod recorder {
         resume: Vec<String>,
     }
 
-    /// A [`DAEMON`]'s words, and its [`DAEMON_READY`] probe's: what exits 0
-    /// once it serves.
+    /// A [`DAEMON`]'s words, its [`DAEMON_READY`] probe's (what exits 0 once
+    /// it serves), and the [`DAEMON_ENV`] its spawn alone gets.
     #[derive(Debug, Default, Clone, PartialEq)]
     struct DaemonCmd {
         start: Vec<String>,
         ready: Vec<String>,
+        env: Vec<(String, String)>,
     }
 
     impl Options {
@@ -174,6 +175,14 @@ mod recorder {
             args.remove(0);
             Ok(args.remove(0))
         };
+        // A `KEY=VALUE` flag's pair.
+        let pair = |args: &mut Vec<String>, flag: &str| {
+            let value = take(args, flag)?;
+            value
+                .split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .ok_or_else(|| format!("{flag} takes KEY=VALUE, got {value:?}"))
+        };
         while let Some(flag) = args.first().cloned() {
             match flag.as_str() {
                 OUT => options.out = Some(PathBuf::from(take(&mut args, OUT)?)),
@@ -196,14 +205,9 @@ mod recorder {
                 }
                 DAEMON => daemon.start.push(take(&mut args, DAEMON)?),
                 DAEMON_READY => daemon.ready.push(take(&mut args, DAEMON_READY)?),
+                DAEMON_ENV => daemon.env.push(pair(&mut args, DAEMON_ENV)?),
                 RESUME => options.resume.push(take(&mut args, RESUME)?),
-                ENV => {
-                    let value = take(&mut args, ENV)?;
-                    let (k, v) = value
-                        .split_once('=')
-                        .ok_or_else(|| format!("{ENV} takes KEY=VALUE, got {value:?}"))?;
-                    options.env.push((k.to_string(), v.to_string()));
-                }
+                ENV => options.env.push(pair(&mut args, ENV)?),
                 _ => break,
             }
         }
@@ -215,9 +219,6 @@ mod recorder {
         if daemon != DaemonCmd::default() {
             if daemon.start.is_empty() || daemon.ready.is_empty() {
                 return Err(format!("{DAEMON} and {DAEMON_READY} come together"));
-            }
-            if let Some(why) = hermetic::Daemon::not_run_on(cfg!(windows)) {
-                return Err(format!("{DAEMON}: {why}"));
             }
             options.daemon = Some(daemon);
         }
@@ -293,7 +294,7 @@ mod recorder {
             eprintln!(
                 "usage: capture_fixture [{OUT} <dir>] [{TEE} <socket|pipe>] [{WITHIN} <dir>] [{ENV} K=V]... \
                  [{CLI_VERSION} <version>] [{WORKSPACE} <dir>] [{DAEMON} <word>]... [{DAEMON_READY} <word>]... \
-                 [{RESUME} <word>]... \
+                 [{DAEMON_ENV} K=V]... [{RESUME} <word>]... \
                  <source-id> <scenario> <cmd...>   \
                  ('{PROMPT_PLACEHOLDER}' expands)\n       \
                  capture_fixture --strip-corpus   (strip every committed capture in place)\n       \
@@ -355,6 +356,7 @@ mod recorder {
         };
         let daemon = match RunningDaemon::start(
             options.daemon.as_ref(),
+            *DAEMON_BOOT.here(),
             &workspace,
             &wiring,
             descriptor.verified_version,
@@ -408,14 +410,10 @@ mod recorder {
         };
         let unresumed = !options.resume.is_empty() && resumed.is_none();
         let note_survived = note_survived(&workspace);
-        drop(daemon);
+        let daemon_stop = daemon.map_or(Ok(()), |d| d.stop(*DAEMON_STOP_GRACE.here()));
         tap.settle();
         let payloads = tap.payloads();
-        let incomplete = tap.stopped().map(|why| {
-            std::io::Error::other(format!(
-                "the tap stopped accepting, so this capture is incomplete: {why}"
-            ))
-        });
+        let incomplete = incomplete(tap.stopped(), daemon_stop);
 
         // A committed capture is complete or not written at all.
         let incomplete = match incomplete {
@@ -919,23 +917,42 @@ mod recorder {
         Ok(c)
     }
 
-    /// How long a daemon may take to exit after SIGTERM before it is killed.
-    #[cfg(unix)]
-    const DAEMON_STOP_GRACE: Duration = Duration::from_secs(30);
-    /// How long one readiness probe may take before it is killed and read as
-    /// a no: a probe that blocked would hold the wait past [`BOOT`].
-    const DAEMON_PROBE_BUDGET: Duration = Duration::from_secs(5);
+    /// How long a daemon gets to serve: its cold boot and a cold-starting probe
+    /// after it, which on Windows outlast the rig's [`BOOT`].
+    const DAEMON_BOOT: PerOs<Duration> = PerOs {
+        unix: BOOT,
+        windows: Duration::from_secs(120),
+    };
+    /// How long a daemon may take to exit once its stdin closed: a kill would
+    /// lose its shutdown hooks' last sends, and openclaw's Windows stop,
+    /// `process.exit` included, outlasts the Unix grace.
+    const DAEMON_STOP_GRACE: PerOs<Duration> = PerOs {
+        unix: Duration::from_secs(30),
+        windows: Duration::from_secs(150),
+    };
+    /// How many last lines of its log, and of its probes' when it never served,
+    /// a daemon that never served or never stopped carries in its error: a failed
+    /// run's uploaded dir keeps the recorder's error; both logs stay in its scratch.
+    const DAEMON_LOG_TAIL: usize = 40;
 
     /// A capture's daemon, run with the CLI's wiring so its hooks reach the
-    /// tap, and stopped when dropped: by SIGTERM, which stops it cleanly
-    /// (openclaw `docs/cli/gateway/running.md:32` at v2026.10.1) so its
-    /// shutdown hooks fire, then by a kill past `DAEMON_STOP_GRACE`.
-    struct RunningDaemon(std::process::Child);
+    /// tap. It stops when its stdin closes ([`hermetic::Daemon`]), which
+    /// [`Self::stop`] does; one dropped unstopped is killed.
+    struct RunningDaemon {
+        child: std::process::Child,
+        /// Its stdin's write end, held until it should stop.
+        lifeline: Option<std::process::ChildStdin>,
+        /// Its start, which names it.
+        start: String,
+        /// Where its output goes.
+        log: PathBuf,
+    }
 
     impl RunningDaemon {
-        /// `daemon` started, once its probe exits 0.
+        /// `daemon` started, once its probe exits 0 within `boot`.
         fn start(
             daemon: Option<&DaemonCmd>,
+            boot: Duration,
             ws: &Path,
             wiring: &CliWiring<'_>,
             verified: &str,
@@ -946,56 +963,106 @@ mod recorder {
             };
             let own = driver_dir(wiring.scratch);
             std::fs::create_dir_all(&own)?;
-            let log = std::fs::File::create(own.join("daemon.log"))?;
-            let mut running = Self(
-                wired(&daemon.start, ws, wiring, verified, env)?
-                    .stdin(std::process::Stdio::null())
-                    .stdout(log.try_clone()?)
-                    .stderr(log)
-                    .spawn()?,
-            );
-            wait_until("the daemon", BOOT, || {
+            let log_path = own.join("daemon.log");
+            let log = std::fs::File::create(&log_path)?;
+            let mut child = wired(&daemon.start, ws, wiring, verified, env)?
+                .envs(daemon.env.iter().map(|(k, v)| (k, v)))
+                .stdin(std::process::Stdio::piped())
+                .stdout(log.try_clone()?)
+                .stderr(log)
+                .spawn()?;
+            let mut running = Self {
+                lifeline: child.stdin.take(),
+                child,
+                start: daemon.start.join(" "),
+                log: log_path.clone(),
+            };
+            // Every probe's output, each followed by how it ended.
+            let probe_log = own.join("probe.log");
+            let mut probes = std::fs::File::create(&probe_log)?;
+            let deadline = std::time::Instant::now() + boot;
+            wait_until("the daemon", boot, || {
                 let mut probe = wired(&daemon.ready, ws, wiring, verified, env)?
                     .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
+                    .stdout(probes.try_clone()?)
+                    .stderr(probes.try_clone()?)
                     .spawn()?;
-                if wait_until("its probe", DAEMON_PROBE_BUDGET, || {
-                    Ok(probe.try_wait()?.is_some())
-                })
-                .is_err()
-                {
+                // A probe may take as long as a CLI's cold start; only one that
+                // would hold the wait past `boot` is killed.
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                let answered =
+                    wait_until("its probe", left, || Ok(probe.try_wait()?.is_some())).is_ok();
+                if !answered {
                     let _ = probe.kill();
                 }
-                let served = probe.wait()?.success();
-                match running.0.try_wait()? {
+                let status = probe.wait()?;
+                if answered {
+                    writeln!(probes, "[the probe exited {status}]")?;
+                } else {
+                    writeln!(probes, "[the probe was killed at the boot deadline]")?;
+                }
+                match running.child.try_wait()? {
                     // A probe answered by whatever else holds the port.
                     Some(exit) => Err(std::io::Error::other(format!(
                         "the daemon exited {exit} before it served"
                     ))),
-                    None => Ok(served),
+                    None => Ok(answered && status.success()),
                 }
+            })
+            .map_err(|e| {
+                std::io::Error::other(format!(
+                    "{e}; its probes ended:\n{}\nits log ends:\n{}",
+                    tail(&probe_log),
+                    tail(&log_path)
+                ))
             })?;
             Ok(Some(running))
+        }
+
+        /// Closes its stdin and waits `grace` for it to exit. One that outlives
+        /// it is killed, and that fails its capture: a kill loses the hooks its
+        /// shutdown would have sent.
+        fn stop(mut self, grace: Duration) -> std::io::Result<()> {
+            drop(self.lifeline.take());
+            if wait_until("its exit", grace, || Ok(self.child.try_wait()?.is_some())).is_ok() {
+                return Ok(());
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            Err(std::io::Error::other(format!(
+                "the daemon `{}` outlived its stdin by {grace:?} and was killed; its log ends:\n{}",
+                self.start,
+                tail(&self.log)
+            )))
         }
     }
 
     impl Drop for RunningDaemon {
         fn drop(&mut self) {
-            #[cfg(unix)]
-            {
-                use rustix::process::{Pid, Signal, kill_process};
-                let _ = kill_process(Pid::from_child(&self.0), Signal::TERM);
-                let exited = wait_until("its exit", DAEMON_STOP_GRACE, || {
-                    Ok(self.0.try_wait()?.is_some())
-                });
-                if exited.is_ok() {
-                    return;
-                }
-            }
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
+    }
+
+    /// The last [`DAEMON_LOG_TAIL`] lines of the log at `path`.
+    fn tail(path: &Path) -> String {
+        let text = std::fs::read(path)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(DAEMON_LOG_TAIL)..].join("\n")
+    }
+
+    /// Why a capture is incomplete, if it is: its tap stopped accepting, its
+    /// daemon had to be killed, or both.
+    fn incomplete(tap: Option<String>, daemon: std::io::Result<()>) -> Option<std::io::Error> {
+        let tap = tap
+            .map(|why| format!("the tap stopped accepting, so this capture is incomplete: {why}"));
+        let whys: Vec<String> = tap
+            .into_iter()
+            .chain(daemon.err().map(|e| e.to_string()))
+            .collect();
+        (!whys.is_empty()).then(|| std::io::Error::other(whys.join("; ")))
     }
 
     fn write_payloads(payloads: &[String], dest: &Path) -> std::io::Result<PathBuf> {
@@ -2043,17 +2110,33 @@ mod recorder {
                 "run",
                 "--daemon-ready",
                 "up",
+                "--daemon-env",
+                "A=1",
                 "codex",
             ]))
-            .map(|(o, _)| o.daemon.map(|d| (d.start, d.ready)));
-            if cfg!(windows) {
-                assert!(daemon.is_err(), "a Windows recorder stops no daemon");
-            } else {
-                assert_eq!(daemon, Ok(Some((args(&["d", "run"]), args(&["up"])))));
-            }
-            for half in [["--daemon", "d"], ["--daemon-ready", "up"]] {
+            .map(|(o, _)| o.daemon.map(|d| (d.start, d.ready, d.env)));
+            let own = vec![("A".to_owned(), "1".to_owned())];
+            assert_eq!(daemon, Ok(Some((args(&["d", "run"]), args(&["up"]), own))));
+            for half in [
+                ["--daemon", "d"],
+                ["--daemon-ready", "up"],
+                ["--daemon-env", "A=1"],
+            ] {
                 assert!(parse_options(args(&half)).is_err(), "{half:?} alone");
             }
+            assert!(
+                parse_options(args(&[
+                    "--daemon",
+                    "d",
+                    "--daemon-ready",
+                    "up",
+                    "--daemon-env",
+                    "NOEQUALS",
+                    "codex",
+                ]))
+                .is_err(),
+                "a daemon's env without its value"
+            );
         }
 
         #[test]
@@ -2379,17 +2462,13 @@ mod recorder {
 
         #[cfg(unix)]
         #[test]
-        fn a_daemon_serves_before_the_cli_runs_and_stops_on_sigterm() {
+        fn a_daemon_serves_before_the_cli_runs() {
             let sandbox = tempfile::tempdir().expect("sandbox");
             let ws = tempfile::tempdir().expect("workspace");
             let endpoint = Endpoint::in_dir(sandbox.path(), "capture");
-            let (ready, stopped) = (ws.path().join("ready"), ws.path().join("stopped"));
+            let ready = ws.path().join("ready");
             // It serves only after a beat, so a probe that never waited fails.
-            let serve = format!(
-                "trap 'echo term >{}; exit 0' TERM; sleep 1; touch {}; while :; do sleep 0.1; done",
-                stopped.display(),
-                ready.display()
-            );
+            let serve = format!("sleep 1; touch {}; cat >/dev/null", ready.display());
             let daemon = DaemonCmd {
                 start: ["sh", "-c", &serve].map(String::from).to_vec(),
                 ready: ["test", "-e"]
@@ -2397,20 +2476,237 @@ mod recorder {
                     .into_iter()
                     .chain([ready.display().to_string()])
                     .collect(),
+                env: Vec::new(),
             };
             let wiring = CliWiring {
                 endpoint: &endpoint,
                 scratch: sandbox.path(),
             };
-            let running = RunningDaemon::start(Some(&daemon), ws.path(), &wiring, "1.0.0", &[])
-                .expect("starts")
-                .expect("a daemon");
+            let running = RunningDaemon::start(
+                Some(&daemon),
+                *DAEMON_BOOT.here(),
+                ws.path(),
+                &wiring,
+                "1.0.0",
+                &[],
+            )
+            .expect("starts")
+            .expect("a daemon");
             assert!(ready.exists(), "returned before it served");
-            drop(running);
+            running.stop(*DAEMON_STOP_GRACE.here()).expect("it stops");
+        }
+
+        /// Where a re-run of this test binary as the fake daemon keeps its
+        /// markers: the env var marks the re-run.
+        const FAKE_DAEMON: &str = "PIXTUOID_TEST_FAKE_DAEMON";
+        /// A second libtest filter, naming no test, that marks the fake's probe.
+        const FAKE_PROBE: &str = "fake-daemon-probe";
+        /// What the fake's probe says while the fake does not serve.
+        const NOT_YET: &str = "the fake does not serve yet";
+
+        /// `test`'s name as libtest filters it: module path without the crate.
+        fn this_test(test: &str) -> String {
+            let module = module_path!()
+                .split_once("::")
+                .map_or(module_path!(), |(_, m)| m);
+            format!("{module}::{test}")
+        }
+
+        /// This test binary, re-run as `test` playing a daemon, and as its probe,
+        /// which passes once the fake wrote its `ready`.
+        fn fake_daemon(test: &str) -> DaemonCmd {
+            let exe = std::env::current_exe()
+                .expect("the test binary")
+                .display()
+                .to_string();
+            let name = this_test(test);
+            DaemonCmd {
+                start: vec![
+                    exe.clone(),
+                    "--exact".into(),
+                    name.clone(),
+                    "--nocapture".into(),
+                ],
+                ready: vec![
+                    exe,
+                    "--exact".into(),
+                    name,
+                    FAKE_PROBE.into(),
+                    "--nocapture".into(),
+                ],
+                env: Vec::new(),
+            }
+        }
+
+        /// In a re-run as the fake: its marker directory, and whether it is the
+        /// probe, which has taken `probe_takes` and asserted the fake serves by
+        /// the time this returns. A fake that `serves` says so before it returns.
+        fn as_fake(serves: bool, probe_takes: Duration) -> Option<(PathBuf, bool)> {
+            let dir = PathBuf::from(std::env::var_os(FAKE_DAEMON)?);
+            let probe = std::env::args().any(|a| a == FAKE_PROBE);
+            if probe {
+                std::thread::sleep(probe_takes);
+                assert!(dir.join("ready").exists(), "{NOT_YET}");
+            } else if serves {
+                std::fs::write(dir.join("ready"), "").expect("ready");
+            }
+            Some((dir, probe))
+        }
+
+        /// The fake daemon, started within `boot` as the recorder starts one,
+        /// in `dir`: its workspace, its scratch and its markers, which outlive it.
+        fn start_fake(test: &str, dir: &Path, boot: Duration) -> std::io::Result<RunningDaemon> {
+            let endpoint = Endpoint::in_dir(dir, "capture");
+            let wiring = CliWiring {
+                endpoint: &endpoint,
+                scratch: dir,
+            };
+            let env = [(FAKE_DAEMON.to_owned(), dir.display().to_string())];
+            RunningDaemon::start(Some(&fake_daemon(test)), boot, dir, &wiring, "1.0.0", &env)
+                .map(|d| d.expect("a daemon"))
+        }
+
+        /// Not `cfg(unix)`: the lifeline is the recorder's one stop on every OS.
+        #[test]
+        fn a_daemon_stops_when_its_stdin_closes() {
+            const TEST: &str = "a_daemon_stops_when_its_stdin_closes";
+            if let Some((dir, probe)) = as_fake(true, Duration::ZERO) {
+                if !probe {
+                    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("stdin");
+                    // An EOF that came before the recorder stopped it is a
+                    // stdin it never held.
+                    let when = if dir.join("stopping").exists() {
+                        "after stop"
+                    } else {
+                        "before stop"
+                    };
+                    std::fs::write(dir.join("stopped"), when).expect("stopped");
+                }
+                return;
+            }
+            let markers = tempfile::tempdir().expect("markers");
+            let running = start_fake(TEST, markers.path(), *DAEMON_BOOT.here()).expect("starts");
+            std::fs::write(markers.path().join("stopping"), "").expect("stopping");
+            running
+                .stop(*DAEMON_STOP_GRACE.here())
+                .expect("it stops on its own");
             assert_eq!(
-                std::fs::read_to_string(&stopped).ok().as_deref(),
-                Some("term\n")
+                std::fs::read_to_string(markers.path().join("stopped"))
+                    .ok()
+                    .as_deref(),
+                Some("after stop"),
+                "the daemon saw EOF only once the recorder stopped it"
             );
+        }
+
+        #[test]
+        fn a_daemons_own_env_reaches_its_spawn_and_not_its_probe() {
+            const TEST: &str = "a_daemons_own_env_reaches_its_spawn_and_not_its_probe";
+            const OWN: &str = "PIXTUOID_TEST_FAKE_DAEMON_OWN";
+            if let Some((dir, probe)) = as_fake(true, Duration::ZERO) {
+                if probe {
+                    assert!(std::env::var_os(OWN).is_none(), "the probe got it");
+                } else {
+                    let own = std::env::var_os(OWN).unwrap_or_default();
+                    std::fs::write(dir.join("own"), own.as_encoded_bytes()).expect("own");
+                    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("stdin");
+                }
+                return;
+            }
+            let dir = tempfile::tempdir().expect("dir");
+            let endpoint = Endpoint::in_dir(dir.path(), "capture");
+            let wiring = CliWiring {
+                endpoint: &endpoint,
+                scratch: dir.path(),
+            };
+            let env = [(FAKE_DAEMON.to_owned(), dir.path().display().to_string())];
+            let daemon = DaemonCmd {
+                env: vec![(OWN.to_owned(), "1".to_owned())],
+                ..fake_daemon(TEST)
+            };
+            RunningDaemon::start(
+                Some(&daemon),
+                *DAEMON_BOOT.here(),
+                dir.path(),
+                &wiring,
+                "1.0.0",
+                &env,
+            )
+            .expect("it serves")
+            .expect("a daemon")
+            .stop(*DAEMON_STOP_GRACE.here())
+            .expect("it stops");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("own"))
+                    .ok()
+                    .as_deref(),
+                Some("1")
+            );
+        }
+
+        #[test]
+        fn a_daemon_that_never_serves_carries_both_logs_into_the_error() {
+            const TEST: &str = "a_daemon_that_never_serves_carries_both_logs_into_the_error";
+            const SAYS: &str = "the fake daemon will not serve";
+            if let Some((_, probe)) = as_fake(false, Duration::ZERO) {
+                if !probe {
+                    println!("{SAYS}");
+                    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("stdin");
+                }
+                return;
+            }
+            let dir = tempfile::tempdir().expect("dir");
+            let why = start_fake(TEST, dir.path(), Duration::from_secs(2))
+                .map(|_| ())
+                .expect_err("it never serves")
+                .to_string();
+            assert!(why.contains("never came up"), "{why}");
+            assert!(why.contains(SAYS), "its log: {why}");
+            assert!(why.contains(NOT_YET), "its probes: {why}");
+        }
+
+        #[test]
+        fn a_daemon_that_outlives_its_stdin_is_killed_and_fails_the_capture() {
+            const TEST: &str = "a_daemon_that_outlives_its_stdin_is_killed_and_fails_the_capture";
+            /// Past any grace this test gives it.
+            const OUTLIVES: Duration = Duration::from_secs(600);
+            const SAYS: &str = "the fake daemon will not stop";
+            if let Some((_, probe)) = as_fake(true, Duration::ZERO) {
+                if !probe {
+                    println!("{SAYS}");
+                    std::thread::sleep(OUTLIVES);
+                }
+                return;
+            }
+            let markers = tempfile::tempdir().expect("markers");
+            let running = start_fake(TEST, markers.path(), *DAEMON_BOOT.here()).expect("starts");
+            let grace = Duration::from_secs(1);
+            let started = std::time::Instant::now();
+            let why = running.stop(grace).expect_err("a killed daemon fails");
+            assert!(started.elapsed() >= grace, "killed before its grace");
+            let why = why.to_string();
+            assert!(why.contains(&this_test(TEST)), "names the daemon: {why}");
+            assert!(
+                why.contains(&format!("{grace:?}")),
+                "names the grace: {why}"
+            );
+            assert!(why.contains(SAYS), "its log: {why}");
+            assert!(
+                incomplete(None, Err(std::io::Error::other(why))).is_some(),
+                "a capture whose daemon was killed is incomplete"
+            );
+            assert!(incomplete(None, Ok(())).is_none());
+        }
+
+        #[test]
+        fn a_capture_whose_tap_stopped_and_daemon_was_killed_names_both() {
+            const TAP: &str = "the tap's own reason";
+            const KILL: &str = "the daemon's kill";
+            let why = incomplete(Some(TAP.into()), Err(std::io::Error::other(KILL)))
+                .expect("incomplete")
+                .to_string();
+            assert!(why.contains(TAP), "{why}");
+            assert!(why.contains(KILL), "{why}");
         }
 
         #[cfg(unix)]
@@ -2420,41 +2716,76 @@ mod recorder {
             let ws = tempfile::tempdir().expect("workspace");
             let endpoint = Endpoint::in_dir(sandbox.path(), "capture");
             let daemon = DaemonCmd {
-                start: ["sh", "-c", "exit 3"].map(String::from).to_vec(),
+                start: ["sh", "-c", "echo out of disk; exit 3"]
+                    .map(String::from)
+                    .to_vec(),
                 ready: ["sh", "-c", "sleep 1"].map(String::from).to_vec(),
+                env: Vec::new(),
             };
             let wiring = CliWiring {
                 endpoint: &endpoint,
                 scratch: sandbox.path(),
             };
-            let why = RunningDaemon::start(Some(&daemon), ws.path(), &wiring, "1.0.0", &[])
-                .map(|_| ())
-                .expect_err("its probe answered for someone else");
+            let why = RunningDaemon::start(
+                Some(&daemon),
+                *DAEMON_BOOT.here(),
+                ws.path(),
+                &wiring,
+                "1.0.0",
+                &[],
+            )
+            .map(|_| ())
+            .expect_err("its probe answered for someone else");
             assert!(why.to_string().contains("exited"), "{why}");
+            assert!(why.to_string().contains("out of disk"), "its log: {why}");
         }
 
-        #[cfg(unix)]
         #[test]
-        fn a_probe_that_blocks_is_killed_and_read_as_a_no() {
-            let sandbox = tempfile::tempdir().expect("sandbox");
-            let ws = tempfile::tempdir().expect("workspace");
-            let endpoint = Endpoint::in_dir(sandbox.path(), "capture");
-            let daemon = DaemonCmd {
-                start: ["sh", "-c", "exit 3"].map(String::from).to_vec(),
-                ready: ["sleep", "60"].map(String::from).to_vec(),
-            };
-            let wiring = CliWiring {
-                endpoint: &endpoint,
-                scratch: sandbox.path(),
-            };
+        fn a_probe_that_blocks_is_killed_at_the_boot_deadline() {
+            const TEST: &str = "a_probe_that_blocks_is_killed_at_the_boot_deadline";
+            /// Past any boot this test gives it.
+            const BLOCKS: Duration = Duration::from_secs(600);
+            if let Some((_, probe)) = as_fake(true, BLOCKS) {
+                if !probe {
+                    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("stdin");
+                }
+                return;
+            }
+            let dir = tempfile::tempdir().expect("dir");
+            let boot = Duration::from_secs(2);
             let started = std::time::Instant::now();
-            let why = RunningDaemon::start(Some(&daemon), ws.path(), &wiring, "1.0.0", &[])
+            let why = start_fake(TEST, dir.path(), boot)
                 .map(|_| ())
-                .expect_err("it never served");
-            assert!(why.to_string().contains("exited"), "{why}");
+                .expect_err("its probe never answered")
+                .to_string();
+            assert!(why.contains("killed at the boot deadline"), "{why}");
+            assert!(started.elapsed() < boot * 2, "the probe outlived its boot");
+        }
+
+        #[test]
+        fn a_slow_probe_answers_inside_the_boot_deadline() {
+            const TEST: &str = "a_slow_probe_answers_inside_the_boot_deadline";
+            /// A probe's own cold start, as a slow CLI's is.
+            const SLOW: Duration = Duration::from_secs(6);
+            if let Some((_, probe)) = as_fake(true, SLOW) {
+                if !probe {
+                    std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("stdin");
+                }
+                return;
+            }
+            let dir = tempfile::tempdir().expect("dir");
+            let started = std::time::Instant::now();
+            let running = start_fake(TEST, dir.path(), SLOW * 3).expect("a slow probe answers");
+            assert!(started.elapsed() >= SLOW, "{:?}", started.elapsed());
+            running.stop(*DAEMON_STOP_GRACE.here()).expect("it stops");
+        }
+
+        #[test]
+        fn a_windows_daemon_gets_longer_to_boot_and_stop_than_a_unix_one() {
+            assert!(DAEMON_BOOT.windows > DAEMON_BOOT.unix, "its cold boot");
             assert!(
-                started.elapsed() < DAEMON_PROBE_BUDGET * 2,
-                "the probe ran out"
+                DAEMON_STOP_GRACE.windows > DAEMON_STOP_GRACE.unix,
+                "its stop"
             );
         }
 

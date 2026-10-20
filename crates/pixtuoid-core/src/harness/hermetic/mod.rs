@@ -247,19 +247,16 @@ impl Live {
 }
 
 /// A server a profile's CLI talks to, run inside each scenario's recorded run.
+/// It must stop when its stdin closes, the one stop the recorder has on every
+/// OS: one that outlives it is killed, and its capture fails.
 #[derive(Debug)]
 pub struct Daemon {
     /// Its start, after the CLI's binary.
     pub start: &'static [&'static str],
     /// What exits 0 once it serves, after the CLI's binary.
     pub ready: &'static [&'static str],
-}
-
-impl Daemon {
-    /// Why a leg on `windows` runs no daemon, if it runs none.
-    pub fn not_run_on(windows: bool) -> Option<&'static str> {
-        windows.then_some("the recorder stops its daemon by a Unix signal")
-    }
+    /// Environment it alone gets, beside the profile's.
+    pub env: &'static [(&'static str, &'static str)],
 }
 
 /// The port a [`Daemon`] listens on, picked free by the orchestrator.
@@ -2158,6 +2155,11 @@ telemetry:
         daemon: Some(Daemon {
             start: &["gateway", "run"],
             ready: &["gateway", "health"],
+            // Its gateway stops gracefully on its stdin's EOF, the recorder's
+            // stop (`src/cli/gateway-cli/host-lifeline.ts:4-14`, `:40-47`,
+            // `src/cli/gateway-cli/run-loop.ts:1214-1217`,
+            // `docs/platforms/mac/bundled-gateway.md:46-49`).
+            env: &[("OPENCLAW_GATEWAY_HOST_LIFELINE", "stdin")],
         }),
     },
 ];
@@ -2203,26 +2205,6 @@ impl Profile {
         matches!(self.package, Package::UpdaterManifest { .. })
             .then(|| scripts_dir().join(self.source).join("manifest.lock.json"))
     }
-
-    /// Why a leg on `windows` doesn't run `s`, one of this profile's
-    /// scenarios, if it doesn't.
-    pub fn not_run_on(&self, s: &Scenario, windows: bool) -> Option<&'static str> {
-        self.daemon
-            .as_ref()
-            .and_then(|_| Daemon::not_run_on(windows))
-            .or_else(|| s.not_run_on(windows))
-    }
-
-    /// Whether a leg on `windows` runs any of it, and so reports it.
-    pub fn runs_on(&self, windows: bool) -> bool {
-        self.scenarios
-            .iter()
-            .any(|s| self.not_run_on(s, windows).is_none())
-            || self
-                .live
-                .as_ref()
-                .is_some_and(|l| l.not_run_on(windows).is_none())
-    }
 }
 
 impl Scenario {
@@ -2234,7 +2216,7 @@ impl Scenario {
     }
 
     /// Why a leg on `windows` doesn't run it, if it doesn't.
-    fn not_run_on(&self, windows: bool) -> Option<&'static str> {
+    pub fn not_run_on(&self, windows: bool) -> Option<&'static str> {
         match self.surface {
             Surface::Tui { row, .. } if windows && !row.renders_under_conpty => {
                 Some("its TUI paints nothing under ConPTY")
@@ -2359,6 +2341,28 @@ mod tests {
                     "{}/{}: a TUI turn takes no args and resumes nothing",
                     p.source,
                     s.name
+                );
+            }
+        }
+    }
+
+    /// What the runner's source selection, the lifecycle's turn and the bump
+    /// plan take for granted.
+    #[test]
+    fn no_leg_skips_a_whole_source() {
+        for p in PROFILES {
+            assert!(
+                p.scenarios
+                    .iter()
+                    .any(|s| matches!(s.surface, Surface::Headless)),
+                "{}: no Headless scenario, which every leg runs and the lifecycle turns",
+                p.source
+            );
+            for windows in [false, true] {
+                assert!(
+                    p.scenarios.iter().any(|s| s.not_run_on(windows).is_none()),
+                    "{}: a leg (windows: {windows}) runs none of its scenarios",
+                    p.source
                 );
             }
         }

@@ -211,6 +211,8 @@ pub mod recorder_flag {
     pub const DAEMON: &str = "--daemon";
     /// One word of `Options::daemon`'s readiness probe.
     pub const DAEMON_READY: &str = "--daemon-ready";
+    /// One `KEY=VALUE` of `Options::daemon`'s own environment.
+    pub const DAEMON_ENV: &str = "--daemon-env";
     /// One word of `Options::resume`, the invocation a second turn runs.
     pub const RESUME: &str = "--resume-word";
 }

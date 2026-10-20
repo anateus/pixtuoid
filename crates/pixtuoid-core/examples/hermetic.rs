@@ -207,19 +207,10 @@ mod run {
             let p = hermetic::profile(source)
                 .ok_or_else(|| format!("{source} is not a registered source"))?;
             let Some(sc) = self.scenario.as_deref() else {
-                if p.runs_on(windows) {
-                    return Ok(());
-                }
-                return Err(format!(
-                    "{source} doesn't run here: {}",
-                    not_run_of(p, windows).join(", ")
-                ));
+                return Ok(());
             };
             if sc == LIFECYCLE {
-                return match lifecycle_turn(self, p, windows) {
-                    Some(_) => Ok(()),
-                    None => Err(format!("{source}/{LIFECYCLE} has no scenario to turn here")),
-                };
+                return Ok(());
             }
             if let (LIVE, Some(live)) = (sc, &p.live) {
                 return match live.not_run_on(windows) {
@@ -230,7 +221,7 @@ mod run {
             let s = p
                 .scenario(sc)
                 .ok_or_else(|| format!("{source} has no scenario {sc}"))?;
-            match p.not_run_on(s, windows) {
+            match s.not_run_on(windows) {
                 Some(why) => Err(format!("{source}/{sc} doesn't run here: {why}")),
                 None => Ok(()),
             }
@@ -369,7 +360,7 @@ mod run {
         };
         let windows = cfg!(windows);
         let selected = selected(args, p, windows);
-        let lifecycle = lifecycle_turn(args, p, windows);
+        let lifecycle = lifecycle_turn(args, p);
         if selected.is_empty() && lifecycle.is_none() {
             return Ok((entries, None));
         }
@@ -573,22 +564,18 @@ mod run {
         p.scenarios
             .iter()
             .filter(|s| args.selects(p.source, s.name))
-            .filter(|s| p.not_run_on(s, windows).is_none())
+            .filter(|s| s.not_run_on(windows).is_none())
             .collect()
     }
 
     /// The scenario `p`'s install lifecycle goes on from and turns under its
     /// last uninstall, when `args` selects the lifecycle. `--record` writes
     /// scenarios alone.
-    fn lifecycle_turn<'a>(args: &Args, p: &'a Profile, windows: bool) -> Option<&'a Scenario> {
+    fn lifecycle_turn<'a>(args: &Args, p: &'a Profile) -> Option<&'a Scenario> {
         if args.record || !args.selects(p.source, LIFECYCLE) {
             return None;
         }
-        headless_first(
-            p.scenarios
-                .iter()
-                .filter(|s| p.not_run_on(s, windows).is_none()),
-        )
+        headless_first(p.scenarios.iter())
     }
 
     /// The sandbox a lifecycle goes on in, when its scenario's `verdict` was
@@ -639,7 +626,7 @@ mod run {
     /// Each of `p`'s runs a leg on `windows` never makes, and why.
     fn not_run_of(p: &Profile, windows: bool) -> Vec<String> {
         let scenarios = p.scenarios.iter().filter_map(|s| {
-            let why = p.not_run_on(s, windows)?;
+            let why = s.not_run_on(windows)?;
             Some(format!("{}/{} ({why})", p.source, s.name))
         });
         let live = p.live.as_ref().and_then(|l| {
@@ -678,7 +665,7 @@ mod run {
         let leg = p
             .scenarios
             .iter()
-            .filter(|s| p.not_run_on(s, windows).is_none());
+            .filter(|s| s.not_run_on(windows).is_none());
         judged.len() == leg.count()
     }
 
@@ -1503,7 +1490,11 @@ mod run {
             ports: Ports,
             workspace: &Path,
         ) -> std::io::Result<Self> {
-            let dir = tempfile::tempdir()?;
+            // Under the temp root's long form: a Windows runner's TEMP is an 8.3
+            // short path, which a CLI's realpath disagrees with, and openclaw's
+            // plugin copy then refuses its plugin (`@openclaw/fs-safe`
+            // `src/copy-root-file-sync.ts:57`, `:77-79` at v0.24.2).
+            let dir = tempfile::tempdir_in(dunce::canonicalize(std::env::temp_dir())?)?;
             let at = |rel: &str| -> std::io::Result<PathBuf> {
                 let d = dir.path().join(rel);
                 std::fs::create_dir_all(&d)?;
@@ -2014,6 +2005,9 @@ mod run {
                     args.extend([flag.into(), word]);
                 }
             }
+            for (k, v) in daemon.env {
+                args.extend([recorder_flag::DAEMON_ENV.into(), format!("{k}={v}").into()]);
+            }
         }
         // A scenario's prompts expand here; the recorder expands only its own.
         let prompted = |word: &str, prompt: &str| word.replace(PROMPT_PLACEHOLDER, prompt);
@@ -2340,8 +2334,6 @@ mod run {
             assert!(
                 r.ends_with(
                     "\nNot run here: grok/permission (its TUI paints nothing under ConPTY) \
-                     openclaw/tool-run (the recorder stops its daemon by a Unix signal) \
-                     openclaw/model-error (the recorder stops its daemon by a Unix signal) \
                      openclaw/live (its tier waits on a Unix socket)\n"
                 ),
                 "{r}"
@@ -2669,6 +2661,23 @@ mod run {
                 words(recorder_flag::DAEMON_READY),
                 ["/cli/openclaw", "gateway", "health"]
             );
+            assert_eq!(
+                words(recorder_flag::DAEMON_ENV),
+                ["OPENCLAW_GATEWAY_HOST_LIFELINE=stdin"]
+            );
+            let sandbox = Sandbox::new(
+                p,
+                Path::new("/nowhere/shims"),
+                Path::new("/nowhere/bin"),
+                TEST_PORTS,
+                Path::new("/nowhere/ws"),
+            )
+            .expect("sandbox");
+            assert_eq!(
+                sandbox.var_os("OPENCLAW_GATEWAY_HOST_LIFELINE"),
+                None,
+                "the CLI, its probes and the live tier keep openclaw's own stop"
+            );
             let config: serde_json::Value =
                 serde_json::from_str(&config_text(p.config[0].template, TEST_PORTS, "/ws"))
                     .expect("valid JSON");
@@ -2791,6 +2800,20 @@ mod run {
             let one = [PathBuf::from("/runs/x")];
             assert!(judges_source(&one, 1));
             assert!(!judges_source(&one, 2), "a sibling selected out or Blocked");
+        }
+
+        #[test]
+        fn a_sandboxs_home_is_its_own_canonical_path() {
+            let sandbox = Sandbox::new(
+                &PROFILES[0],
+                Path::new("/nowhere/shims"),
+                Path::new("/nowhere/bin"),
+                TEST_PORTS,
+                Path::new("/nowhere/ws"),
+            )
+            .expect("sandbox");
+            let home = PathBuf::from(sandbox.var_os("HOME").expect("a HOME"));
+            assert_eq!(dunce::canonicalize(&home).expect("it exists"), home);
         }
 
         #[test]
@@ -3157,14 +3180,11 @@ mod run {
             assert_eq!(picked(&tui_first[..1]), Some("tui"));
             let codex = hermetic::profile("codex").expect("profiled");
             let record = parse(&args(&["--record", "codex"])).expect("parse");
-            assert!(lifecycle_turn(&record, codex, false).is_none());
+            assert!(lifecycle_turn(&record, codex).is_none());
             let all = parse(&args(&[])).expect("parse");
-            assert!(lifecycle_turn(&all, codex, false).is_some());
+            assert!(lifecycle_turn(&all, codex).is_some());
             let other = parse(&args(&["codex", "tool-run"])).expect("parse");
-            assert!(
-                lifecycle_turn(&other, codex, false).is_none(),
-                "not selected"
-            );
+            assert!(lifecycle_turn(&other, codex).is_none(), "not selected");
         }
 
         #[test]
@@ -3191,8 +3211,7 @@ mod run {
                     .check(windows)
             };
             assert!(turn(false).is_ok());
-            let refused = turn(true).expect_err("a daemon on Windows");
-            assert!(refused.contains("Unix signal"), "{refused}");
+            assert!(turn(true).is_ok(), "a daemon runs on Windows");
             assert!(
                 check(&["codex", LIVE]).is_err(),
                 "a scenario profile's live run"
@@ -3205,15 +3224,22 @@ mod run {
             };
             assert!(lifecycle(false).is_ok());
             assert!(
-                lifecycle(true).is_err(),
-                "its one scenario runs on no Windows leg"
+                lifecycle(true).is_ok(),
+                "a daemon's lifecycle runs on Windows"
             );
-            for named in [&["openclaw"][..], &["openclaw", LIVE]] {
-                let check = |windows| parse(&args(named)).expect("parse").check(windows);
-                assert!(check(false).is_ok(), "{named:?}");
-                let refused = check(true).expect_err("a Unix-socket tier on Windows");
-                assert!(refused.contains("Unix socket"), "{refused}");
-            }
+            let source = parse(&args(&["openclaw"])).expect("parse");
+            assert!(
+                source.check(true).is_ok(),
+                "a daemon profile runs on Windows"
+            );
+            let live = |windows| {
+                parse(&args(&["openclaw", LIVE]))
+                    .expect("parse")
+                    .check(windows)
+            };
+            assert!(live(false).is_ok());
+            let refused = live(true).expect_err("a Unix-socket tier on Windows");
+            assert!(refused.contains("Unix socket"), "{refused}");
         }
 
         #[cfg(not(unix))]
