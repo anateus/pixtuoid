@@ -733,7 +733,9 @@ fn judge(
     let reached: Vec<Reach> = reaches.iter().map(|&(_, class)| class).collect();
     match scenario.shape {
         Shape::ToolRun => tool_run(&events, &reached, findings),
-        Shape::Permission => permission(&events, &reached, findings),
+        Shape::Permission => {
+            permission(&events, &reached, manifest.capture.note_survived, findings)
+        }
         Shape::Subagent => subagent(
             &events,
             &reaches,
@@ -878,7 +880,15 @@ fn tool_run(events: &[AgentEvent], reached: &[Reach], findings: &mut Vec<(Label,
     }
 }
 
-fn permission(events: &[AgentEvent], reached: &[Reach], findings: &mut Vec<(Label, String)>) {
+fn permission(
+    events: &[AgentEvent],
+    reached: &[Reach],
+    note_survived: bool,
+    findings: &mut Vec<(Label, String)>,
+) {
+    if !note_survived {
+        findings.push((Label::Fail, "the note is gone".into()));
+    }
     if !reached.contains(&Reach::Waiting) {
         findings.push((Label::Fail, "the slot never went Waiting".into()));
     }
@@ -910,25 +920,21 @@ fn permission(events: &[AgentEvent], reached: &[Reach], findings: &mut Vec<(Labe
     });
     let ended = if !waited.is_empty() {
         waited.iter().any(|t| ended_calls.contains(t))
-    } else if !events
-        .iter()
-        .any(|e| matches!(e, AgentEvent::ActivityStart { .. }))
-    {
-        // Asked before the call started (reasonix): the refused call never ran,
-        // so its turn's end.
-        events.iter().any(|e| {
-            matches!(
-                e,
-                AgentEvent::ActivityEnd {
-                    tool_use_id: None,
-                    ..
-                }
-            )
-        })
+    } else if started.is_empty() {
+        // No start carries a call id (reasonix): one End per Start (a
+        // guardian's read before the wait) plus the turn's, counted not paired
+        // (`internal/ext/hook/runner.go:154`, `:166` at v2.44.0).
+        // `a_permission_script_calls_no_tool_after_its_refusal` forbids a
+        // retry, and the note's survival proves the refused call never ran.
+        let count = |is: fn(&AgentEvent) -> bool| events.iter().filter(|e| is(e)).count();
+        let starts = count(|e| matches!(e, AgentEvent::ActivityStart { .. }));
+        let ends = count(|e| matches!(e, AgentEvent::ActivityEnd { .. }));
+        // An End naming a call no Start opened is not this branch's to count.
+        ended_calls.is_empty() && ends == starts + 1
     } else {
-        // A wait that names no call (claude-code's `PermissionRequest`): every
-        // started tool ends.
-        !started.is_empty() && started.is_subset(&ended_calls)
+        // Starts carry call ids (claude-code, whose `PermissionRequest` names
+        // none): every started call ends.
+        started.is_subset(&ended_calls)
     };
     if !ended {
         findings.push((
@@ -1345,6 +1351,7 @@ mod tests {
                 version: "test".into(),
                 exit_code: Some(0),
                 resumed: None,
+                note_survived: true,
             },
             aimock: "test".into(),
             requests: 2,
@@ -1690,6 +1697,101 @@ mod tests {
         assert!(
             has(&v, Label::Fail, "never ended"),
             "a call that started is held to its own end: {:?}",
+            v.findings()
+        );
+    }
+
+    #[test]
+    fn a_guardian_that_reads_before_the_wait_passes_while_the_read_ends() {
+        let d = recorded("reasonix", Shape::Permission, RX_WAIT_SCENE);
+        let v = verify(d.path()).expect("verify");
+        assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
+        edit_hooks(d.path(), |v| {
+            let guardian = v["sessionId"]
+                .as_str()
+                .is_some_and(|s| s.ends_with(":guardian"));
+            (!(guardian && v["event"] == "PostToolUse")).then_some(v)
+        });
+        let v = verify(d.path()).expect("verify");
+        assert!(
+            has(&v, Label::Fail, "never ended"),
+            "a read before the wait is held to its own end: {:?}",
+            v.findings()
+        );
+    }
+
+    #[test]
+    fn an_orphaned_id_bearing_end_cannot_mask_an_idless_calls_missing_end() {
+        let agent_id = AgentId::from_parts("reasonix", "p");
+        let end = |tool_use_id: Option<&str>| AgentEvent::ActivityEnd {
+            agent_id,
+            tool_use_id: tool_use_id.map(Into::into),
+        };
+        let events = |read_ends_as: Option<&str>| {
+            vec![
+                AgentEvent::ActivityStart {
+                    agent_id,
+                    tool_use_id: None,
+                    detail: None,
+                },
+                end(read_ends_as),
+                AgentEvent::Waiting {
+                    agent_id,
+                    reason: "approval".into(),
+                    tool_use_id: None,
+                },
+                end(None),
+            ]
+        };
+        let judged = |read_ends_as| {
+            let mut findings = Vec::new();
+            permission(
+                &events(read_ends_as),
+                &[Reach::Waiting],
+                true,
+                &mut findings,
+            );
+            findings
+        };
+        assert!(judged(None).is_empty(), "the start and the turn each ended");
+        assert!(
+            judged(Some("orphan"))
+                .iter()
+                .any(|f| f.1.contains("never ended")),
+            "an End naming a call no Start opened stands in for the start's"
+        );
+    }
+
+    #[test]
+    fn an_end_no_call_owns_fails() {
+        let d = recorded("reasonix", Shape::Permission, RX_WAIT_SCENE);
+        reorder_hooks(d.path(), |lines| {
+            let end = lines
+                .iter()
+                .position(|v| v["event"] == "PostToolUse")
+                .expect("the guardian's read ended");
+            let again = lines[end].clone();
+            lines.insert(end, again);
+        });
+        let v = verify(d.path()).expect("verify");
+        assert!(
+            has(&v, Label::Fail, "never ended"),
+            "ids are absent, so a surplus End could stand in for an unended call: {:?}",
+            v.findings()
+        );
+    }
+
+    #[test]
+    fn a_refused_call_that_took_the_note_with_it_fails() {
+        let d = recorded("dsh", Shape::Permission, DS_WAIT_SCENE);
+        write_manifest(d.path(), "dsh", |m| {
+            m.scenario = "permission".into();
+            m.capture.note_survived = false;
+        });
+        let v = verify(d.path()).expect("verify");
+        assert!(
+            has(&v, Label::Fail, "the note is gone"),
+            "{:?}",
             v.findings()
         );
     }
