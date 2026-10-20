@@ -15,6 +15,7 @@ use crate::source::registry;
 
 pub mod bump;
 pub mod digest;
+pub mod dropped;
 mod literals;
 pub mod pin;
 pub mod tui;
@@ -369,6 +370,14 @@ pub const TUI_LOG: &str = "tui.log";
 /// The provenance key naming the aimock a recording ran against, which only
 /// the tier's own recordings carry.
 pub const PROVENANCE_AIMOCK: &str = "aimock";
+
+/// The file beside a run's report counting its New findings, which
+/// `hermetic.yml` reads to upload a run that passed with one.
+pub const NEW_TYPES: &str = "new-types.json";
+
+/// The provenance key holding what a tier recording's decoders dropped
+/// ([`dropped::Dropped`]), the baseline a New finding is judged against.
+pub const PROVENANCE_DROPPED: &str = "dropped";
 
 /// The name an install lifecycle run is selected and reported by.
 pub const LIFECYCLE: &str = "lifecycle";
@@ -2111,6 +2120,16 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn hermetic_yml_reads_the_new_types_the_tier_writes() {
+        let yml = std::fs::read_to_string(bump::repo_root().join(".github/workflows/hermetic.yml"))
+            .expect("hermetic.yml");
+        assert!(
+            yml.contains(&format!("runs/{NEW_TYPES}")),
+            "a run that passed with a New finding uploads only as this file says"
+        );
+    }
 
     #[test]
     fn every_registered_source_is_profiled_or_says_why_not_and_never_both() {
