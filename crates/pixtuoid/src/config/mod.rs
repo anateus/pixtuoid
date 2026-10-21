@@ -25,10 +25,10 @@ pub(crate) struct AppConfig {
     /// capacity is auto-computed from terminal size.
     #[serde(rename = "max-desks")]
     pub max_desks: Option<usize>,
-    /// A `GraphicsMode` name, raw so a typo warns in `resolve_graphics` instead
-    /// of failing the whole load.
+    /// A [`LookMode`](crate::graphics::LookMode) name, raw so a typo warns in
+    /// `resolve_look` instead of failing the whole load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub graphics: Option<String>,
+    pub look: Option<String>,
     /// A [`MotionMode`] name, raw so a typo warns in `resolve_motion`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion: Option<String>,
@@ -434,23 +434,21 @@ pub(crate) fn resolve_theme(
     Ok(config_theme.unwrap_or(&NORMAL))
 }
 
-/// Resolve CLI + config into the run's [`GraphicsMode`](crate::GraphicsMode)
-/// (CLI > config > default). The config value is checked even when the flag
+/// Resolve CLI + config into the run's [`LookMode`](crate::graphics::LookMode)
+/// (CLI > config > default). The config value is checked even when a flag
 /// wins, as in [`resolve_theme`], and by clap's own parser, so the file and the
 /// flag accept the same names.
-pub(crate) fn resolve_graphics(
+pub(crate) fn resolve_look(
     config: &AppConfig,
-    cli: Option<crate::GraphicsMode>,
+    cli: Option<crate::graphics::LookMode>,
     warnings: &mut Vec<String>,
-) -> crate::GraphicsMode {
-    let configured = config.graphics.as_deref().and_then(|v| {
-        let mode = <crate::GraphicsMode as clap::ValueEnum>::from_str(v, false).ok();
+) -> crate::graphics::LookMode {
+    let configured = config.look.as_deref().and_then(|v| {
+        let mode = <crate::graphics::LookMode as clap::ValueEnum>::from_str(v, false).ok();
         if mode.is_none() {
             warn_user(
                 warnings,
-                format!(
-                    "unknown graphics {v:?} in config — ignoring (falling back to the default)"
-                ),
+                format!("unknown look {v:?} in config — ignoring (falling back to the default)"),
             );
         }
         mode
@@ -486,7 +484,7 @@ impl MotionMode {
 }
 
 /// Resolve config into the run's [`MotionMode`], warning on an unknown name
-/// as [`resolve_graphics`] does.
+/// as [`resolve_look`] does.
 pub(crate) fn resolve_motion(config: &AppConfig, warnings: &mut Vec<String>) -> MotionMode {
     let configured = config.motion.as_deref().and_then(|v| {
         let mode = <MotionMode as clap::ValueEnum>::from_str(v, false).ok();
