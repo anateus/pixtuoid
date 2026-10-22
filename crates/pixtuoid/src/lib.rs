@@ -14,13 +14,9 @@ pub(crate) mod audio;
 pub(crate) mod cli;
 pub(crate) mod config;
 pub(crate) mod doctor;
-
-#[cfg(feature = "upstream")]
-mod drift_watch;
 pub(crate) mod floating;
 pub(crate) mod focus;
 pub(crate) mod graphics;
-pub(crate) use graphics::GraphicsMode;
 pub(crate) mod install;
 pub(crate) mod jank;
 pub(crate) mod pacing;
@@ -38,14 +34,10 @@ pub(crate) mod version;
 /// reports. Not an API: it moves with them.
 #[doc(hidden)]
 pub mod dev {
-    pub use crate::audio::demote_to_utility;
+    #[cfg(target_os = "macos")]
+    pub use crate::audio::promote_to_user_initiated;
     pub use crate::config::{FLOATING_DEFAULT_H, FLOATING_DEFAULT_W};
     pub use crate::doctor::footer_warning;
-    /// The upstream drift watch, apart from [`crate::run`], the program.
-    #[cfg(feature = "upstream")]
-    pub mod drift_watch {
-        pub use crate::drift_watch::{Report, run};
-    }
     pub use crate::floating::compose::{Change, XrgbSurface, composite, composition};
     pub use crate::floating::geometry::{Zoom, window_geometry};
     pub use crate::floating::offscreen::{OfficeRenderer, Pressing, WindowFrame};

@@ -10,11 +10,6 @@
 //! "grok"`), NOT a command argument: grok's runner injects handler env into the
 //! hook process on every platform, and an argument-less absolute path is
 //! DIRECT-exec'd, avoiding grok's shell heuristic entirely.
-//!
-//! Both `SubagentStop` AND `SubagentEnd` are registered: the docs name
-//! `SubagentStop`, but upstream's subagent-finish file-hook dispatch keys the
-//! `SubagentEnd` alias by exact-key lookup, so registering only the documented
-//! spelling would never fire.
 
 use std::path::{Path, PathBuf};
 
@@ -23,13 +18,7 @@ use serde_json::{Value, json};
 
 use crate::install::io;
 use crate::install::target::MergeOutcome;
-#[cfg(feature = "upstream")]
-use crate::install::target::UNFIRED_HOOK;
 use crate::install::verify::{SchemaParse, ShimRef};
-#[cfg(feature = "upstream")]
-use pixtuoid_core::source::grok::REPO;
-#[cfg(feature = "upstream")]
-use pixtuoid_core::source::upstream::{Finding, Read, Watch, When};
 
 /// The KEY is the detection signal; the value is only a human note for anyone
 /// who opens the file.
@@ -60,26 +49,8 @@ pub(crate) const GROK_EVENTS: &[&str] = &[
     "StopCancelled",
     "SubagentStart",
     "SubagentStop",
-    "SubagentEnd",
     "SessionEnd",
 ];
-
-#[cfg(feature = "upstream")]
-pub(crate) const UPSTREAM: &[Watch] = &[Watch {
-    id: "grok.hook_events",
-    ours: || GROK_EVENTS.to_vec(),
-    docs: &[REPO.doc(
-        "crates/codegen/xai-grok-hooks/src/event.rs",
-        r"pub enum HookEventName\b",
-        "`HookEventName`",
-    )],
-    read: Read::RustMacroRows {
-        name: "hook_events",
-    },
-    when: When::Vanishes,
-    finding: Finding::Breaking(UNFIRED_HOOK),
-    siblings: None,
-}];
 
 /// `{grok_home}/hooks/pixtuoid.json`, via the SAME `grok_home()` resolution the
 /// watcher's sessions root and the liveness probe ride, so the three can never
@@ -412,9 +383,9 @@ mod tests {
         );
 
         let mut doc: Value = serde_json::from_str(&installed.content).unwrap();
-        doc["hooks"].as_object_mut().unwrap().remove("SubagentEnd");
+        doc["hooks"].as_object_mut().unwrap().remove("SubagentStop");
         let half_dead = verify_schema(&doc.to_string());
-        assert!(half_dead.issues.iter().any(|i| i.contains("SubagentEnd")));
+        assert!(half_dead.issues.iter().any(|i| i.contains("SubagentStop")));
 
         let mut doc: Value = serde_json::from_str(&installed.content).unwrap();
         doc["hooks"]["Stop"][0]["hooks"][0]["env"] = json!({});
@@ -470,7 +441,7 @@ mod tests {
                 "Notification" => {
                     payload["notificationType"] = serde_json::json!("permission_prompt");
                 }
-                "SubagentStart" | "SubagentStop" | "SubagentEnd" => {
+                "SubagentStart" | "SubagentStop" => {
                     payload["subagentId"] = serde_json::json!("0197fa31-child");
                     payload["subagentType"] = serde_json::json!("explore");
                 }
@@ -502,7 +473,6 @@ mod tests {
                 "StopFailure",
                 "SubagentStart",
                 "SubagentStop",
-                "SubagentEnd",
                 "SessionEnd",
             ],
         );

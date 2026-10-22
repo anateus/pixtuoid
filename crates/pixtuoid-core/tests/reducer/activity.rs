@@ -6,7 +6,9 @@ use pixtuoid_core::source::{AgentEvent, Transport};
 use pixtuoid_core::state::reducer::Reducer;
 use pixtuoid_core::state::{ActivityState, SceneState};
 
-use crate::{act_end, act_start, start, waiting};
+use crate::{
+    HOOK_AND_TRANSCRIPT, UNNAMED_CHILD_HOOKS, act_end, act_start, start, start_as, waiting,
+};
 
 #[test]
 fn activity_start_sets_state_active() {
@@ -217,7 +219,7 @@ fn active_ms_does_not_double_count_on_duplicate_activity_end() {
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/dedup.jsonl");
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, HOOK_AND_TRANSCRIPT);
 
     act_start(
         &mut r,
@@ -279,7 +281,7 @@ fn active_ms_preserved_when_task_arrives_during_active_tool() {
             detail: Some(ToolDetail::Task),
         },
         t1,
-        Transport::Jsonl,
+        Transport::Hook,
     );
 
     let slot = scene.agents.get(&id).unwrap();
@@ -459,7 +461,7 @@ fn parallel_tool_end_while_waiting_keeps_waiting() {
         id,
         Some("t2"),
         t0 + Duration::from_millis(1000),
-        Transport::Jsonl,
+        Transport::Hook,
     );
     let slot = scene.agents.get(&id).unwrap();
     assert!(
@@ -496,7 +498,7 @@ fn turn_end_stop_hook_resolves_stale_waiting() {
     let id = AgentId::from_parts("reasonix", "/Users/dev/proj");
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, "reasonix");
     waiting(
         &mut r,
         &mut scene,
@@ -523,9 +525,55 @@ fn turn_end_stop_hook_resolves_stale_waiting() {
     );
 }
 
-// Codex's JSONL emits None-id ActivityEnds per tool (it opts out of dedup), and
-// one can race in just after a fresh PermissionRequest — so only the HOOK-side
-// turn-end signal may resolve a Waiting.
+// kimi kills a still-running PostToolUse(Failure) hook when its turn ends, so a
+// call may never get its own End; the turn's Stop must still settle the slot.
+#[test]
+fn a_turn_end_settles_a_call_whose_own_end_never_came() {
+    use crate::waiting_for;
+    use pixtuoid_core::state::reducer::ACTIVE_GRACE_WINDOW;
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    for gated in [false, true] {
+        let mut scene = SceneState::uniform(4);
+        let mut r = Reducer::new();
+        let id = AgentId::from_parts("kimi", "session_abc");
+        start_as(&mut r, &mut scene, id, "kimi");
+        act_start(
+            &mut r,
+            &mut scene,
+            id,
+            Some("call_1"),
+            None,
+            t0,
+            Transport::Hook,
+        );
+        if gated {
+            waiting_for(
+                &mut r,
+                &mut scene,
+                id,
+                "permission",
+                Some("call_1"),
+                t0,
+                Transport::Hook,
+            );
+        }
+        let stop = t0 + Duration::from_millis(800);
+        act_end(&mut r, &mut scene, id, None, stop, Transport::Hook);
+        r.tick(
+            &mut scene,
+            stop + ACTIVE_GRACE_WINDOW + Duration::from_millis(100),
+        );
+        assert_eq!(
+            scene.agents.get(&id).unwrap().state,
+            ActivityState::Idle,
+            "gated: {gated}"
+        );
+    }
+}
+
+// Codex's JSONL turn end is a None-id ActivityEnd (its output Ends carry the call
+// id), and one can race in just after a fresh PermissionRequest — so only the
+// HOOK-side turn-end signal may resolve a Waiting.
 #[test]
 fn jsonl_none_id_end_while_waiting_keeps_waiting() {
     use pixtuoid_core::state::reducer::ACTIVE_GRACE_WINDOW;
@@ -534,7 +582,7 @@ fn jsonl_none_id_end_while_waiting_keeps_waiting() {
     let id = AgentId::from_parts("codex", "sess-1");
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, "codex");
     waiting(&mut r, &mut scene, id, "permission", t0, Transport::Hook);
     act_end(
         &mut r,
@@ -607,52 +655,6 @@ fn codex_permission_then_jsonl_output_resumes_to_active() {
     );
 }
 
-#[test]
-fn copilot_denied_permission_clears_waiting_through_the_reducer() {
-    use pixtuoid_core::source::copilot::decode_copilot_line;
-    let mut scene = SceneState::uniform(4);
-    let mut r = Reducer::new();
-    let path = "/p/session-state/sess/events.jsonl";
-    let id = AgentId::from_parts("copilot", "sess");
-    let feed = |r: &mut Reducer, scene: &mut SceneState, line: &str| {
-        for ev in decode_copilot_line(path, "copilot", serde_json::from_str(line).unwrap()).unwrap()
-        {
-            r.apply(scene, ev, SystemTime::now(), Transport::Jsonl);
-        }
-    };
-    feed(
-        &mut r,
-        &mut scene,
-        r#"{"type":"session.start","data":{"sessionId":"sess","context":{"cwd":"/repo"}},"id":"a","parentId":null}"#,
-    );
-    // BYTE-REAL: a matched permission round captured from a live copilot session
-    // (the user pressed Reject) — do not hand-edit these payloads.
-    feed(
-        &mut r,
-        &mut scene,
-        r#"{"type":"permission.requested","data":{"requestId":"954afe31-559a-4afc-9eb6-13e30cf48aea","permissionRequest":{"kind":"shell","toolCallId":"call_nf1RvU9GxssNg2g7WtPgHqQ4","fullCommandText":"cat /etc/hostname","intention":"Show system hostname","commands":[{"identifier":"cat","readOnly":true}],"possiblePaths":["/etc/hostname"],"possibleUrls":[],"hasWriteFileRedirection":false,"canOfferSessionApproval":true},"promptRequest":{"kind":"path","accessKind":"shell","paths":["/etc/hostname"],"toolCallId":"call_nf1RvU9GxssNg2g7WtPgHqQ4"}},"id":"5240af45-3ad2-4bf7-bc37-83c329c9c2ea","timestamp":"2026-06-14T21:38:40.507Z","parentId":"cb3c0a03-3f84-451c-bac6-843f0632ba9f"}"#,
-    );
-    assert!(
-        matches!(
-            scene.agents.get(&id).unwrap().state,
-            ActivityState::Waiting { .. }
-        ),
-        "permission.requested should set Waiting"
-    );
-    feed(
-        &mut r,
-        &mut scene,
-        r#"{"type":"permission.completed","data":{"requestId":"954afe31-559a-4afc-9eb6-13e30cf48aea","toolCallId":"call_nf1RvU9GxssNg2g7WtPgHqQ4","result":{"kind":"denied-interactively-by-user"}},"id":"60dae716-c76c-45e2-84e1-c3248ce3790c","timestamp":"2026-06-14T21:38:43.086Z","parentId":"5240af45-3ad2-4bf7-bc37-83c329c9c2ea"}"#,
-    );
-    assert!(
-        !matches!(
-            scene.agents.get(&id).unwrap().state,
-            ActivityState::Waiting { .. }
-        ),
-        "a DENIED permission must clear Waiting (else the sprite hangs 60 min)"
-    );
-}
-
 // Line shapes follow a captured omp ask round, sanitized.
 #[test]
 fn omp_ask_round_waits_then_answer_clears_through_the_reducer() {
@@ -710,6 +712,102 @@ fn omp_ask_round_waits_then_answer_clears_through_the_reducer() {
     );
 }
 
+// Line shapes follow agy's `ask-question` recording.
+#[test]
+fn an_answered_agy_question_clears_waiting_on_either_transport() {
+    use pixtuoid_core::source::antigravity::{SOURCE_NAME, decode_ag_line};
+    use pixtuoid_core::source::decoder::decode_hook_payload;
+    use pixtuoid_core::state::reducer::ACTIVE_GRACE_WINDOW;
+    use serde_json::{Value, json};
+    const TRANSCRIPT: &str =
+        "/h/.gemini/antigravity-cli/brain/c1/.system_generated/logs/transcript.jsonl";
+    fn feed(r: &mut Reducer, scene: &mut SceneState, wire: &[(Value, Transport)], at: SystemTime) {
+        for (v, tp) in wire {
+            let events = match tp {
+                Transport::Hook => decode_hook_payload(v.clone()),
+                _ => decode_ag_line(TRANSCRIPT, SOURCE_NAME, v.clone()),
+            };
+            for ev in events.expect("agy's wire decodes") {
+                r.apply(scene, ev, at, *tp);
+            }
+        }
+    }
+    let hook = |event: &str| {
+        (
+            json!({
+                "_pixtuoid_source": SOURCE_NAME, "_pixtuoid_event": event,
+                "conversationId": "c1", "workspacePaths": ["/repo"], "stepIdx": 2,
+                "toolCall": { "name": "ask_question", "args": {} },
+            }),
+            Transport::Hook,
+        )
+    };
+    let asked = (
+        json!({ "step_index": 1, "type": "PLANNER_RESPONSE",
+                "tool_calls": [{ "name": "ask_question", "args": {} }] }),
+        Transport::Jsonl,
+    );
+    let answered = (
+        json!({ "step_index": 2, "type": "GENERIC" }),
+        Transport::Jsonl,
+    );
+    let id = AgentId::from_parts(SOURCE_NAME, "c1");
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let t1 = t0 + Duration::from_secs(5);
+    for (what, asks, answers) in [
+        ("transcript", vec![asked.clone()], vec![answered.clone()]),
+        ("hooks", vec![hook("PreToolUse")], vec![hook("PostToolUse")]),
+        (
+            "both",
+            vec![asked.clone(), hook("PreToolUse")],
+            vec![hook("PostToolUse"), answered.clone()],
+        ),
+        (
+            "both, reversed",
+            vec![hook("PreToolUse"), asked.clone()],
+            vec![answered.clone(), hook("PostToolUse")],
+        ),
+    ] {
+        let mut scene = SceneState::uniform(4);
+        let mut r = Reducer::new();
+        start_as(&mut r, &mut scene, id, SOURCE_NAME);
+        feed(&mut r, &mut scene, &asks, t0);
+        assert!(
+            matches!(scene.agents[&id].state, ActivityState::Waiting { .. }),
+            "{what}: the question parks the slot Waiting"
+        );
+        feed(&mut r, &mut scene, &answers, t1);
+        r.tick(
+            &mut scene,
+            t1 + ACTIVE_GRACE_WINDOW + Duration::from_millis(100),
+        );
+        assert!(
+            matches!(scene.agents[&id].state, ActivityState::Idle),
+            "{what}: the answer clears Waiting before the turn ends"
+        );
+    }
+    // Both sides of the window the hook End is remembered for.
+    let inside = HOOK_WINS_WINDOW / 10;
+    let past = HOOK_WINS_WINDOW + Duration::from_millis(1);
+    for (what, late, after, parks) in [
+        ("hook", hook("PreToolUse"), inside, false),
+        ("transcript", asked.clone(), inside, false),
+        ("hook", hook("PreToolUse"), past, true),
+        ("transcript", asked, past, true),
+    ] {
+        let mut scene = SceneState::uniform(4);
+        let mut r = Reducer::new();
+        start_as(&mut r, &mut scene, id, SOURCE_NAME);
+        feed(&mut r, &mut scene, &[hook("PostToolUse")], t0);
+        feed(&mut r, &mut scene, &[late], t0 + after);
+        assert_eq!(
+            matches!(scene.agents[&id].state, ActivityState::Waiting { .. }),
+            parks,
+            "{what}: a wait {after:?} after its call's hook End parks the slot only past the window"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // omp extension-bridge approval rounds (#951): the interleavings human approval
 // latency makes reachable past `HOOK_WINS_WINDOW` (`counted_calls`' own doc) —
@@ -729,7 +827,7 @@ fn approval_transcript_start_first_waits_then_resumes_active_counting_once() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/a.jsonl");
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, HOOK_AND_TRANSCRIPT);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     act_start(
@@ -781,7 +879,7 @@ fn approval_hook_waiting_first_survives_a_late_transcript_start() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/b.jsonl");
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, HOOK_AND_TRANSCRIPT);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     waiting_for(
@@ -836,7 +934,7 @@ fn approval_resume_before_the_transcript_start_counts_once() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/c.jsonl");
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, HOOK_AND_TRANSCRIPT);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     waiting_for(
@@ -884,7 +982,7 @@ fn denied_approval_clears_waiting_via_the_hook_end() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/d.jsonl");
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, HOOK_AND_TRANSCRIPT);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     act_start(
@@ -938,7 +1036,7 @@ fn parallel_gated_approvals_resolve_member_by_member() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/e.jsonl");
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, HOOK_AND_TRANSCRIPT);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     act_start(
@@ -1034,8 +1132,8 @@ fn parallel_gated_approvals_resolve_member_by_member() {
 fn a_delegating_parents_own_approval_round_survives_subagent_suppression() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
-    let id = AgentId::from_transcript_path("/p/f.jsonl");
-    start(&mut r, &mut scene, id);
+    let id = AgentId::from_parts(UNNAMED_CHILD_HOOKS, "f");
+    start_as(&mut r, &mut scene, id, UNNAMED_CHILD_HOOKS);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     // A Task in flight arms `suppress_subagent_leak` for this id.
@@ -1134,7 +1232,7 @@ fn a_denial_resolving_one_gate_keeps_the_queued_siblings() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/g.jsonl");
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, HOOK_AND_TRANSCRIPT);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     act_start(
@@ -1214,7 +1312,7 @@ fn an_already_resolved_calls_late_transcript_start_keeps_a_sibling_gate() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/h.jsonl");
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, HOOK_AND_TRANSCRIPT);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     // x1's whole round runs hook-first; its transcript Start straggles in
@@ -1283,7 +1381,7 @@ fn an_auto_approved_parallel_tool_does_not_strip_a_pending_gate() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/i.jsonl");
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, HOOK_AND_TRANSCRIPT);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     waiting_for(
@@ -1340,7 +1438,7 @@ fn the_approval_resume_labels_from_the_wire_tool_name() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/j.jsonl");
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, HOOK_AND_TRANSCRIPT);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     waiting_for(
@@ -1388,7 +1486,7 @@ fn a_transcript_twin_past_the_dedup_window_counts_once() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/k.jsonl");
-    start(&mut r, &mut scene, id);
+    start_as(&mut r, &mut scene, id, HOOK_AND_TRANSCRIPT);
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     act_start(

@@ -26,6 +26,7 @@ use pixtuoid_core::source::hook::HookRouter;
 use pixtuoid_core::source::jsonl::ChildEndUnclaims;
 use pixtuoid_core::source::omp::OmpSource;
 use pixtuoid_core::state::MAX_FLOORS;
+use pixtuoid_core::state::reducer::ACTIVE_GRACE_WINDOW;
 use pixtuoid_core::{Reducer, SceneState, TaggedReceiver};
 use tokio::sync::watch;
 
@@ -33,6 +34,16 @@ use super::gate;
 use super::{
     ConnectedSources, QuitArms, QuitSignal, RunConfig, SceneRx, resolve_boot_caps, summarize,
 };
+
+/// How often the headless loop samples the scene for a summary line.
+const HEADLESS_SUMMARY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+// A resolved wait stays shown for `ACTIVE_GRACE_WINDOW`, and that alone lets a
+// poll see a hermetic Permission row's brief wait.
+const _: () = assert!(
+    ACTIVE_GRACE_WINDOW.as_millis() > HEADLESS_SUMMARY_POLL_INTERVAL.as_millis(),
+    "a resolved wait must outlast one headless poll"
+);
 
 /// Boot the TUI (unless headless) and drive the source pipeline until it exits;
 /// the quit signal that ended it, for the caller to re-raise.
@@ -66,8 +77,8 @@ type Boot = (
 /// the plan affords unless the config names one.
 fn boot_tui(cfg: &RunConfig) -> Result<Boot> {
     let pack = Arc::new(pixtuoid_scene::pack::load_bundled_pack()?);
-    let plan = crate::graphics::plan_this_terminal(cfg.graphics, pack.max_density_variant(), true);
-    tracing::info!(mode = ?cfg.graphics, plan = ?plan, "graphics plan");
+    let plan = crate::graphics::plan_this_terminal(cfg.look, pack.max_density_variant(), true);
+    tracing::info!(look = ?cfg.look, plan = ?plan, "graphics plan");
     let motion = cfg.motion.or(plan.motion(crate::graphics::Link::of_env()));
     tracing::info!(mode = ?cfg.motion, motion = ?motion, "motion");
     Ok((pack, plan, motion))
@@ -76,8 +87,6 @@ fn boot_tui(cfg: &RunConfig) -> Result<Boot> {
 async fn run_async(cfg: RunConfig, tui: Option<Boot>) -> Result<Option<QuitSignal>> {
     let RunConfig {
         socket,
-        projects_root,
-        codex_sessions_root,
         desk_cap,
         headless: _,
         config_path,
@@ -88,14 +97,11 @@ async fn run_async(cfg: RunConfig, tui: Option<Boot>) -> Result<Option<QuitSigna
         drift,
         first_run,
         audio,
-        graphics: _,
+        look: _,
         motion: _,
     } = cfg;
     // Audio owns no state here: `run_tui` builds the AudioController, which owns
     // the device thread and tears it down on Drop at any exit.
-    // Focus-jump pid point-query roots (cloned: build_source_set consumes the
-    // originals).
-    let focus_roots = (projects_root.clone(), codex_sessions_root.clone());
     let connected = ConnectedSources::new(connected);
     let socket_path = socket.unwrap_or_else(ClaudeCodeSource::default_socket_path);
     // The terminal-size query stays here in the shell (the injected `measure`);
@@ -112,13 +118,7 @@ async fn run_async(cfg: RunConfig, tui: Option<Boot>) -> Result<Option<QuitSigna
         health_rx,
         floor_caps,
         _source_handles,
-    } = super::pipeline::spawn_pipeline(
-        socket_path.clone(),
-        projects_root,
-        codex_sessions_root,
-        connected.clone(),
-        boot_caps,
-    );
+    } = super::pipeline::spawn_pipeline(socket_path.clone(), connected.clone(), boot_caps);
 
     match tui {
         None => headless_loop(scene_rx, health_rx).await,
@@ -139,7 +139,6 @@ async fn run_async(cfg: RunConfig, tui: Option<Boot>) -> Result<Option<QuitSigna
                 log,
                 drift,
                 first_run,
-                focus_roots,
                 audio_cfg: audio,
             })
             .await
@@ -148,28 +147,19 @@ async fn run_async(cfg: RunConfig, tui: Option<Boot>) -> Result<Option<QuitSigna
 }
 
 /// Build the runtime source set `run_async` spawns — the ONE place that set is
-/// constructed. Each transcript source carries different typed config (CC's
-/// projects root, Codex's sessions root), so this stays imperative rather than a
-/// registry-driven loop. Hook-only sources + the daemon (OpenClaw) are absent by
+/// constructed. Imperative rather than a registry-driven loop: cc, codex and
+/// grok share one `ChildEndUnclaims` the others don't take. Hook-only sources + the daemon (OpenClaw) are absent by
 /// design — they ride the router's shared socket.
 pub(crate) fn build_source_set(
     socket_path: PathBuf,
-    projects_root: Option<PathBuf>,
-    codex_sessions_root: Option<PathBuf>,
     presence_tx: Option<daemon::PresenceSender>,
 ) -> Vec<Box<dyn DynSource>> {
     let mut cc_src = ClaudeCodeSource::default_paths();
-    if let Some(p) = projects_root {
-        cc_src.projects_root = p;
-    }
     let ag_src = AntigravitySource::default_paths();
     let copilot_src = CopilotSource::default_paths();
     let omp_src = OmpSource::default_paths();
 
     let mut codex_src = CodexSource::default_paths();
-    if let Some(p) = codex_sessions_root {
-        codex_src.sessions_root = p;
-    }
 
     // The hook tee is the sole PRODUCER, and each watcher drains only ids whose
     // transcripts it claims (AgentId is source-namespaced), so a Codex child waits
@@ -316,7 +306,6 @@ async fn headless_loop_with_signal(
     // deaths must surface in the summary stream or a dead transport reads as a
     // silently empty office. Tracked by count: the watch Vec only grows.
     let mut deaths_seen = 0usize;
-    const HEADLESS_SUMMARY_POLL_INTERVAL_MS: u64 = 200;
     loop {
         // Headless mode exists to feed this stream, so a reader that left
         // (`| head`) ends the run.
@@ -325,7 +314,7 @@ async fn headless_loop_with_signal(
             return Ok(None);
         }
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(HEADLESS_SUMMARY_POLL_INTERVAL_MS)) => {
+            _ = tokio::time::sleep(HEADLESS_SUMMARY_POLL_INTERVAL) => {
                 let snapshot = scene_rx.borrow_and_update().clone();
                 let summary = summarize(&snapshot);
                 if summary != prev_summary {
@@ -369,7 +358,7 @@ mod tests {
         use pixtuoid_core::source::registry::{self, descriptor_for};
         use std::collections::BTreeSet;
 
-        let sources = build_source_set(PathBuf::from("/tmp/pixtuoid-test.sock"), None, None, None);
+        let sources = build_source_set(PathBuf::from("/tmp/pixtuoid-test.sock"), None);
         let built: BTreeSet<&str> = sources.iter().map(|s| s.name()).collect();
 
         // The HookRouter is infrastructure, not a registered CLI: it has no

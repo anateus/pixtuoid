@@ -3,47 +3,16 @@
 //! from the line unchanged. The recorder strips captures with it, so a field a
 //! decoder stopped reading cannot linger in committed bytes.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use super::provenance::{Deidentified, Provenance};
 use super::{Capture, Drive, LineFailure, captures};
 use crate::source::daemon::DecodedPresence;
 use crate::source::registry;
-
-/// What the provenance says happened to the bytes after recording. `Exempt`
-/// is declared by hand, in the committed record, for a capture whose purpose
-/// is to pin a wire premise the decoder drops on purpose — a test that reads
-/// raw bytes is invisible to the probe, so the record has to say so.
-#[derive(Debug)]
-pub enum Deidentified {
-    /// Subtrees blanked because no decoder reads them.
-    Stripped(usize),
-    /// Left as recorded, for the reason the provenance gives.
-    Exempt(String),
-}
-
-impl Deidentified {
-    /// The provenance's `deidentified` object.
-    pub fn record(&self) -> Value {
-        match self {
-            Self::Stripped(n) => serde_json::json!({ "method": "decoder-allowlist", "blanked": n }),
-            Self::Exempt(why) => serde_json::json!({ "method": "none", "why": why }),
-        }
-    }
-}
-
-/// The exemption a committed `provenance.json` declares, if any.
-pub fn exemption(provenance: &Path) -> Option<String> {
-    let record: Value = serde_json::from_str(&std::fs::read_to_string(provenance).ok()?).ok()?;
-    (record["deidentified"]["method"] == "none").then(|| {
-        record["deidentified"]["why"]
-            .as_str()
-            .unwrap_or("")
-            .to_string()
-    })
-}
 
 /// One strip pass: how many subtrees were blanked, and which files were left as
 /// recorded because a line in them is not JSON.
@@ -80,11 +49,9 @@ pub fn strip_unread(source: &str, files: &[PathBuf]) -> std::io::Result<Strip> {
                 continue;
             }
         };
-        let base = events_of(source, &drive, &lines);
-        let stamped = is_hook_envelope(file);
+        let per_line = strip_with(source, &drive, file, &mut lines);
         let mut out = String::new();
-        for i in 0..lines.len() {
-            let here = probe(source, &drive, &mut lines, &base, i, "", stamped);
+        for (i, here) in per_line.into_iter().enumerate() {
             strip.blanked += here;
             if here == 0 {
                 out.push_str(&raw[i]);
@@ -96,6 +63,25 @@ pub fn strip_unread(source: &str, files: &[PathBuf]) -> std::io::Result<Strip> {
         replace_atomically(file, out.as_bytes())?;
     }
     Ok(strip)
+}
+
+/// `file`'s `lines` blanked as [`strip_unread`] blanks them; `false` when no
+/// decoder reads `file`, which a strip leaves as it is.
+pub(crate) fn strip_lines(source: &str, file: &Path, lines: &mut [Value]) -> bool {
+    let Some(drive) = drive_for(source, file) else {
+        return false;
+    };
+    strip_with(source, &drive, file, lines);
+    true
+}
+
+/// Each line's count of subtrees blanked, `lines` rewritten in place.
+fn strip_with(source: &str, drive: &Drive, file: &Path, lines: &mut [Value]) -> Vec<usize> {
+    let base = events_of(source, drive, lines);
+    let stamped = is_hook_envelope(file);
+    (0..lines.len())
+        .map(|i| probe(source, drive, lines, &base, i, "", stamped))
+        .collect()
 }
 
 /// Write `bytes` over `file` through a sibling and a rename, so a reader never
@@ -142,9 +128,12 @@ fn sibling_of(file: &Path) -> PathBuf {
 /// If a provenance or capture file cannot be read, parsed or rewritten.
 pub fn strip_corpus(root: &Path, mut report: impl FnMut(&Capture, &Strip)) -> std::io::Result<()> {
     for capture in captures(root) {
-        let prov = capture.dir.join(crate::harness::PROVENANCE);
-        let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&prov)?)?;
-        if !strips(&record) {
+        let path = capture.provenance_path();
+        let mut record = Provenance::read(&path)?;
+        let Provenance::Recorded(r) = &mut record else {
+            continue;
+        };
+        if !r.strips() {
             continue;
         }
         let files = capture.jsonl_files();
@@ -152,22 +141,15 @@ pub fn strip_corpus(root: &Path, mut report: impl FnMut(&Capture, &Strip)) -> st
             continue;
         }
         let strip = strip_unread(&capture.source, &files)?;
-        if let Some(obj) = record.as_object_mut()
-            && (strip.blanked > 0 || !obj.contains_key("deidentified"))
-        {
-            let earlier = obj
-                .get("deidentified")
-                .and_then(|d| d["blanked"].as_u64())
-                .and_then(|n| usize::try_from(n).ok())
-                .unwrap_or(0);
-            obj.insert(
-                "deidentified".into(),
-                Deidentified::Stripped(earlier + strip.blanked).record(),
-            );
-            std::fs::write(
-                &prov,
-                format!("{}\n", serde_json::to_string_pretty(&record)?),
-            )?;
+        if strip.blanked > 0 || r.deidentified.is_none() {
+            let earlier = match r.deidentified {
+                Some(Deidentified::Stripped { blanked }) => blanked,
+                _ => 0,
+            };
+            r.deidentified = Some(Deidentified::Stripped {
+                blanked: earlier + strip.blanked,
+            });
+            record.write_to(&path)?;
         }
         report(&capture, &strip);
     }
@@ -219,14 +201,22 @@ type Decoded = (
 /// Everything the registry reads from a line, not only the line decoder: a
 /// daemon's envelopes decode to no `AgentEvent` by design (presence rides
 /// `presence_decoder`), and the watcher registers a transcript through
-/// `cwd_extractor`, which the harness never calls — it seeds a fixed cwd.
+/// `cwd_extractor` and `parent_extractor`, which the harness never calls — it
+/// seeds a fixed cwd and no parent.
 /// Compared as rendered, the way a golden is: `PathBuf` equality drops a
 /// trailing slash, and grok's `workspaceRoot` fallback differs by exactly that.
 fn events_of(source: &str, drive: &Drive, lines: &[Value]) -> Decoded {
     let d = drive.lines(lines.iter().map(Value::to_string));
-    let cwds = lines
+    let parent = registry::parent_extractor_for(source);
+    let first_sight = lines
         .iter()
-        .map(|l| format!("{:?}", registry::cwd_extractor_for(source)(l)))
+        .map(|l| {
+            format!(
+                "{:?} {:?}",
+                registry::cwd_extractor_for(source)(l),
+                parent.and_then(|f| f(l))
+            )
+        })
         .collect();
     let presence = lines
         .iter()
@@ -242,15 +232,8 @@ fn events_of(source: &str, drive: &Drive, lines: &[Value]) -> Decoded {
         failures(&d.panics),
         d.breadcrumbs,
         presence,
-        cwds,
+        first_sight,
     )
-}
-
-/// Whether the strip applies to a capture with this provenance: a recording
-/// not declared exempt, whose committed bytes then hold only what a decoder
-/// reads.
-pub(crate) fn strips(record: &Value) -> bool {
-    record["origin"] == "recorded" && record["deidentified"]["method"] != "none"
 }
 
 /// What blanking writes over `node`, its type's empty value; `None` when that
@@ -277,6 +260,40 @@ pub(crate) fn child_pointer(at: &str, key: &str) -> String {
 /// `tests/sources/captures.rs`, which dates a capture by it.
 pub(crate) fn is_shim_stamp(at: &str, key: &str) -> bool {
     at.is_empty() && key.starts_with('_')
+}
+
+/// Each non-empty string leaf of `v` under `at`, as `(pointer, value)`, a
+/// string that holds JSON read on under its own pointer. A shim stamp counts:
+/// `_pixtuoid_event` is the only place a hook's name arrives for a CLI that
+/// does not send it (antigravity).
+pub(crate) fn string_leaves(v: &Value, at: &str, out: &mut BTreeSet<(String, String)>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                string_leaves(x, &child_pointer(at, k), out);
+            }
+        }
+        Value::Array(a) => {
+            for x in a {
+                string_leaves(x, &format!("{at}/*"), out);
+            }
+        }
+        Value::String(s) if !s.is_empty() => {
+            if let Some(inner) = embedded_json(s) {
+                string_leaves(&inner, at, out);
+            }
+            out.insert((at.to_owned(), s.clone()));
+        }
+        _ => {}
+    }
+}
+
+/// The JSON a string holds, which the censuses read on into: codex's
+/// `arguments` keys its call's fields.
+pub(crate) fn embedded_json(s: &str) -> Option<Value> {
+    s.starts_with(['{', '['])
+        .then(|| serde_json::from_str(s).ok())
+        .flatten()
 }
 
 fn probe(
@@ -327,20 +344,6 @@ mod tests {
     use crate::harness::sources_root;
 
     #[test]
-    fn the_strip_applies_to_a_recording_not_declared_exempt() {
-        let record = |v: Value| strips(&v);
-        assert!(record(serde_json::json!({"origin": "recorded",
-            "deidentified": {"method": "decoder-allowlist"}})));
-        assert!(
-            record(serde_json::json!({"origin": "recorded"})),
-            "not yet stripped"
-        );
-        assert!(!record(serde_json::json!({"origin": "recorded",
-            "deidentified": {"method": "none"}})));
-        assert!(!record(serde_json::json!({"origin": "composed"})));
-    }
-
-    #[test]
     fn a_child_pointer_escapes_tilde_before_slash() {
         assert_eq!(child_pointer("/a", "b"), "/a/b");
         assert_eq!(child_pointer("", "x~y/z"), "/x~0y~1z");
@@ -388,24 +391,13 @@ mod tests {
         std::fs::write(file, out.join("\n") + "\n").expect("write");
     }
 
-    /// The scenario's one transcript, found rather than named: a re-record
-    /// gives it a new filename. The registry's admit rule and the recorder's
-    /// own hook-envelope test decide what is a transcript, and a stale second
-    /// one beside a promoted `.new` fails here instead of being picked by
-    /// directory order.
     fn transcript_in(source: &str, scenario: &Path) -> PathBuf {
-        let mut found: Vec<PathBuf> = crate::harness::transcripts_under(source, scenario)
-            .into_iter()
-            .filter(|p| !is_hook_envelope(p))
-            .collect();
-        assert_eq!(
-            found.len(),
-            1,
-            "{}: one transcript per scenario, found {:?}",
-            scenario.display(),
-            found
-        );
-        found.remove(0)
+        crate::harness::transcript_in(source, scenario).unwrap_or_else(|found| {
+            panic!(
+                "{}: one transcript per scenario, found {found:?}",
+                scenario.display()
+            )
+        })
     }
 
     fn stripped_copy_of(src: &Path) -> (tempfile::TempDir, PathBuf) {
@@ -427,11 +419,7 @@ mod tests {
 
     #[test]
     fn a_daemon_capture_keeps_what_its_presence_decoder_reads() {
-        let (_d, hooks) = stripped_copy(
-            "openclaw",
-            "gateway-lifecycle-recorded",
-            "hook-payloads.jsonl",
-        );
+        let (_d, hooks) = stripped_copy("openclaw", "tool-run-hermetic", "hook-payloads.jsonl");
         let files = vec![hooks.clone()];
         let before = scenario_events("openclaw", &files);
         let wire = std::fs::read_to_string(&hooks).expect("read");
@@ -618,10 +606,9 @@ mod tests {
             let before = scenario_events(source, &files);
             let strip = strip_unread(source, &files).expect("strip");
             assert_eq!(scenario_events(source, &files), before, "{label}");
-            let recorded = std::fs::read_to_string(scenario.join(crate::harness::PROVENANCE))
-                .ok()
-                .and_then(|record| serde_json::from_str(&record).ok())
-                .is_some_and(|record| strips(&record));
+            let recorded = Provenance::read_if_any(&capture.provenance_path())
+                .expect("a committed record parses")
+                .is_some_and(|record| record.strips());
             assert!(
                 !recorded || strip.blanked == 0,
                 "{label}: {} subtrees no decoder reads any more; `just restrip-fixtures`",

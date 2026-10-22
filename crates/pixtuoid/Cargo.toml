@@ -20,8 +20,8 @@ name = "pixtuoid"
 path = "src/main.rs"
 
 [dependencies]
-pixtuoid-core  = { path = "../pixtuoid-core", version = "0.19.0" }
-pixtuoid-scene = { path = "../pixtuoid-scene", version = "0.19.0" }
+pixtuoid-core  = { path = "../pixtuoid-core", version = "0.20.0" }
+pixtuoid-scene = { path = "../pixtuoid-scene", version = "0.20.0" }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "fs", "io-util"] }
 ratatui            = { workspace = true }
 # The base64 of kitty's transmits and of the probe's queries.
@@ -51,23 +51,11 @@ toml_edit          = { workspace = true }
 # YAML parse+emit for the Hermes install target — the maintained yaml-rust
 # successor, serde_yaml and serde_yml both being abandoned. It data-preserves a
 # user's other config keys on merge but does NOT round-trip comments.
-saphyr             = "0.1.0"
+saphyr             = "0.2.1"
 anyhow             = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 which              = "8"
-regex              = { workspace = true, optional = true }
-sha2               = { workspace = true, optional = true }
-# `printing` for the span a reader slices an arm's source by.
-syn                = { workspace = true, optional = true, features = ["printing"] }
-# A reader slices the source a syntax node spans.
-proc-macro2        = { workspace = true, optional = true, features = ["span-locations"] }
-oxc_allocator      = { workspace = true, optional = true }
-oxc_ast            = { workspace = true, optional = true }
-oxc_ast_visit      = { workspace = true, optional = true }
-oxc_parser         = { workspace = true, optional = true }
-oxc_span           = { workspace = true, optional = true }
-pulldown-cmark     = { workspace = true, optional = true }
 # clock feature gives us Local::now() w/ system timezone for the wall clock.
 chrono             = { workspace = true, features = ["clock"] }
 open               = "5"
@@ -105,7 +93,11 @@ clap_mangen = "0.3.0"
 # headers on Linux. `tracing` routes rodio's OWN diagnostics
 # to `tracing::error!/debug!` instead of its default `eprintln!` — a raw stderr
 # write mid-altscreen corrupts the TUI.
-rodio = { version = "0.22.2", default-features = false, features = ["playback", "tracing"], optional = true }
+rodio = { version = "0.23.0", default-features = false, features = ["playback", "tracing"], optional = true }
+# The music ring between the audio thread and the device callback: documented
+# wait-free and allocation-free after construction, which `std::sync::mpsc`
+# doesn't promise, with chunks written in place.
+rtrb = { version = "0.4.0", optional = true }
 
 [features]
 # `build-target` builds the Linux release artifacts with `portable` alone, so a
@@ -113,22 +105,7 @@ rodio = { version = "0.22.2", default-features = false, features = ["playback", 
 default = ["audio", "portable"]
 portable = []
 # Ambient sound (config-OFF at runtime regardless; this gates the DEPENDENCY).
-audio = ["dep:rodio"]
-# The `drift_watch` example's checker, with every source's upstream
-# declarations, and its tests; no shipped build enables it.
-upstream = [
-    "pixtuoid-core/upstream",
-    "dep:regex",
-    "dep:sha2",
-    "dep:syn",
-    "dep:proc-macro2",
-    "dep:oxc_allocator",
-    "dep:oxc_ast",
-    "dep:oxc_ast_visit",
-    "dep:oxc_parser",
-    "dep:oxc_span",
-    "dep:pulldown-cmark",
-]
+audio = ["dep:rodio", "dep:rtrb"]
 
 # termios/select for `term::query_tty` (the truecolor and graphics probes),
 # O_NOFOLLOW in install/io.rs, the stderr dup in audio/sink.rs.
@@ -176,8 +153,7 @@ windows-sys = { workspace = true, features = [
 [dev-dependencies]
 # `tests/wire_to_pixels.rs` drives real fixture bytes through the shared
 # `pixtuoid_core::harness` pipeline, which is behind core's dev-only feature.
-# `upstream`: the installers' parity tests read a source's declared watch.
-pixtuoid-core = { path = "../pixtuoid-core", version = "0.19.0", features = ["harness", "upstream"] }
+pixtuoid-core = { path = "../pixtuoid-core", version = "0.20.0", features = ["harness"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
 # tests/text_coverage.rs parses the source of everything that renders text.
@@ -188,7 +164,7 @@ proc-macro2 = { workspace = true }
 snapbox  = { workspace = true, features = ["json"] }
 # Emits the SourceStatus JSON Schema — test/gen only, so the `JsonSchema` derive
 # is `cfg_attr(test)` and this stays a dev-dep. See sources.rs + `just gen-contract`.
-schemars = "1"
+schemars = { workspace = true }
 # test-util: paused-clock signal-arm tests in runtime/driver.rs (headless_loop).
 tokio    = { workspace = true, features = ["test-util"] }
 image    = { workspace = true, features = ["gif"] }
@@ -204,10 +180,6 @@ criterion  = { workspace = true }
 name = "snapshot"
 path = "examples/snapshot/main.rs"
 test = true
-
-[[example]]
-name = "drift_watch"
-required-features = ["upstream"]
 
 [package.metadata.deb]
 section = "utils"

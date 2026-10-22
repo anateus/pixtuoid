@@ -8,61 +8,19 @@ use crate::source::decoder::DecodeResult as Result;
 use serde_json::Value;
 
 use crate::source::decoder::{
-    CwdExtractor, IdDeriver, LineDecoder, PathFilter, accept_all_paths, default_id_from_path,
-    extract_top_level_cwd,
+    CwdExtractor, IdDeriver, LineDecoder, ParentExtractor, PathFilter, accept_all_paths,
+    default_id_from_path, extract_top_level_cwd,
 };
 use crate::source::{
     AgentEvent, antigravity, claude_code, codewhale, codex, copilot, cursor, dsh, grok, hermes,
     kimi, omp, openclaw, opencode, reasonix,
 };
-#[cfg(any(test, feature = "upstream"))]
-use crate::source::{
-    acp,
-    upstream::{Upstream, Watch},
-};
-
-/// How the shared hook decoder derives the AgentId for this source. Moot for a
-/// [`HookCustom::ClaimsAll`] source (its decoder builds its own AgentIds and the
-/// shared id-key branch is never reached) — pick `TranscriptPathThenSessionId`
-/// with an `// inert` comment there.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum IdKey {
-    /// `transcript_path` when present and non-empty, else `session_id`. Correct
-    /// for path-keyed sources whose hook and JSONL both carry the transcript
-    /// path, so they coalesce on it. NOT CC — see [`Self::SessionId`].
-    TranscriptPathThenSessionId,
-    /// Always `session_id`, ignoring any `transcript_path`. Correct for CC and
-    /// Codex: their hook `session_id` IS the transcript filename stem, so hook
-    /// and JSONL events coalesce on it. Keying on the path instead would split
-    /// them into two sprites — CC's transcript path is cwd-derived (a
-    /// git-worktree split rebuilds the wrong parent) and Codex's is
-    /// `string | null`.
-    SessionId,
-}
-
-/// A source's own hook-payload decoder, dispatched ahead of the shared CC-shaped
-/// arms — TYPED by whether it may decline, so a [`Self::ClaimsAll`] fn has no
-/// `Option` to get wrong.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum HookCustom {
-    /// EXTENDS the shared arms: tried first; `Ok(Some(events))` short-circuits,
-    /// `Ok(None)` DECLINES and falls through to the shared arms, `Err`
-    /// propagates.
-    Extend(fn(&Value) -> Result<Option<Vec<AgentEvent>>>),
-    /// CLAIMS every event: an alien-envelope source (no shared
-    /// `hook_event_name`/`session_id` for the shared arms to key on) whose
-    /// decoder handles EVERYTHING and constructs its own AgentIds. It can NOT
-    /// decline, so a payload never silently falls through to the shared arms.
-    ClaimsAll(fn(&Value) -> Result<Vec<AgentEvent>>),
-}
 
 /// The wire NAME of the per-call tool id in this source's hook envelope, read by
 /// the shared arms. It is a registry row and not a per-source copy of those arms
 /// because reading the wrong name is SILENT — the field is optional, so a
 /// mis-spelling is indistinguishable from an absent id, and every kimi tool call
-/// decoded to `None` for the whole source's life. Moot for a
-/// `HookCustom::ClaimsAll` source, exactly as `IdKey` is — pick `ToolUse`
-/// with an `// inert` comment there.
+/// decoded to `None` for the whole source's life.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToolIdKey {
     /// `tool_use_id` — Claude Code's spelling, and every CC-shaped envelope's
@@ -83,17 +41,26 @@ impl ToolIdKey {
     }
 }
 
-/// Per-source hook decoding behaviour beyond the shared CC-shaped arms.
-#[derive(Debug)]
-pub struct HookDecoding {
-    /// The per-session AgentId key strategy, read by the shared arms only.
-    pub(crate) id_key: IdKey,
-    /// The per-call tool id's wire name, read by the shared arms only.
-    pub tool_id_key: ToolIdKey,
-    /// The source's own decoder, dispatched FIRST — before any shared field
-    /// requirement — so an alien envelope (no `session_id` at all) can still
-    /// decode. `None` = ride the shared arms only.
-    pub(crate) custom: Option<HookCustom>,
+/// How a source's hook payloads decode. The source's own decoder runs FIRST,
+/// before any shared field requirement, so an alien envelope (no `session_id` at
+/// all) can still decode; TYPED by whether it may decline, so a
+/// [`Self::ClaimsAll`] row has no `Option` to get wrong and no shared-arm setting
+/// it would never read.
+#[derive(Debug, Clone, Copy)]
+pub enum HookDecoding {
+    /// The shared CC-shaped arms, keyed on `session_id`, which `extend` EXTENDS:
+    /// `Ok(Some(events))` short-circuits, `Ok(None)` DECLINES and falls through
+    /// to the shared arms, `Err` propagates.
+    Shared {
+        /// The per-call tool id's wire name.
+        tool_id_key: ToolIdKey,
+        extend: fn(&Value) -> Result<Option<Vec<AgentEvent>>>,
+    },
+    /// CLAIMS every event: an alien-envelope source (no shared
+    /// `hook_event_name`/`session_id` for the shared arms to key on) whose
+    /// decoder handles EVERYTHING and constructs its own AgentIds. It can NOT
+    /// decline, so a payload never silently falls through to the shared arms.
+    ClaimsAll(fn(&Value) -> Result<Vec<AgentEvent>>),
 }
 
 /// Reducer-facing capability flags — stable facts about the source's wire
@@ -116,6 +83,42 @@ pub(crate) struct SourceCaps {
     /// `last_event_at` freezes for the whole delegation, so the reducer gives it
     /// the Waiting-class stale window instead of sweeping mid-delegation.
     pub(crate) delegations_are_hook_silent: bool,
+    /// What a subagent dispatch's end says about its child.
+    pub(crate) child_end_inference: ChildEndInference,
+    /// Does a subagent's hook arrive under its parent's key, naming no child?
+    /// Then while the parent has a Task in flight its hook activity is the
+    /// child's, and the reducer drops it.
+    pub(crate) child_hooks_unnamed: bool,
+}
+
+/// What a subagent dispatch's end says about its child; where it says the
+/// child returned, the end walks the parent's whole subtree out (b1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildEndInference {
+    /// Nothing: a dispatch can return while its child runs, and each child
+    /// turn ends by its own event.
+    None,
+    /// A tracked dispatch's end means its child returned: the dispatch blocks
+    /// until then.
+    TaskDrain,
+    /// As `TaskDrain`, and the end may carry no id: no end event names the
+    /// child.
+    AnyTaskEnd,
+    /// Nothing, and the child is a session that outlives its turns: only its
+    /// deletion ends it.
+    Durable,
+}
+
+impl ChildEndInference {
+    /// Whether a dispatch's end means its child returned (b1); `tracked` when
+    /// the end names its dispatch.
+    pub(crate) fn dispatch_end_ends_child(self, tracked: bool) -> bool {
+        match self {
+            Self::TaskDrain => tracked,
+            Self::AnyTaskEnd => true,
+            Self::None | Self::Durable => false,
+        }
+    }
 }
 
 impl SourceCaps {
@@ -124,6 +127,8 @@ impl SourceCaps {
         has_exit_signal: false,
         resurrects_on_prompt: false,
         delegations_are_hook_silent: false,
+        child_end_inference: ChildEndInference::None,
+        child_hooks_unnamed: false,
     };
 
     /// The short-idle-reaper policy, derived: only safe when the sweep is the
@@ -167,10 +172,6 @@ pub struct SourceDescriptor {
     /// `OPENCODE_CONFIG_DIR` and `REASONIX_HOME` are declared there. Where a CLI
     /// has several (omp), this names the most direct one.
     pub home_env: Option<&'static str>,
-    /// What this source reads off upstream, kept on the row rather than in a
-    /// list beside the registry.
-    #[cfg(any(test, feature = "upstream"))]
-    pub upstream: Upstream,
     /// What KIND of source this is. Consumers read through the accessors so the
     /// enum shape stays an internal detail.
     pub(crate) kind: SourceKind,
@@ -201,6 +202,13 @@ pub struct Transcript {
     /// walker dispatches by the SCANNED source, so one source's shape is never
     /// tried against another's transcript.
     pub(crate) cwd_extractor: CwdExtractor,
+    /// First-sight parent extractor for the same head scan, which stops at the
+    /// cwd's line: a parent must sit on or before it.
+    #[cfg_attr(
+        not(any(feature = "native", feature = "harness")),
+        expect(dead_code, reason = "only a tree walk reads it")
+    )]
+    pub(crate) parent_extractor: Option<ParentExtractor>,
 }
 
 /// Where this source's OS pid comes from — a DATA-only capability: this const
@@ -213,9 +221,8 @@ pub enum FocusChannel {
     /// The shim RESOLVES the CLI's pid into `_pid` by walking past the runner's
     /// interposed shell (`pixtuoid-hook`'s `cli_pid`) — a `cmd /C` on Windows, a
     /// `$SHELL -c` wrapper on Unix, which need NOT exec-replace itself with the
-    /// shim (#896). An unrecognised wrapper resolves to a pid that is not the
-    /// CLI, so `HookPidWatch` corroborates before acting on one.
-    ShimStamp,
+    /// shim (#896). How far to trust the resolved pid is the [`Corroboration`].
+    ShimStamp(Corroboration),
     /// The source's own runtime stamps `_pid` — cross-platform, and survives
     /// even where the shim sends nothing.
     PluginStamp,
@@ -231,12 +238,25 @@ pub enum FocusChannel {
     Unsupported,
 }
 
+/// How many sightings a shim-resolved pid needs before the exit watch acts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Corroboration {
+    /// A wrapper the walk does not recognise can sit between the CLI and our
+    /// hook command (Cursor `eval`s it mid-script, #896), so the resolved pid may
+    /// not be the CLI: `HookPidWatch` waits for a second consecutive sighting.
+    Twice,
+    /// The runner reaches our hook command only through a shell the walk
+    /// recognises, so the first sighting is the CLI. The second can never come
+    /// from a turn that ends the process (its parent is gone before the shim walks).
+    OnceViaShell,
+}
+
 impl FocusChannel {
     /// Whether a hook-envelope `_pid` stamp is this session's own focusable
     /// process.
     #[cfg(feature = "native")]
     pub(crate) fn stamps_focus_pid(self) -> bool {
-        matches!(self, FocusChannel::ShimStamp | FocusChannel::PluginStamp)
+        matches!(self, FocusChannel::ShimStamp(_) | FocusChannel::PluginStamp)
     }
 }
 
@@ -292,6 +312,12 @@ impl SourceDescriptor {
     /// The first-sight cwd extractor (`None` for a hook-only agent or a daemon).
     pub(crate) fn cwd_extractor(&self) -> Option<CwdExtractor> {
         self.transcript().map(|t| t.cwd_extractor)
+    }
+
+    /// The first-sight parent extractor (`None` without one).
+    #[cfg(any(feature = "native", feature = "harness"))]
+    pub(crate) fn parent_extractor(&self) -> Option<ParentExtractor> {
+        self.transcript().and_then(|t| t.parent_extractor)
     }
 
     /// The transcript path→session-id derivation (`None` without a transcript).
@@ -430,15 +456,6 @@ pub fn registered_source_names() -> impl Iterator<Item = &'static str> {
     REGISTRY.iter().map(|d| d.name)
 }
 
-/// The watch declared under `id`, whichever source declares it.
-#[cfg(any(test, feature = "upstream"))]
-pub fn declared_watch(id: &str) -> Option<&'static Watch> {
-    REGISTRY
-        .iter()
-        .flat_map(|d| d.upstream.watches())
-        .find(|w| w.id == id)
-}
-
 /// The first-sight cwd extractor for the source being scanned: the walker calls
 /// this with the source it is scanning, so one source's head shape is never
 /// tried against another's transcript — a foreign-shaped line (a codex-style
@@ -449,6 +466,12 @@ pub fn cwd_extractor_for(source: &str) -> CwdExtractor {
     descriptor_for(source)
         .and_then(|d| d.cwd_extractor())
         .unwrap_or(extract_top_level_cwd)
+}
+
+/// `source`'s first-sight parent extractor, if its transcripts name a parent.
+#[cfg(any(feature = "native", feature = "harness"))]
+pub(crate) fn parent_extractor_for(source: &str) -> Option<ParentExtractor> {
+    descriptor_for(source).and_then(|d| d.parent_extractor())
 }
 
 /// How this source keys a transcript path onto a session id. THE single
@@ -498,12 +521,10 @@ pub fn daemon_sources() -> impl Iterator<Item = (&'static str, crate::source::da
 const CLAUDE_CODE: SourceDescriptor = SourceDescriptor {
     name: claude_code::SOURCE_NAME,
     label_prefix: "cc",
-    verified_version: "2.1.278",
+    verified_version: "2.1.306",
     version_probe: Some(&["claude", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: Some("CLAUDE_CONFIG_DIR"),
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Watched(&[claude_code::UPSTREAM]),
     kind: SourceKind::Agent {
         transcript: Some(Transcript {
             line_decoder: claude_code::decode_cc_line,
@@ -513,15 +534,13 @@ const CLAUDE_CODE: SourceDescriptor = SourceDescriptor {
             // in the SAME projects tree.
             path_filter: claude_code::admits_transcript,
             cwd_extractor: extract_top_level_cwd,
+            parent_extractor: None,
         }),
-        hook: Some(HookDecoding {
-            // The session UUID == the transcript filename stem, so keying on it
-            // (not the cwd-derived path) survives a git-worktree cwd-split.
-            id_key: IdKey::SessionId,
+        hook: Some(HookDecoding::Shared {
             tool_id_key: ToolIdKey::ToolUse,
             // They swap the event's SUBJECT (child AgentId ≠ session AgentId), which
             // the shared arms can't express; Stop is a fleet subagent's ONLY end (#241).
-            custom: Some(HookCustom::Extend(claude_code::decode_cc_hook_custom)),
+            extend: claude_code::decode_cc_hook_custom,
         }),
         caps: SourceCaps {
             has_exit_signal: true,
@@ -529,6 +548,11 @@ const CLAUDE_CODE: SourceDescriptor = SourceDescriptor {
             // would not walk back in — moot with a real exit signal anyway.
             resurrects_on_prompt: false,
             delegations_are_hook_silent: false,
+            // A subagent turn fires SubagentStart, and SubagentStop once it has
+            // finished responding; an Agent call that backgrounds its subagent
+            // returns `async_launched` at launch (hooks.md).
+            child_end_inference: ChildEndInference::None,
+            child_hooks_unnamed: false,
         },
         focus: FocusChannel::TranscriptProbe,
     },
@@ -537,27 +561,24 @@ const CLAUDE_CODE: SourceDescriptor = SourceDescriptor {
 const CODEX: SourceDescriptor = SourceDescriptor {
     name: codex::SOURCE_NAME,
     label_prefix: "cx",
-    verified_version: "0.155.1",
+    verified_version: "0.163.0",
     version_probe: Some(&["codex", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: Some("CODEX_HOME"),
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Watched(&[codex::UPSTREAM]),
     kind: SourceKind::Agent {
         transcript: Some(Transcript {
             line_decoder: codex::decode_codex_line,
             // The rollout filename's trailing UUID (the stem also has a timestamp).
             id_from_path: codex::codex_id_from_path,
             path_filter: accept_all_paths,
-            // Rollouts carry cwd ONLY on the head session_meta line, under `payload`.
             cwd_extractor: codex::extract_codex_cwd,
+            parent_extractor: Some(codex::extract_codex_parent),
         }),
-        hook: Some(HookDecoding {
-            id_key: IdKey::SessionId,
+        hook: Some(HookDecoding::Shared {
             tool_id_key: ToolIdKey::ToolUse,
-            // SubagentStart/Stop change the event's SUBJECT — inexpressible in
-            // the shared arms.
-            custom: Some(HookCustom::Extend(codex::decode_codex_hook_custom)),
+            // A child's events change their SUBJECT, and a root's `spawn_agent`
+            // is a Task: neither is expressible in the shared arms.
+            extend: codex::decode_codex_hook_custom,
         }),
         caps: SourceCaps {
             // Still false after #710 registered Codex's SessionEnd hook: it is
@@ -565,6 +586,10 @@ const CODEX: SourceDescriptor = SourceDescriptor {
             has_exit_signal: false,
             resurrects_on_prompt: true,
             delegations_are_hook_silent: false,
+            // `spawn_agent` returns at launch, and a child's SubagentStop ends
+            // it (`codex-rs/core/src/hook_runtime.rs:401-437` at rust-v0.163.0).
+            child_end_inference: ChildEndInference::None,
+            child_hooks_unnamed: false,
         },
         focus: FocusChannel::TranscriptProbe,
     },
@@ -573,77 +598,69 @@ const CODEX: SourceDescriptor = SourceDescriptor {
 const ANTIGRAVITY: SourceDescriptor = SourceDescriptor {
     name: antigravity::SOURCE_NAME,
     label_prefix: "ag",
-    verified_version: "unknown",
+    verified_version: "1.4.2",
     version_probe: Some(&["agy", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: None,
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Closed {
-        why: "a closed Google IDE with no fetchable schema: its decoder breadcrumbs a \
-              renamed step instead",
-    },
     kind: SourceKind::Agent {
         transcript: Some(Transcript {
             line_decoder: antigravity::decode_ag_line,
-            // Path-keyed: its hook keys on `transcript_path` too, so the
-            // default coalesces the two transports.
-            id_from_path: default_id_from_path,
+            id_from_path: antigravity::ag_id_from_path,
             path_filter: antigravity::admits_transcript,
-            // AG step lines carry no cwd field at all — the shared shape never
-            // matches and the label falls back to the bare `ag` prefix.
+            // AG step lines carry no cwd field at all; the cwd rides the
+            // `SessionStart` hook.
             cwd_extractor: extract_top_level_cwd,
+            parent_extractor: None,
         }),
-        // A real spec despite the missing install target (unlike copilot, which
-        // has no hook path at all): the payload does decode via the shared arms.
-        hook: Some(HookDecoding {
-            id_key: IdKey::TranscriptPathThenSessionId,
-            tool_id_key: ToolIdKey::ToolUse,
-            custom: None,
-        }),
-        // Both false is VERIFIED: no end marker (`status` is per-step, always DONE),
-        // and nothing re-registers a swept session — unknown-id JSONL lines are
-        // no-ops and the hook never fires without an install target. Flipping
-        // `resurrects_on_prompt` for the 5-min reaper strands a live idle session.
+        hook: Some(HookDecoding::ClaimsAll(antigravity::decode_ag_hook_payload)),
+        // Both false is VERIFIED: no end marker (`status` is per-step, always DONE)
+        // and no end hook, and no prompt-time hook re-registers a swept session.
+        // Flipping `resurrects_on_prompt` for the 5-min reaper strands a live idle
+        // session. An exit rides the shim-stamped pid.
         caps: SourceCaps {
             has_exit_signal: false,
             resurrects_on_prompt: false,
             delegations_are_hook_silent: false,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
         },
-        focus: FocusChannel::Unsupported,
+        focus: FocusChannel::ShimStamp(Corroboration::Twice),
     },
 };
 
 /// HOOK-ONLY: Reasonix v2 session files are full-rewritten per turn
 /// (untailable) and its hook envelope is ALIEN (camelCase, `event`
-/// discriminator, `cwd` as the only identity), so the custom decoder claims
+/// discriminator, `sessionId` the identity), so the custom decoder claims
 /// every event.
 const REASONIX: SourceDescriptor = SourceDescriptor {
     name: reasonix::SOURCE_NAME,
     label_prefix: "rx",
-    verified_version: "1.38.7",
+    verified_version: "2.44.0",
     version_probe: Some(&["reasonix", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: None,
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Installer,
     kind: SourceKind::Agent {
         transcript: None,
-        hook: Some(HookDecoding {
-            id_key: IdKey::TranscriptPathThenSessionId, // inert: custom claims all
-            tool_id_key: ToolIdKey::ToolUse,            // inert: custom claims all
-            custom: Some(HookCustom::ClaimsAll(reasonix::decode_rx_hook_payload)),
-        }),
+        hook: Some(HookDecoding::ClaimsAll(reasonix::decode_rx_hook_payload)),
         caps: SourceCaps {
             // SessionEnd fires on clean exit — best-effort counts.
             has_exit_signal: true,
             // UserPromptSubmit re-emits SessionStart, so a swept-but-live
             // session walks back in on the next prompt.
             resurrects_on_prompt: true,
-            // Subagents run in-process with hooks disabled upstream, so the slot
-            // emits NOTHING until the dispatch tool's PostToolUse.
+            // A subagent's hooks carry its own session id, the parent's
+            // suffixed with its role (`internal/ext/hook/runner.go:57-66` at
+            // v2.39.0), so the parent's slot emits NOTHING until the dispatch
+            // tool's PostToolUse.
             delegations_are_hook_silent: true,
+            // A child's session fires no end; a skill tool's child is keyed
+            // by a call id its parent's tool hooks don't carry
+            // (`internal/assembly/boot/delegation.go:127-133`,
+            // `internal/ext/hook/hook.go:827-847` at v2.39.0).
+            child_end_inference: ChildEndInference::AnyTaskEnd,
+            child_hooks_unnamed: false,
         },
-        focus: FocusChannel::ShimStamp,
+        focus: FocusChannel::ShimStamp(Corroboration::Twice),
     },
 };
 
@@ -664,15 +681,9 @@ const DSH: SourceDescriptor = SourceDescriptor {
     // `DSH_HOME` is honored INSTALLER-side (the plugin file + patch row live
     // under it); hook-only, so core resolves no root to relocate.
     home_env: None,
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Installer,
     kind: SourceKind::Agent {
         transcript: None,
-        hook: Some(HookDecoding {
-            id_key: IdKey::SessionId,        // inert: custom claims all
-            tool_id_key: ToolIdKey::ToolUse, // inert: custom claims all
-            custom: Some(HookCustom::ClaimsAll(dsh::decode_dsh_payload)),
-        }),
+        hook: Some(HookDecoding::ClaimsAll(dsh::decode_dsh_payload)),
         caps: SourceCaps {
             // `agent/disposed` + the plugin's own effect-disposer sweep fire
             // on clean quit AND signal shutdown (dsh runs disposers there
@@ -690,6 +701,8 @@ const DSH: SourceDescriptor = SourceDescriptor {
             // (`dsh-subagent-claude-code`/`-codex`/`-acp`) publishes no
             // local child at all. `true` can only over-retain a dead slot.
             delegations_are_hook_silent: true,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
         },
         // The plugin runs in-process (a cordis plugin in the launcher's one
         // root context; no worker mode exists for plugins), so its stamped
@@ -711,15 +724,9 @@ const CODEWHALE: SourceDescriptor = SourceDescriptor {
     version_probe: Some(&["codewhale", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: None,
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Watched(&[codewhale::UPSTREAM]),
     kind: SourceKind::Agent {
         transcript: None,
-        hook: Some(HookDecoding {
-            id_key: IdKey::TranscriptPathThenSessionId, // inert: custom claims all
-            tool_id_key: ToolIdKey::ToolUse,            // inert: custom claims all
-            custom: Some(HookCustom::ClaimsAll(codewhale::decode_cw_hook_payload)),
-        }),
+        hook: Some(HookDecoding::ClaimsAll(codewhale::decode_cw_hook_payload)),
         caps: SourceCaps {
             // session_end fires on a clean TUI quit — best-effort counts.
             has_exit_signal: true,
@@ -729,27 +736,23 @@ const CODEWHALE: SourceDescriptor = SourceDescriptor {
             // The recorded dispatch fires nothing of the child's own between
             // `subagent_spawn` and `subagent_complete`.
             delegations_are_hook_silent: true,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
         },
-        focus: FocusChannel::ShimStamp,
+        focus: FocusChannel::ShimStamp(Corroboration::Twice),
     },
 };
 
 const OPENCODE: SourceDescriptor = SourceDescriptor {
     name: opencode::SOURCE_NAME,
     label_prefix: "oc",
-    verified_version: "2.0.27",
+    verified_version: "2.1.2",
     version_probe: Some(&["opencode", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: None,
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Watched(&[opencode::UPSTREAM]),
     kind: SourceKind::Agent {
         transcript: None,
-        hook: Some(HookDecoding {
-            id_key: IdKey::TranscriptPathThenSessionId, // inert: custom claims all
-            tool_id_key: ToolIdKey::ToolUse,            // inert: custom claims all
-            custom: Some(HookCustom::ClaimsAll(opencode::decode_oc_hook_payload)),
-        }),
+        hook: Some(HookDecoding::ClaimsAll(opencode::decode_oc_hook_payload)),
         caps: SourceCaps {
             // A TUI quit ends nothing: the session lives on in the server.
             has_exit_signal: false,
@@ -759,6 +762,11 @@ const OPENCODE: SourceDescriptor = SourceDescriptor {
             // A `subagent` child is parented by its `session.created`'s `parentID`,
             // so its events keep the parent fresh (`scope::refresh_lineage`).
             delegations_are_hook_silent: false,
+            // A `subagent` call can return while its child runs on
+            // (`packages/core/src/tool/plugin/subagent.ts:229-243` at v2.0.32),
+            // and a session ends only by `session.deleted`.
+            child_end_inference: ChildEndInference::Durable,
+            child_hooks_unnamed: false,
         },
         // The plugin runs in the background server every TUI attaches to
         // (`packages/client/src/service-contender.ts:19-20`), not in a TUI.
@@ -772,12 +780,10 @@ const OPENCODE: SourceDescriptor = SourceDescriptor {
 const OPENCLAW: SourceDescriptor = SourceDescriptor {
     name: openclaw::SOURCE_NAME,
     label_prefix: "ok",
-    verified_version: "2026.10.1",
+    verified_version: "2026.10.5",
     version_probe: Some(&["openclaw", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: None,
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Installer,
     kind: SourceKind::Daemon {
         presence_decoder: openclaw::decode_openclaw_hook_payload,
     },
@@ -790,18 +796,17 @@ const OPENCLAW: SourceDescriptor = SourceDescriptor {
 const COPILOT: SourceDescriptor = SourceDescriptor {
     name: copilot::SOURCE_NAME,
     label_prefix: "cp",
-    verified_version: "unknown",
+    verified_version: "1.0.98",
     version_probe: Some(&["copilot", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: Some("COPILOT_HOME"),
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Watched(&[copilot::UPSTREAM]),
     kind: SourceKind::Agent {
         transcript: Some(Transcript {
             line_decoder: copilot::decode_copilot_line,
             id_from_path: copilot::copilot_id_from_path,
             path_filter: accept_all_paths,
             cwd_extractor: copilot::extract_copilot_cwd,
+            parent_extractor: None,
         }),
         hook: None,
         caps: SourceCaps {
@@ -813,6 +818,8 @@ const COPILOT: SourceDescriptor = SourceDescriptor {
             // The `task` dispatch emits `tool.execution_start`/`complete` AND
             // explicit `subagent.started`/`completed` events.
             delegations_are_hook_silent: false,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
         },
         focus: FocusChannel::Unsupported,
     },
@@ -832,15 +839,9 @@ const CURSOR: SourceDescriptor = SourceDescriptor {
     version_probe: Some(&["cursor-agent", "--version"]),
     version_hyphen: Hyphen::Build,
     home_env: None,
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Installer,
     kind: SourceKind::Agent {
         transcript: None,
-        hook: Some(HookDecoding {
-            id_key: IdKey::TranscriptPathThenSessionId, // inert: custom claims all
-            tool_id_key: ToolIdKey::ToolUse,            // inert: custom claims all
-            custom: Some(HookCustom::ClaimsAll(cursor::decode_cursor_hook_payload)),
-        }),
+        hook: Some(HookDecoding::ClaimsAll(cursor::decode_cursor_hook_payload)),
         caps: SourceCaps {
             // `sessionEnd` fires on clean completion. An abrupt exit rides the
             // shim-stamped pid, which reaches the CLI only because the ancestor walk
@@ -852,8 +853,10 @@ const CURSOR: SourceDescriptor = SourceDescriptor {
             // A `Task` dispatch gets NO `postToolUse`, and its children are separate
             // unlinkable sessions.
             delegations_are_hook_silent: true,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
         },
-        focus: FocusChannel::ShimStamp,
+        focus: FocusChannel::ShimStamp(Corroboration::Twice),
     },
 };
 
@@ -866,19 +869,13 @@ const CURSOR: SourceDescriptor = SourceDescriptor {
 const HERMES: SourceDescriptor = SourceDescriptor {
     name: hermes::SOURCE_NAME,
     label_prefix: "hm",
-    verified_version: "0.21.0",
+    verified_version: "0.22.2",
     version_probe: Some(&["hermes", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: Some("HERMES_HOME"),
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Installer,
     kind: SourceKind::Agent {
         transcript: None,
-        hook: Some(HookDecoding {
-            id_key: IdKey::TranscriptPathThenSessionId, // inert: custom claims all
-            tool_id_key: ToolIdKey::ToolUse,            // inert: custom claims all
-            custom: Some(HookCustom::ClaimsAll(hermes::decode_hermes_hook_payload)),
-        }),
+        hook: Some(HookDecoding::ClaimsAll(hermes::decode_hermes_hook_payload)),
         caps: SourceCaps {
             // `on_session_finalize`, fired by upstream's atexit `_run_cleanup` with
             // `reason="shutdown"`. NOT `on_session_end`, which despite the name is a
@@ -887,8 +884,10 @@ const HERMES: SourceDescriptor = SourceDescriptor {
             resurrects_on_prompt: false,
             // No subagent nesting on the wire — sessions render flat.
             delegations_are_hook_silent: false,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
         },
-        focus: FocusChannel::ShimStamp,
+        focus: FocusChannel::ShimStamp(Corroboration::Twice),
     },
 };
 
@@ -902,12 +901,10 @@ const HERMES: SourceDescriptor = SourceDescriptor {
 const GROK: SourceDescriptor = SourceDescriptor {
     name: grok::SOURCE_NAME,
     label_prefix: "gk",
-    verified_version: "1.0.25",
+    verified_version: "1.0.62",
     version_probe: Some(&["grok", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: Some("GROK_HOME"),
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Watched(&[grok::UPSTREAM, acp::UPSTREAM]),
     kind: SourceKind::Agent {
         transcript: Some(Transcript {
             line_decoder: grok::decode_grok_line,
@@ -918,12 +915,9 @@ const GROK: SourceDescriptor = SourceDescriptor {
             // Always-None: grok lines carry no cwd — the URL-encoded group dir
             // does, applied via the watcher's cwd deriver.
             cwd_extractor: grok::extract_grok_cwd,
+            parent_extractor: None,
         }),
-        hook: Some(HookDecoding {
-            id_key: IdKey::SessionId,        // inert: custom claims all
-            tool_id_key: ToolIdKey::ToolUse, // inert: custom claims all
-            custom: Some(HookCustom::ClaimsAll(grok::decode_grok_hook_payload)),
-        }),
+        hook: Some(HookDecoding::ClaimsAll(grok::decode_grok_hook_payload)),
         caps: SourceCaps {
             // `session_end` does NOT fire on a plain TUI quit (the loop breaks without
             // draining the session actor), so the DOMINANT exit is signal-less; the
@@ -936,6 +930,8 @@ const GROK: SourceDescriptor = SourceDescriptor {
             // A BLOCKING spawn's Task detail gets its post_tool_use at
             // completion, and a background spawn never mints a Task at all.
             delegations_are_hook_silent: false,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
         },
         // `active_sessions.json` maps session_id → pid with an `opened_at` recycle
         // guard; a shim stamp would shadow it with a walk carrying no guard (#527).
@@ -957,12 +953,10 @@ const GROK: SourceDescriptor = SourceDescriptor {
 const OMP: SourceDescriptor = SourceDescriptor {
     name: omp::SOURCE_NAME,
     label_prefix: "om",
-    verified_version: "18.2.6",
+    verified_version: "18.12.1",
     version_probe: Some(&["omp", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: Some("PI_CODING_AGENT_DIR"),
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Watched(&[omp::UPSTREAM]),
     kind: SourceKind::Agent {
         transcript: Some(Transcript {
             line_decoder: omp::decode_omp_line,
@@ -971,12 +965,9 @@ const OMP: SourceDescriptor = SourceDescriptor {
             id_from_path: omp::omp_id_from_path,
             path_filter: accept_all_paths,
             cwd_extractor: extract_top_level_cwd,
+            parent_extractor: None,
         }),
-        hook: Some(HookDecoding {
-            id_key: IdKey::SessionId,        // inert: custom claims all
-            tool_id_key: ToolIdKey::ToolUse, // inert: custom claims all
-            custom: Some(HookCustom::ClaimsAll(omp::decode_omp_hook_payload)),
-        }),
+        hook: Some(HookDecoding::ClaimsAll(omp::decode_omp_hook_payload)),
         caps: SourceCaps {
             // The `session_exit` entry is appended + flushed on every clean
             // teardown incl. SIGINT/SIGTERM (and the bridge fires
@@ -986,7 +977,7 @@ const OMP: SourceDescriptor = SourceDescriptor {
             has_exit_signal: true,
             // The header `SessionStart` decodes once per transcript life. A
             // `--resume` fires the bridge's `session_start` on the SAME id
-            // (probe-verified at this row's `verified_version`), so an ended
+            // (`omp/fixtures/resume-recorded`), so an ended
             // session CAN walk back in — through the SessionStart arm's
             // ordinary parentless re-registration, not this prompt-resurrect
             // flag.
@@ -994,6 +985,8 @@ const OMP: SourceDescriptor = SourceDescriptor {
             // The `task` dispatch emits a toolCall/toolResult pair on the parent
             // AND the child persists its own parent-linked transcript.
             delegations_are_hook_silent: false,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
         },
         // The bridge extension runs IN-PROCESS (upstream: extensions share
         // the runtime), so its stamped `process.pid` IS omp's own —
@@ -1018,20 +1011,16 @@ const OMP: SourceDescriptor = SourceDescriptor {
 const KIMI: SourceDescriptor = SourceDescriptor {
     name: kimi::SOURCE_NAME,
     label_prefix: "km",
-    verified_version: "2.0.1",
+    verified_version: "2.3.0",
     version_probe: Some(&["kimi", "--version"]),
     version_hyphen: Hyphen::Prerelease,
     home_env: None,
-    #[cfg(any(test, feature = "upstream"))]
-    upstream: Upstream::Installer,
     kind: SourceKind::Agent {
         transcript: None,
-        hook: Some(HookDecoding {
-            // session_id is the base field on every Kimi event.
-            id_key: IdKey::SessionId,
+        hook: Some(HookDecoding::Shared {
             // The ONE source that does not spell the per-call id `tool_use_id`.
             tool_id_key: ToolIdKey::ToolCall,
-            custom: Some(HookCustom::Extend(kimi::decode_kimi_hook_custom)),
+            extend: kimi::decode_kimi_hook_custom,
         }),
         caps: SourceCaps {
             // `SessionEnd` fires on exit — best-effort counts; abrupt exits fall
@@ -1045,8 +1034,16 @@ const KIMI: SourceDescriptor = SourceDescriptor {
             // mints Task. `AgentSwarm` has NO such injection, so an omitting swarm
             // call mints Generic instead; `true` can only over-retain a dead slot.
             delegations_are_hook_silent: true,
+            child_end_inference: ChildEndInference::TaskDrain,
+            // A subagent's tool hooks carry the session's id alone
+            // (kimi-code@2.2.0 `agentExternalHooksService.ts:301-313`).
+            child_hooks_unnamed: true,
         },
-        focus: FocusChannel::ShimStamp,
+        // kimi-code 2.2.0 spawns every hook with `shell: true`, which Node runs as
+        // `/bin/sh -c` on Unix and `%ComSpec%` on Windows
+        // (`packages/agent-core-v2/src/features/externalHooks/internal/runHook.ts:66-67`,
+        // https://nodejs.org/api/child_process.html): re-check both if either changes.
+        focus: FocusChannel::ShimStamp(Corroboration::OnceViaShell),
     },
 };
 
@@ -1063,7 +1060,10 @@ mod tests {
             ("codex-cli 0.155.1", Some("0.155.1")),
             ("0.135", Some("0.135.0")),
             ("omp/18.2.6", Some("18.2.6")),
-            ("Hermes Agent v0.21.0 (2026.8.31)", Some("0.21.0")),
+            (
+                "Hermes Agent v0.22.2 (2026.9.24) · stable · local d923a5eb487a",
+                Some("0.22.2"),
+            ),
             ("grok 1.0.25 (f7e67d6988e2) [stable]", Some("1.0.25")),
             ("0.2.0-rc.2", Some("0.2.0-rc.2")),
             // copilot's, which no capture records: a dot no digit follows ends it.
@@ -1221,10 +1221,7 @@ mod tests {
         }
 
         let ag = "/h/.gemini/antigravity-cli/brain/x/.system_generated/logs/transcript.jsonl";
-        assert_eq!(
-            id_deriver_for(antigravity::SOURCE_NAME)(Path::new(ag)),
-            crate::id::normalize_path_key(ag),
-        );
+        assert_eq!(id_deriver_for(antigravity::SOURCE_NAME)(Path::new(ag)), "x");
         assert_eq!(
             id_deriver_for("not-a-source")(Path::new(ag)),
             crate::id::normalize_path_key(ag),
@@ -1458,16 +1455,14 @@ mod tests {
         #[test]
         fn every_hook_and_presence_decoder_never_panics(v in arb_json()) {
             for d in REGISTRY {
-                if let Some(hook) = d.hook() {
-                    match hook.custom {
-                        Some(HookCustom::Extend(f)) => {
-                            let _ = f(&v);
-                        }
-                        Some(HookCustom::ClaimsAll(f)) => {
-                            let _ = f(&v);
-                        }
-                        None => {}
+                match d.hook() {
+                    Some(HookDecoding::Shared { extend, .. }) => {
+                        let _ = extend(&v);
                     }
+                    Some(HookDecoding::ClaimsAll(f)) => {
+                        let _ = f(&v);
+                    }
+                    None => {}
                 }
                 if let Some(presence) = d.presence_decoder() {
                     let _ = presence(&v);

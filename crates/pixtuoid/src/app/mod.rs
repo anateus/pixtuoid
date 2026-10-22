@@ -103,14 +103,14 @@ pub fn run() -> Result<()> {
             source,
             max_desks: cli_max_desks,
             headless,
-            graphics,
+            look,
         } => {
             let rc = build_run_config(
                 cli_theme.as_deref(),
                 source,
                 cli_max_desks,
                 headless,
-                graphics,
+                look,
                 drift,
             )?;
             // After every Drop the run held: the unwind is done, so the signal can now
@@ -122,14 +122,24 @@ pub fn run() -> Result<()> {
         }
         Cmd::Floating { source } => {
             // No desk cap: floating seeds its capacity from the window.
-            let rc = build_run_config(cli_theme.as_deref(), source, None, false, None, drift)?;
+            let rc = build_run_config(
+                cli_theme.as_deref(),
+                source,
+                None,
+                false,
+                crate::cli::LookArgs::default(),
+                drift,
+            )?;
             if let Some(signal) = floating::run(rc)? {
                 signal.reraise();
             }
             Ok(())
         }
-        Cmd::Doctor { graphics } => {
-            let report = doctor::run(&crate::run_log::LogLocation::from_env(), graphics)?;
+        Cmd::Doctor { look, protocol } => {
+            let report = doctor::run(
+                &crate::run_log::LogLocation::from_env(),
+                crate::graphics::LookChoice::new(look, protocol),
+            )?;
             write!(crate::cli_stdout(), "{report}")?;
             Ok(())
         }
@@ -183,22 +193,23 @@ fn build_run_config(
     source: SourceArgs,
     cli_max_desks: Option<usize>,
     headless: bool,
-    cli_graphics: Option<crate::GraphicsMode>,
+    cli_look: crate::cli::LookArgs,
     drift: crate::doctor::DriftSeen,
 ) -> Result<runtime::RunConfig> {
-    let SourceArgs {
-        socket,
-        projects_root,
-        codex_sessions_root,
-    } = source;
+    let SourceArgs { socket } = source;
     let cfg_path = config::config_path();
     let mut cfg_warnings = Vec::new();
     let (cfg, load_degraded) = config::load_with_status(&cfg_path, &mut cfg_warnings);
     let theme = config::resolve_theme(&cfg, cli_theme, &mut cfg_warnings)?;
     let desk_cap = config::resolve_desk_cap(&cfg, cli_max_desks, &mut cfg_warnings);
     let pets = config::resolve_pets(&cfg, &mut cfg_warnings);
-    let graphics = config::resolve_graphics(&cfg, cli_graphics, &mut cfg_warnings);
+    let look = crate::graphics::LookChoice::new(
+        config::resolve_look(&cfg, cli_look.look, &mut cfg_warnings),
+        cli_look.protocol,
+    );
     let motion = config::resolve_motion(&cfg, &mut cfg_warnings);
+    let adopted =
+        adopt_unless_headless(headless, || sources::adopt_flagged_targets(&cfg_path, &cfg));
     let connected = sources::connected(&cfg);
     let first_run = sources::is_first_run(&connected, load_degraded);
     if !headless {
@@ -207,6 +218,13 @@ fn build_run_config(
         // so re-printing there would duplicate.
         for w in &cfg_warnings {
             let _ = writeln!(std::io::stderr(), "⚠ pixtuoid: {w}");
+        }
+        for (t, installed) in &adopted {
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}",
+                sources::adopted_notice(t, installed)
+            );
         }
     }
     refresh_plugins(
@@ -220,8 +238,6 @@ fn build_run_config(
     }
     Ok(runtime::RunConfig {
         socket,
-        projects_root,
-        codex_sessions_root,
         desk_cap,
         headless,
         config_path: cfg_path,
@@ -232,9 +248,16 @@ fn build_run_config(
         drift,
         first_run,
         audio: config::resolve_audio(&cfg),
-        graphics,
+        look,
         motion,
     })
+}
+
+/// Run `adopt` ([`sources::adopt_flagged_targets`]) on an interactive launch
+/// only: adoption installs hooks, and a headless run's flags are no user's
+/// consent.
+fn adopt_unless_headless<T>(headless: bool, adopt: impl FnOnce() -> Vec<T>) -> Vec<T> {
+    if headless { Vec::new() } else { adopt() }
 }
 
 /// Bring the connected sources' plugin files up to this build, then name on `out`
@@ -285,6 +308,19 @@ fn warn_broken_installs(connected: &std::collections::HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_interactive_launch_adopts() {
+        let ran = std::cell::Cell::new(0);
+        let adopt = || {
+            ran.set(ran.get() + 1);
+            vec![()]
+        };
+        assert!(adopt_unless_headless(true, adopt).is_empty());
+        assert_eq!(ran.get(), 0, "headless never adopts");
+        assert_eq!(adopt_unless_headless(false, adopt).len(), 1);
+        assert_eq!(ran.get(), 1);
+    }
 
     #[test]
     fn both_boot_modes_converge_and_only_an_interactive_one_prints() {

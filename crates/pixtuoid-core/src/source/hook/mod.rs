@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tracing::{debug, warn};
 
 use crate::AgentId;
-use crate::source::decoder::{checked_pid, decode_hook_payload};
+use crate::source::decoder::{checked_pid, decode_hook_payload, hook_source};
 use crate::source::registry::SourceDescriptor;
 use crate::source::{AgentEvent, TaggedSender, Transport};
 
@@ -20,12 +20,19 @@ mod windows;
 #[cfg(windows)]
 use windows as imp;
 
+/// One accepted hook connection, a Unix stream or a named-pipe instance, read
+/// through [`MAX_CONN_BYTES`].
+pub(crate) type HookConn = tokio::io::Take<imp::Conn>;
+
 mod pid_watch;
 pub(crate) use pid_watch::HookPidWatch;
 
 mod router;
 pub use router::HookRouter;
 
+/// The variable naming the hook endpoint: [`super::claude_code::ClaudeCodeSource::default_socket_path`]
+/// reads it, and so does the shim's parity-pinned twin (`tests/socket_path_parity.rs`).
+pub(crate) const SOCKET_ENV: &str = "PIXTUOID_SOCKET";
 pub(crate) const MAX_CONCURRENT_CONNS: usize = 128;
 pub(crate) const CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -45,7 +52,7 @@ impl std::fmt::Display for SocketBusy {
         write!(
             f,
             "another pixtuoid instance is listening on {} — close it first, or run this one \
-             with PIXTUOID_SOCKET pointing at a different path",
+             with {SOCKET_ENV} pointing at a different path",
             self.path.display()
         )
     }
@@ -111,7 +118,24 @@ impl HookSocketListener {
     ///
     /// If the connection semaphore closes unexpectedly or, on Windows, the next pipe instance cannot be created.
     pub async fn run(self, tx: TaggedSender) -> Result<()> {
-        self.inner.run(tx, self.pid_watch, self.presence_tx).await
+        let (pid_watch, presence_tx) = (self.pid_watch.clone(), self.presence_tx.clone());
+        self.serve(move |conn| {
+            handle_conn(conn, tx.clone(), pid_watch.clone(), presence_tx.clone())
+        })
+        .await
+    }
+
+    /// Accept connections forever, each handed to `handle` under the endpoint
+    /// guards, [`CONN_TIMEOUT`] and [`MAX_CONN_BYTES`]: every handler's, so
+    /// none can read past them.
+    pub(crate) async fn serve<F, Fut>(self, handle: F) -> Result<()>
+    where
+        F: Fn(HookConn) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.inner
+            .serve(move |conn| handle(conn.take(MAX_CONN_BYTES)))
+            .await
     }
 }
 
@@ -119,7 +143,7 @@ impl HookSocketListener {
 /// `STAMP_HEADROOM`). `lines()` buffers until a newline, so without this
 /// an adversarial client could grow the buffer unboundedly for the whole
 /// `CONN_TIMEOUT` window × [`MAX_CONCURRENT_CONNS`] slots.
-const MAX_CONN_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_CONN_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Breadcrumb for the silent-loss path: the per-connection budget bounds
 /// `handle_conn` by DROPPING its future, so no code after the cancelled await
@@ -168,11 +192,13 @@ impl Drop for UndeliveredEvents {
     }
 }
 
-/// The agent a decoded event should bind to the connection's `_pid` (for the
-/// abrupt-exit watch). BOTH `SessionStart` and `Identity` register-or-back-fill
-/// a slot, and `Identity` is the only carrier for a session attached mid-turn
-/// until its next `SessionStart`. Activity/Waiting/End never register a new
-/// slot.
+/// Every agent a payload of `source`'s names, each bound once to the
+/// connection's `_pid` for the abrupt-exit watch. The payload is a sighting of
+/// that pid whatever it decodes to: registering a slot is the reducer's
+/// business, and an end still says which process sent it. Binding an agent with
+/// no slot, or an ended one, is harmless, since its exit `SessionEnd` is a
+/// reducer no-op. At most one target per agent: a payload must not corroborate
+/// its own pid, and omp pairs `SessionStart` + `Identity` in one batch.
 ///
 /// Dispatches on the same `FocusChannel` as [`patch_identity_pids`], which
 /// reads a narrower fact off it: a `ServerStamp` pid ends sessions but is no
@@ -181,36 +207,21 @@ impl Drop for UndeliveredEvents {
 /// its own exit watch, so binding here would only offer a second, weaker
 /// answer. omp carries BOTH reapers and no precedence is enforced: on an abrupt
 /// kill this watch usually ends the slot first, and the jsonl exit path's
-/// trailing rows then land on an exiting slot as no-ops — accepted, a duplicate
-/// `SessionEnd` is a documented reducer no-op.
-fn pid_bind_target(ev: &AgentEvent) -> Option<(AgentId, bool)> {
-    use crate::source::registry::FocusChannel;
-    let (agent_id, source) = match ev {
-        AgentEvent::SessionStart {
-            agent_id, source, ..
-        }
-        | AgentEvent::Identity {
-            agent_id, source, ..
-        } => (agent_id, source),
-        _ => return None,
+/// trailing rows then land on an exiting slot as no-ops.
+fn bind_targets(source: &str, evs: &[AgentEvent]) -> std::collections::BTreeMap<AgentId, bool> {
+    use crate::source::registry::{Corroboration, FocusChannel};
+    let corroborate = match crate::source::registry::descriptor_for(source)
+        .map(SourceDescriptor::focus_channel)
+    {
+        // The shim GUESSED which ancestor is the CLI — corroborate it, unless
+        // the runner's own shell is the only thing it can have walked past.
+        Some(FocusChannel::ShimStamp(Corroboration::Twice)) => true,
+        Some(FocusChannel::ShimStamp(Corroboration::OnceViaShell)) => false,
+        // The source stamped its own `process.pid`, a fact (`Bindings::sight`).
+        Some(FocusChannel::PluginStamp | FocusChannel::ServerStamp) => false,
+        _ => return std::collections::BTreeMap::new(),
     };
-    match crate::source::registry::descriptor_for(source).map(SourceDescriptor::focus_channel) {
-        // The shim GUESSED which ancestor is the CLI — corroborate it.
-        Some(FocusChannel::ShimStamp) => Some((*agent_id, true)),
-        // The source stamped its own `process.pid`; a session that never calls a
-        // tool reports it once.
-        Some(FocusChannel::PluginStamp | FocusChannel::ServerStamp) => Some((*agent_id, false)),
-        _ => None,
-    }
-}
-
-/// The batch's bind targets, at most one per agent: a payload must not
-/// corroborate its own pid. omp pairs `SessionStart` + `Identity` in its
-/// session batches (activity events are not bind targets), so the collapse is
-/// load-bearing — pinned by `a_batch_yields_one_bind_target_per_agent` and
-/// `an_omp_session_batch_pairs_start_and_identity_and_binds_once_trusted`.
-fn bind_targets(evs: &[AgentEvent]) -> std::collections::BTreeMap<AgentId, bool> {
-    evs.iter().filter_map(pid_bind_target).collect()
+    evs.iter().map(|e| (e.agent_id(), corroborate)).collect()
 }
 
 /// Stamp the connection's peeked `_pid` onto every `Identity` event of a decoded
@@ -243,12 +254,12 @@ fn patch_identity_pids(evs: &mut [AgentEvent], pid: Option<i32>) {
 }
 
 pub(crate) async fn handle_conn(
-    stream: impl AsyncRead + Unpin,
+    stream: tokio::io::Take<impl AsyncRead + Unpin>,
     tx: TaggedSender,
     pid_watch: Option<HookPidWatch>,
     presence_tx: Option<PresenceSender>,
 ) {
-    let reader = BufReader::new(stream.take(MAX_CONN_BYTES));
+    let reader = BufReader::new(stream);
     let mut lines = reader.lines();
     loop {
         match lines.next_line().await {
@@ -300,13 +311,16 @@ pub(crate) async fn handle_conn(
                     .get("_pid")
                     .and_then(serde_json::Value::as_i64)
                     .and_then(checked_pid);
+                let source = v.as_object().map(|o| hook_source(o).to_owned());
                 match decode_hook_payload(v) {
                     // One payload can decode to multiple events (#221) — sent in
                     // order on the same channel, so the reducer registers with
                     // real identity before the activity event applies.
                     Ok(evs) => {
-                        if let (Some(pid), Some(watch)) = (pid, pid_watch.as_ref()) {
-                            for (agent_id, corroborate) in bind_targets(&evs) {
+                        if let (Some(pid), Some(source), Some(watch)) =
+                            (pid, source.as_deref(), pid_watch.as_ref())
+                        {
+                            for (agent_id, corroborate) in bind_targets(source, &evs) {
                                 watch.note(pid, agent_id, corroborate);
                             }
                         }
@@ -371,7 +385,7 @@ mod tests {
 
     #[test]
     fn patch_identity_pids_stamps_only_a_focus_target() {
-        for source in ["claude-code", "codex", "antigravity", "copilot", "opencode"] {
+        for source in ["claude-code", "codex", "copilot", "opencode"] {
             let mut evs = vec![AgentEvent::Identity {
                 agent_id: AgentId::from_parts(source, "ses_t"),
                 source: source.into(),
@@ -385,7 +399,14 @@ mod tests {
                 "{source} Identity must stay pid: None"
             );
         }
-        for source in ["cursor", "codewhale", "hermes", "reasonix", "omp"] {
+        for source in [
+            "antigravity",
+            "cursor",
+            "codewhale",
+            "hermes",
+            "reasonix",
+            "omp",
+        ] {
             let mut evs = vec![AgentEvent::Identity {
                 agent_id: AgentId::from_parts(source, "ses_t"),
                 source: source.into(),
@@ -425,15 +446,34 @@ mod tests {
             },
         ];
         assert_eq!(
-            bind_targets(&batch).len(),
+            bind_targets("cursor", &batch).len(),
             1,
-            "two bind-target events for one agent must collapse to one sighting"
+            "two events for one agent must collapse to one sighting"
         );
         assert_eq!(
-            bind_targets(&batch).get(&id),
+            bind_targets("cursor", &batch).get(&id),
             Some(&true),
-            "cursor is ShimStamp — its pid is a guess and needs corroborating"
+            "cursor is ShimStamp(Twice) — its pid is a guess and needs corroborating"
         );
+    }
+
+    /// Among `ShimStamp` sources, only an `OnceViaShell` one acts on its first
+    /// sighting; a `Twice` one waits for a second.
+    #[test]
+    fn corroboration_is_per_source() {
+        let target = |source: &str| {
+            let id = AgentId::from_parts(source, "s");
+            let ev = AgentEvent::Identity {
+                agent_id: id,
+                source: source.into(),
+                session_id: "s".into(),
+                cwd: None,
+                pid: None,
+            };
+            bind_targets(source, &[ev]).get(&id).copied()
+        };
+        assert_eq!(target("kimi"), Some(false));
+        assert_eq!(target("cursor"), Some(true));
     }
 
     /// omp is the first decoder that really pairs `SessionStart` + `Identity`
@@ -455,7 +495,7 @@ mod tests {
             ),
             "the pair this test exists for: {evs:?}"
         );
-        let targets = bind_targets(&evs);
+        let targets = bind_targets("omp", &evs);
         assert_eq!(targets.len(), 1, "the pair must collapse to one sighting");
         assert_eq!(
             targets.values().next(),
@@ -463,8 +503,8 @@ mod tests {
             "a PluginStamp pid is the CLI's own — no corroboration"
         );
 
-        // The switch batch: End(prev) is no bind target, and the current id's
-        // Start+Identity pair still collapses to one trusted sighting.
+        // The switch batch: the current id's Start+Identity pair still collapses
+        // to one trusted sighting, and the ended id binds a no-op beside it.
         let evs = crate::source::omp::decode_omp_hook_payload(&serde_json::json!({
             "type": "session_switch",
             "sessionFile": "/h/.omp/agent/sessions/-repo/2026-08-30T01-00-00-000Z_01a00000-0000-7000-8000-000000000002.jsonl",
@@ -478,16 +518,16 @@ mod tests {
             3,
             "End(prev) + Start(cur) + Identity(cur): {evs:?}"
         );
-        let targets = bind_targets(&evs);
+        let targets = bind_targets("omp", &evs);
         assert_eq!(
-            (targets.len(), targets.values().next()),
-            (1, Some(&false)),
-            "one trusted sighting for the current id, none for the ended one"
+            targets.into_values().collect::<Vec<_>>(),
+            [false, false],
+            "one trusted sighting per id, the ended one's included"
         );
     }
 
     #[test]
-    fn pid_bind_target_skips_a_source_whose_stamp_is_untrusted() {
+    fn a_source_whose_stamp_is_untrusted_binds_nothing() {
         for source in ["claude-code", "codex"] {
             let id = AgentId::from_parts(source, "s");
             let ev = AgentEvent::SessionStart {
@@ -497,16 +537,15 @@ mod tests {
                 cwd: "/r".into(),
                 parent_id: None,
             };
-            assert_eq!(
-                pid_bind_target(&ev),
-                None,
+            assert!(
+                bind_targets(source, &[ev]).is_empty(),
                 "{source} declares its shim stamp untrusted; it must not bind"
             );
         }
     }
 
     #[test]
-    fn pid_bind_target_covers_both_registration_carriers() {
+    fn every_event_binds_its_agent() {
         let id = AgentId::from_parts("opencode", "ses_x");
         for ev in [
             AgentEvent::SessionStart {
@@ -523,14 +562,6 @@ mod tests {
                 cwd: None,
                 pid: None,
             },
-        ] {
-            assert_eq!(
-                pid_bind_target(&ev),
-                Some((id, false)),
-                "{ev:?} must bind the pid; opencode's server stamps its own, so no corroboration"
-            );
-        }
-        for ev in [
             AgentEvent::ActivityStart {
                 agent_id: id,
                 tool_use_id: None,
@@ -550,7 +581,13 @@ mod tests {
                 as_child: false,
             },
         ] {
-            assert_eq!(pid_bind_target(&ev), None, "{ev:?} must not bind the pid");
+            assert_eq!(
+                bind_targets("opencode", std::slice::from_ref(&ev))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                [(id, false)],
+                "{ev:?} must bind the pid; opencode's server stamps its own, so no corroboration"
+            );
         }
     }
 
@@ -571,7 +608,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(8);
 
-        let task = tokio::spawn(handle_conn(server, tx, None, None));
+        let task = tokio::spawn(handle_conn(server.take(MAX_CONN_BYTES), tx, None, None));
         client
             .write_all(
                 b"{\"hook_event_name\":\"SessionStart\",\"session_id\":\"s1\",\
@@ -592,10 +629,10 @@ mod tests {
     /// anything that stops the drain parks the await forever and the test fails
     /// by HANGING instead of asserting.
     #[tokio::test]
-    async fn handle_conn_ceiling_leaves_headroom_over_the_shim_line_cap() {
+    async fn max_conn_bytes_leaves_headroom_over_the_shim_line_cap() {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(8);
-        let task = tokio::spawn(handle_conn(server, tx, None, None));
+        let task = tokio::spawn(handle_conn(server.take(MAX_CONN_BYTES), tx, None, None));
         let pad = "x".repeat((1 << 20) + (1 << 18));
         let line = format!(
             "{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"s1\",\
@@ -623,7 +660,12 @@ mod tests {
         let (ptx, mut prx) =
             tokio::sync::mpsc::unbounded_channel::<crate::source::daemon::PresenceMsg>();
 
-        let task = tokio::spawn(handle_conn(server, tx, None, Some(ptx)));
+        let task = tokio::spawn(handle_conn(
+            server.take(MAX_CONN_BYTES),
+            tx,
+            None,
+            Some(ptx),
+        ));
         client
             .write_all(
                 b"{\"_pixtuoid_source\":\"openclaw\",\"type\":\"gateway_start\",\
@@ -681,7 +723,12 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel::<crate::source::daemon::PresenceMsg>();
 
         // Spawn with the presence channel ACTIVE so the demux block is entered.
-        let task = tokio::spawn(handle_conn(server, tx, None, Some(ptx)));
+        let task = tokio::spawn(handle_conn(
+            server.take(MAX_CONN_BYTES),
+            tx,
+            None,
+            Some(ptx),
+        ));
         client
             .write_all(
                 b"{\"_pixtuoid_source\":\"opencode\",\"type\":\"session.created\",\
@@ -718,7 +765,7 @@ mod tests {
 
         let timed_out = tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            handle_conn(server, tx, None, None),
+            handle_conn(server.take(MAX_CONN_BYTES), tx, None, None),
         )
         .await
         .is_err();
@@ -755,7 +802,7 @@ mod tests {
 
         client.write_all(PRE_TOOL_USE_LINE).await.unwrap();
         drop(client);
-        handle_conn(server, tx, None, None).await;
+        handle_conn(server.take(MAX_CONN_BYTES), tx, None, None).await;
 
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_ok());
@@ -780,7 +827,12 @@ mod tests {
         let pid = child.id();
 
         let (mut client, server) = tokio::io::duplex(4096);
-        let task = tokio::spawn(handle_conn(server, tx, Some(watch), None));
+        let task = tokio::spawn(handle_conn(
+            server.take(MAX_CONN_BYTES),
+            tx,
+            Some(watch),
+            None,
+        ));
         // TWO payloads: the CLI's own pid rides every hook event, and that
         // repeat is what arms the watch (#896).
         let line = format!(
@@ -819,6 +871,53 @@ mod tests {
         );
     }
 
+    /// A turn that ends without a tool, failed or not, still corroborates its
+    /// session's pid: kimi `-p` fires `SessionStart` and then only its turn's end.
+    #[tokio::test]
+    async fn a_session_whose_only_other_payload_is_its_turn_end_ends_with_its_pid() {
+        for end in ["Stop", "StopFailure"] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(8);
+            let Some(watch) = HookPidWatch::spawn(tx.clone()) else {
+                return; // no exit-watch backend on this platform — nothing to assert
+            };
+            let mut child = crate::test_child::sleeper();
+            let pid = child.id();
+            let (mut client, server) = tokio::io::duplex(4096);
+            let task = tokio::spawn(handle_conn(
+                server.take(MAX_CONN_BYTES),
+                tx,
+                Some(watch),
+                None,
+            ));
+            let line = format!(
+                "{{\"_pixtuoid_source\":\"kimi\",\"hook_event_name\":\"SessionStart\",\
+                 \"session_id\":\"s\",\"cwd\":\"/repo\",\"_pid\":{pid}}}\n\
+                 {{\"_pixtuoid_source\":\"kimi\",\"hook_event_name\":\"{end}\",\
+                 \"session_id\":\"s\",\"cwd\":\"/repo\",\"_pid\":{pid}}}\n"
+            );
+            client.write_all(line.as_bytes()).await.unwrap();
+            drop(client);
+            task.await.unwrap();
+
+            child.kill().expect("kill the watched child");
+            let _ = child.wait();
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match rx.recv().await {
+                        Some((_, AgentEvent::SessionEnd { agent_id, .. })) => {
+                            return Some(agent_id);
+                        }
+                        Some(_) => continue,
+                        None => return None,
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{end}: a SessionEnd within 5s of the watched pid dying"));
+            assert_eq!(ended, Some(AgentId::from_parts("kimi", "s")), "{end}");
+        }
+    }
+
     /// The #896 shape at this seam: ONE payload carrying a `_pid`, then that pid
     /// dies. A single sighting of a shim-guessed pid must end nothing. (The
     /// batch-dedupe guard itself is pinned by `a_batch_yields_one_bind_target_per_agent`
@@ -834,7 +933,12 @@ mod tests {
         let pid = wrapper.id();
 
         let (mut client, server) = tokio::io::duplex(4096);
-        let task = tokio::spawn(handle_conn(server, tx, Some(watch), None));
+        let task = tokio::spawn(handle_conn(
+            server.take(MAX_CONN_BYTES),
+            tx,
+            Some(watch),
+            None,
+        ));
         let line = format!(
             "{{\"_pixtuoid_source\":\"cursor\",\"hook_event_name\":\"preToolUse\",\
              \"session_id\":\"sess-A\",\"workspace_roots\":[\"/repo\"],\
@@ -861,11 +965,53 @@ mod tests {
         );
     }
 
+    /// The kimi counterpart: its failed `-p` turn exits the process, so the only
+    /// pid sighting is the one `SessionStart` carried, and its death must end the
+    /// session (`OnceViaShell`).
+    #[tokio::test]
+    async fn handle_conn_a_single_kimi_sighting_dying_ends_the_session() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(8);
+        let Some(watch) = HookPidWatch::spawn(tx.clone()) else {
+            return; // no exit-watch backend on this platform — nothing to assert
+        };
+        let mut cli = crate::test_child::sleeper();
+        let pid = cli.id();
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(handle_conn(
+            server.take(MAX_CONN_BYTES),
+            tx,
+            Some(watch),
+            None,
+        ));
+        let line = format!(
+            "{{\"_pixtuoid_source\":\"kimi\",\"hook_event_name\":\"SessionStart\",\
+             \"session_id\":\"s\",\"cwd\":\"/repo\",\"_pid\":{pid}}}\n"
+        );
+        client.write_all(line.as_bytes()).await.unwrap();
+        drop(client);
+        task.await.unwrap();
+
+        cli.kill().expect("kill the cli");
+        let _ = cli.wait();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some((_, ev)) = rx.recv().await {
+                if let AgentEvent::SessionEnd { agent_id, .. } = ev {
+                    return Some(agent_id);
+                }
+            }
+            None
+        })
+        .await
+        .expect("a SessionEnd within 5s of the watched pid dying");
+        assert_eq!(ended, Some(AgentId::from_parts("kimi", "s")));
+    }
+
     #[tokio::test]
     async fn handle_conn_never_stamps_a_transcript_family_identity_pid() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(8);
         let (mut client, server) = tokio::io::duplex(4096);
-        let task = tokio::spawn(handle_conn(server, tx, None, None));
+        let task = tokio::spawn(handle_conn(server.take(MAX_CONN_BYTES), tx, None, None));
         let me = std::process::id();
         let line = format!(
             "{{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"ses-cc\",\
@@ -889,10 +1035,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_conn_stamps_a_tool_less_antigravity_session_s_pid() {
+        use crate::source::decoder::EVENT_STAMP;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(8);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(handle_conn(server.take(MAX_CONN_BYTES), tx, None, None));
+        for event in ["SessionStart", "Stop"] {
+            let line = serde_json::json!({
+                "_pixtuoid_source": "antigravity",
+                EVENT_STAMP: event,
+                "conversationId": "c1",
+                "workspacePaths": ["/repo"],
+                "_pid": i32::MAX,
+            });
+            client
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        drop(client);
+        task.await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok((_, ev)) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            events.iter().any(|ev| matches!(ev,
+                AgentEvent::Identity { pid: Some(p), .. } if p.pid == i32::MAX)),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_conn_stamps_identity_pid_even_without_a_pid_watch() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(8);
         let (mut client, server) = tokio::io::duplex(4096);
-        let task = tokio::spawn(handle_conn(server, tx, None, None));
+        let task = tokio::spawn(handle_conn(server.take(MAX_CONN_BYTES), tx, None, None));
         // i32::MAX as the pid: the stamp path does a REAL kernel marker read,
         // and an allocatable pid can be a live process on a busy CI host — an
         // unallocatable one guarantees `started: None`.
@@ -923,7 +1102,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(8);
         let (logs, _guard) = capture_warns();
 
-        let task = tokio::spawn(handle_conn(server, tx, None, None));
+        let task = tokio::spawn(handle_conn(server.take(MAX_CONN_BYTES), tx, None, None));
         client
             .write_all(b"{\"hook_event_name\":\"BogusEvent\",\"session_id\":\"s1\"}\n")
             .await
@@ -957,7 +1136,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(8);
         let (logs, _guard) = capture_warns();
 
-        let task = tokio::spawn(handle_conn(server, tx, None, None));
+        let task = tokio::spawn(handle_conn(server.take(MAX_CONN_BYTES), tx, None, None));
         client.write_all(b"   \n").await.unwrap();
         client
             .write_all(
@@ -989,7 +1168,12 @@ mod tests {
         let (ptx, mut prx) =
             tokio::sync::mpsc::unbounded_channel::<crate::source::daemon::PresenceMsg>();
 
-        let task = tokio::spawn(handle_conn(server, tx, None, Some(ptx)));
+        let task = tokio::spawn(handle_conn(
+            server.take(MAX_CONN_BYTES),
+            tx,
+            None,
+            Some(ptx),
+        ));
         // An object without `type` — the openclaw decoder errs on it.
         client
             .write_all(b"{\"_pixtuoid_source\":\"openclaw\"}\n")
@@ -1026,7 +1210,7 @@ mod tests {
         let (logs, _guard) = capture_warns();
 
         client.write_all(PRE_TOOL_USE_LINE).await.unwrap();
-        handle_conn(server, tx, None, None).await;
+        handle_conn(server.take(MAX_CONN_BYTES), tx, None, None).await;
 
         let out = logs.contents();
         assert!(

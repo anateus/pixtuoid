@@ -10,9 +10,10 @@
 //! {"event":"PreToolUse","cwd":"/repo","toolName":"bash","toolArgs":{"command":"ls"}}
 //! ```
 //!
-//! camelCase fields, `event` discriminator (not `hook_event_name`), and no
-//! transcript path or tool-call id anywhere (`internal/ext/hook/hook.go` Payload).
-//! It DOES carry `sessionId` — 44/44 payloads across the recorded fixtures — so
+//! camelCase fields, `event` discriminator (not `hook_event_name`), no
+//! transcript path, and a tool-call id only on `SubagentStart`/`SubagentStop`
+//! (`internal/ext/hook/hook.go` Payload).
+//! It DOES carry `sessionId` — every recorded payload does — so
 //! that is the AgentId key, cwd only as the fallback for a build that omits it.
 //! Keying on the workspace instead would merge two sessions in ONE project into
 //! a single sprite (the Cursor lesson; `hermes.rs` states it too).
@@ -33,35 +34,54 @@ use crate::source::{AgentEvent, ToolDetail};
 /// The Reasonix CLI source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "reasonix";
 
-/// Each version publishes a "Reasonix CLI" and a "Reasonix Studio" release
-/// (`studio-v…`, github.com/esengine/DeepSeek-Reasonix/releases), so
-/// `releases/latest` may name the app; the CLI is the npm package's `latest`
-/// (registry.npmjs.org/reasonix).
-#[cfg(any(test, feature = "upstream"))]
-pub const REPO: crate::source::upstream::Repo = crate::source::upstream::Repo {
-    name: "esengine/DeepSeek-Reasonix",
-    release: crate::source::upstream::Release::Npm {
-        package: "reasonix",
-        tag_prefix: "v",
-    },
-};
+/// Reasonix tools that spawn a subagent, so the slot reads "Delegating" while
+/// it works (`internal/ext/hook/hook_claude_agent.go:7-10`). `task` is not
+/// here: `SubagentStart` marks a foreground one with its call id, and a
+/// background one leaves the parent working. `run_skill` is excluded: it is
+/// only sometimes a subagent and the args don't say which.
+const SUBAGENT_TOOLS: &[&str] = &[
+    "read_only_task",
+    "parallel_tasks",
+    "explore",
+    "locate",
+    "research",
+    "review",
+    "security_review",
+];
 
-/// Reasonix tools that dispatch an in-process subagent (`internal/agent/task.go`
-/// plus `internal/skill/tools.go`), so the slot reads "Delegating" while
-/// the hook-invisible subagent works. `run_skill` is excluded: it is only
-/// sometimes a subagent and the args don't say which. `task` is pinned live by
-/// `fixtures/reasonix/delegation-recorded`.
-const SUBAGENT_TOOLS: &[&str] = &["task", "explore", "research", "review", "security_review"];
+/// A role's hooks carry its parent's session id suffixed `:<role>`
+/// (`internal/ext/hook/runner.go:57-66`). A subagent's role is
+/// `subagent:<id>` (`internal/runtime/delegation/task.go:901-909`).
+const SUBAGENT_ROLE: &str = ":subagent:";
+/// The planner's and guardian's roles (`internal/assembly/boot/roles.go:79`,
+/// `:118`): phases of the parent's own turn, not delegations.
+const TURN_ROLES: &[&str] = &[":planner", ":guardian"];
+
+/// The field `SubagentStart`/`SubagentStop` pair a call on.
+const CALL_ID: &str = "callId";
+
+/// The agent a session id names, and its parent's id when it is a subagent's:
+/// every role hangs off the session's root runner
+/// (`internal/assembly/boot/delegation.go:81`, `:122`), so a subagent's own
+/// subagent is the root's too.
+fn session_of(id: &str) -> (&str, Option<&str>) {
+    let own = TURN_ROLES
+        .iter()
+        .find_map(|role| id.strip_suffix(role))
+        .unwrap_or(id);
+    (own, own.split_once(SUBAGENT_ROLE).map(|(root, _)| root))
+}
 
 /// Decode one Reasonix hook payload (already identified by
 /// `_pixtuoid_source == "reasonix"`). Envelope verified against
 /// `internal/ext/hook/hook.go`. An unregistered event bails rather than
 /// dropping silently, so registered-vs-decoded drift is loud.
 ///
-/// The activity arms prepend an [`AgentEvent::Identity`] (#221) because
-/// Reasonix is HOOK-ONLY: a slot the reducer's proof-of-life pre-pass
-/// synthesizes mid-turn has no JSONL back-fill path, so without the attached
-/// identity it would stay a blank `#N` ghost until the next `UserPromptSubmit`.
+/// The activity arms prepend a registration, an [`AgentEvent::Identity`] (#221)
+/// or a subagent's parented `SessionStart`, because Reasonix is HOOK-ONLY: a
+/// slot the reducer's proof-of-life pre-pass synthesizes mid-turn has no JSONL
+/// back-fill path, so without it it would stay a blank `#N` ghost until the
+/// next `UserPromptSubmit`.
 ///
 /// # Errors
 ///
@@ -92,20 +112,52 @@ pub(crate) fn decode_rx_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
             crate::source::drift::missing_field(SOURCE_NAME, event, "sessionId");
             cwd
         });
+    let (key, parent) = session_of(key);
     let agent_id = AgentId::from_parts(SOURCE_NAME, key);
-
-    let identity = || AgentEvent::identity(agent_id, SOURCE_NAME, key, Some(cwd.into()));
+    let parent_id = parent.map(|p| AgentId::from_parts(SOURCE_NAME, p));
+    let start = || AgentEvent::SessionStart {
+        agent_id,
+        source: SOURCE_NAME.to_string(),
+        session_id: key.to_string(),
+        cwd: cwd.into(),
+        parent_id,
+    };
+    // A subagent fires no start of its own, so each of its events carries the
+    // link to its parent.
+    let register = || match parent_id {
+        Some(_) => start(),
+        None => AgentEvent::identity(agent_id, SOURCE_NAME, key, Some(cwd.into())),
+    };
+    // A foreground `task` brackets its child with these, keyed by the call
+    // (`internal/runtime/agent/execute_one.go:674-679`): the call id lets the
+    // reducer's drain walk the child out when it returns.
+    let call_id = || {
+        let id = obj
+            .get(CALL_ID)
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty());
+        if id.is_none() {
+            crate::source::drift::missing_field(SOURCE_NAME, event, CALL_ID);
+        }
+        id.map(str::to_owned)
+    };
 
     match event {
         // The `UserPromptSubmit` duplicate is the RESURRECT path — a
         // stale-swept session walks back in on its next prompt, and Reasonix
         // has no other re-creation signal.
-        "SessionStart" | "UserPromptSubmit" => Ok(vec![AgentEvent::SessionStart {
+        "SessionStart" | "UserPromptSubmit" => Ok(vec![start()]),
+        "SubagentStart" => Ok(vec![
+            register(),
+            AgentEvent::ActivityStart {
+                agent_id,
+                tool_use_id: call_id(),
+                detail: Some(ToolDetail::Task),
+            },
+        ]),
+        "SubagentStop" => Ok(vec![AgentEvent::ActivityEnd {
             agent_id,
-            source: SOURCE_NAME.to_string(),
-            session_id: key.to_string(),
-            cwd: cwd.into(),
-            parent_id: None,
+            tool_use_id: call_id(),
         }]),
         "PreToolUse" => {
             let tool = obj
@@ -116,7 +168,7 @@ pub(crate) fn decode_rx_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
                     "?"
                 });
             Ok(vec![
-                identity(),
+                register(),
                 AgentEvent::ActivityStart {
                     agent_id,
                     tool_use_id: None,
@@ -124,13 +176,29 @@ pub(crate) fn decode_rx_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
                 },
             ])
         }
-        "PostToolUse" => Ok(vec![
-            identity(),
-            AgentEvent::ActivityEnd {
+        "PostToolUse" => {
+            let mut events = vec![register()];
+            // It names its call's tool, on a failure too
+            // (`internal/ext/hook/runner.go:166-192`), and a skill call's return
+            // is its child's end: re-stating the Task makes this End close one,
+            // whatever the parent started since.
+            let tool = obj.get("toolName").and_then(|s| s.as_str());
+            if tool.is_none() {
+                crate::source::drift::missing_field(SOURCE_NAME, "PostToolUse", "toolName");
+            }
+            if tool.is_some_and(|t| SUBAGENT_TOOLS.contains(&t)) {
+                events.push(AgentEvent::ActivityStart {
+                    agent_id,
+                    tool_use_id: None,
+                    detail: Some(ToolDetail::Task),
+                });
+            }
+            events.push(AgentEvent::ActivityEnd {
                 agent_id,
                 tool_use_id: None,
-            },
-        ]),
+            });
+            Ok(events)
+        }
         // Deliberately Identity-LESS: an end doesn't prove a session worth
         // registering, so an unknown id here rides the reducer's fallback.
         "Stop" => Ok(vec![AgentEvent::ActivityEnd {
@@ -138,14 +206,15 @@ pub(crate) fn decode_rx_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
             tool_use_id: None,
         }]),
         "Notification" => {
-            // Upstream's only Notification producer is the approval gate:
-            // "approval needed: <tool> <subject>".
+            // Every producer waits on the user: the approval gate, a question,
+            // Auto Guard (`internal/session/control/approval_orchestration.go:311`,
+            // `:621`, `recovery.go:341`).
             let msg = obj
                 .get("message")
                 .and_then(|s| s.as_str())
                 .unwrap_or("waiting");
             Ok(vec![
-                identity(),
+                register(),
                 AgentEvent::Waiting {
                     agent_id,
                     reason: ellipsize(msg, MAX_DECODED_FIELD_CHARS),
@@ -156,9 +225,6 @@ pub(crate) fn decode_rx_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
         // The STRUCTURED approval gate: fires BEFORE the prompt with the tool +
         // subject, and ALONGSIDE `Notification` for the same approval — both →
         // Waiting is idempotent (the gated tool's PostToolUse/Stop resolves it).
-        // Capture-verified at v1.25.2: `fixtures/reasonix/permission-flow`. It was
-        // decoded from upstream source and annotated "not live-capturable" until a
-        // seeded ask rule made the gate fire.
         "PermissionRequest" => {
             let tool = obj
                 .get("toolName")
@@ -184,7 +250,7 @@ pub(crate) fn decode_rx_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
                 (None, _) => "approval required".to_string(),
             };
             Ok(vec![
-                identity(),
+                register(),
                 AgentEvent::Waiting {
                     agent_id,
                     reason: ellipsize(&reason, MAX_DECODED_FIELD_CHARS),
@@ -194,7 +260,7 @@ pub(crate) fn decode_rx_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
         }
         "SessionEnd" => Ok(vec![AgentEvent::SessionEnd {
             agent_id,
-            as_child: false,
+            as_child: parent_id.is_some(),
         }]),
         other => {
             crate::source::drift::unknown_event(SOURCE_NAME, other);
@@ -259,7 +325,6 @@ mod tests {
 
     #[test]
     fn two_sessions_in_one_workspace_stay_two_agents() {
-        // Pinned against fixtures/reasonix/delegation-recorded.
         let ev = |sid: &str| {
             decode_rx_hook_payload(&json!({
                 "event": "SessionStart", "cwd": "/repo", "sessionId": sid
@@ -402,7 +467,15 @@ mod tests {
 
     #[test]
     fn subagent_dispatch_family_maps_to_task() {
-        for tool in ["task", "explore", "research", "review", "security_review"] {
+        for tool in [
+            "read_only_task",
+            "parallel_tasks",
+            "explore",
+            "locate",
+            "research",
+            "review",
+            "security_review",
+        ] {
             let ev = decode(json!({
                 "event": "PreToolUse", "cwd": "/r",
                 "toolName": tool, "toolArgs": {"prompt": "do a thing"}
@@ -412,11 +485,18 @@ mod tests {
                 "{tool} must map to ToolDetail::Task"
             );
         }
-        let ev = decode(json!({
-            "event": "PreToolUse", "cwd": "/r",
-            "toolName": "run_skill", "toolArgs": {"name": "lint"}
-        }));
-        assert!(matches!(&ev, AgentEvent::ActivityStart { detail: Some(d), .. } if !d.is_task()));
+        for (tool, args) in [
+            ("run_skill", json!({"name": "lint"})),
+            ("task", json!({"prompt": "do a thing"})),
+        ] {
+            let ev = decode(json!({
+                "event": "PreToolUse", "cwd": "/r", "toolName": tool, "toolArgs": args
+            }));
+            assert!(
+                matches!(&ev, AgentEvent::ActivityStart { detail: Some(d), .. } if !d.is_task()),
+                "{tool} must not map to ToolDetail::Task"
+            );
+        }
     }
 
     #[test]
@@ -434,6 +514,46 @@ mod tests {
                 "{event} must decode to ActivityEnd with no tool id"
             );
         }
+    }
+
+    #[test]
+    fn a_post_tool_use_without_its_tool_name_breadcrumbs() {
+        let post = |v: Value| crate::test_capture::capture_logs(|| drop(decode_all(v)));
+        let bare = post(json!({"event": "PostToolUse", "sessionId": "s", "cwd": "/r"}));
+        assert!(bare.contains(crate::source::drift::TARGET), "{bare:?}");
+        let named = post(
+            json!({"event": "PostToolUse", "sessionId": "s", "cwd": "/r", "toolName": "bash"}),
+        );
+        assert!(!named.contains(crate::source::drift::TARGET), "{named:?}");
+    }
+
+    #[test]
+    fn a_skill_calls_return_restates_its_task_before_the_end() {
+        let post = |tool| {
+            decode_all(
+                json!({"event": "PostToolUse", "sessionId": "s", "cwd": "/r", "toolName": tool}),
+            )
+        };
+        assert!(
+            matches!(
+                post("explore").as_slice(),
+                [
+                    _,
+                    AgentEvent::ActivityStart { tool_use_id: None, detail: Some(d), .. },
+                    AgentEvent::ActivityEnd { tool_use_id: None, .. },
+                ] if d.is_task()
+            ),
+            "{:?}",
+            post("explore")
+        );
+        assert!(
+            matches!(
+                post("read_file").as_slice(),
+                [_, AgentEvent::ActivityEnd { .. }]
+            ),
+            "{:?}",
+            post("read_file")
+        );
     }
 
     #[test]
@@ -583,7 +703,7 @@ mod tests {
 
     #[test]
     fn unknown_event_bails_loudly() {
-        for ev in ["PostLLMCall", "PreCompact", "SubagentStop", "Bogus"] {
+        for ev in ["PostLLMCall", "PreCompact", "PostToolUseFailure", "Bogus"] {
             assert!(
                 decode_rx_hook_payload(&json!({"event": ev, "cwd": "/r"})).is_err(),
                 "{ev} must bail (not registered, must not decode silently)"
@@ -640,5 +760,67 @@ mod tests {
             }
             other => panic!("expected Waiting, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_subagents_events_register_it_under_its_parent() {
+        let child = AgentId::from_parts(SOURCE_NAME, "p:subagent:sa_1");
+        let evs = decode_all(json!({
+            "event": "PreToolUse", "cwd": "/r", "sessionId": "p:subagent:sa_1",
+            "toolName": "read_file", "toolArgs": {"path": "NOTE.txt"}
+        }));
+        assert!(
+            evs.iter().any(
+                |e| matches!(e, AgentEvent::SessionStart { agent_id, parent_id, .. }
+                if *agent_id == child && *parent_id == Some(AgentId::from_parts(SOURCE_NAME, "p")))
+            ),
+            "{evs:?}"
+        );
+        assert!(
+            evs.iter().any(
+                |e| matches!(e, AgentEvent::ActivityStart { agent_id, .. } if *agent_id == child)
+            ),
+            "{evs:?}"
+        );
+    }
+
+    #[test]
+    fn a_planner_or_guardian_is_its_parents_own_turn() {
+        for role in ["planner", "guardian"] {
+            let evs = decode_all(json!({
+                "event": "PreToolUse", "cwd": "/r", "sessionId": format!("p:{role}"),
+                "toolName": "read_file", "toolArgs": {"path": "NOTE.txt"}
+            }));
+            assert!(
+                evs.iter()
+                    .all(|e| e.agent_id() == AgentId::from_parts(SOURCE_NAME, "p")),
+                "{role}: {evs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_start_and_stop_bracket_the_parents_task_by_its_call_id() {
+        let parent = AgentId::from_parts(SOURCE_NAME, "p");
+        let call = Some("call_1".to_string());
+        let start = decode(json!({
+            "event": "SubagentStart", "cwd": "/r", "sessionId": "p", "callId": "call_1",
+            "toolArgs": {"prompt": "read the note"}
+        }));
+        assert!(
+            matches!(&start, AgentEvent::ActivityStart { agent_id, tool_use_id, detail: Some(d) }
+                if *agent_id == parent && *tool_use_id == call && d.is_task()),
+            "{start:?}"
+        );
+        let stop = decode(json!({
+            "event": "SubagentStop", "cwd": "/r", "sessionId": "p", "callId": "call_1"
+        }));
+        assert_eq!(
+            stop,
+            AgentEvent::ActivityEnd {
+                agent_id: parent,
+                tool_use_id: call
+            }
+        );
     }
 }

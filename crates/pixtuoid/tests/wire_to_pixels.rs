@@ -113,7 +113,9 @@ enum Wire {
 struct WireCase {
     name: &'static str,
     source: &'static str,
-    /// Path to the fixture file, relative to `core_fixtures_root()`.
+    /// Path to the fixture file, relative to `core_fixtures_root()`, or to a
+    /// capture holding one transcript of `source`'s under a session id that
+    /// each re-record changes.
     fixture: &'static str,
     wire: Wire,
     /// The state classes this fixture's committed wire must drive the slot
@@ -122,8 +124,17 @@ struct WireCase {
     must_reach: &'static [Reach],
 }
 
-fn assert_renders_a_sprite(case: &WireCase) {
+fn fixture_path(case: &WireCase) -> PathBuf {
     let path = core_fixtures_root().join(case.fixture);
+    if !path.is_dir() {
+        return path;
+    }
+    pixtuoid_core::harness::transcript_in(case.source, &path)
+        .unwrap_or_else(|found| panic!("{}: {found:?} under {path:?}, not one", case.name))
+}
+
+fn assert_renders_a_sprite(case: &WireCase) {
+    let path = fixture_path(case);
     let lines = read_nonblank_lines(&path);
 
     let driven = match case.wire {
@@ -154,10 +165,10 @@ fn assert_renders_a_sprite(case: &WireCase) {
     );
     for want in case.must_reach {
         assert!(
-            driven.reached.contains(want),
+            driven.reached().contains(want),
             "{}: the wire must drive the slot through {want:?}; reached only {:?}",
             case.name,
-            driven.reached
+            driven.reached()
         );
     }
 
@@ -200,8 +211,8 @@ fn agent_cases() -> Vec<WireCase> {
         WireCase {
             name: "antigravity",
             source: "antigravity",
-            fixture: "fixtures/antigravity/tool-run-recorded/transcript.jsonl",
-            wire: Wire::Transcript { seeded: true },
+            fixture: "fixtures/antigravity/tool-run-hermetic/hook-payloads.jsonl",
+            wire: Wire::Hooks,
             must_reach: &[Reach::Active],
         },
         WireCase {
@@ -230,14 +241,14 @@ fn agent_cases() -> Vec<WireCase> {
         WireCase {
             name: "grok",
             source: "grok",
-            fixture: "fixtures/grok/permission-recorded/01a0059d-ece9-7931-8e07-c91d77ba5943/updates.jsonl",
+            fixture: "fixtures/grok/permission-hermetic",
             wire: Wire::Transcript { seeded: true },
             must_reach: &[Reach::Active],
         },
         WireCase {
             name: "reasonix",
             source: "reasonix",
-            fixture: "fixtures/reasonix/delegation-recorded/hook-payloads.jsonl",
+            fixture: "reasonix/fixtures/subagent-hermetic/hook-payloads.jsonl",
             wire: Wire::Hooks,
             must_reach: &[Reach::Active, Reach::Delegating],
         },
@@ -268,17 +279,14 @@ fn agent_cases() -> Vec<WireCase> {
         WireCase {
             name: "hermes",
             source: "hermes",
-            fixture: "fixtures/hermes/tool-run/hook-payloads.jsonl",
+            fixture: "fixtures/hermes/tool-run-hermetic/hook-payloads.jsonl",
             wire: Wire::Hooks,
             must_reach: &[Reach::Active],
         },
         WireCase {
-            // The gate fires TWICE for one command, so this also drives the
-            // reducer path where a re-notified Waiting must not clear the gate
-            // the first one set.
             name: "hermes_approval",
             source: "hermes",
-            fixture: "fixtures/hermes/approval-recorded/hook-payloads.jsonl",
+            fixture: "fixtures/hermes/permission-hermetic/hook-payloads.jsonl",
             wire: Wire::Hooks,
             must_reach: &[Reach::Waiting],
         },
@@ -303,11 +311,7 @@ fn agent_cases() -> Vec<WireCase> {
         WireCase {
             name: "kimi",
             source: "kimi",
-            // The permission fixture, because a HEADLESS kimi run cannot reach
-            // Waiting — it auto-approves even `rm -rf`, so `PermissionRequest`
-            // only fires for a human at a real TUI. Both fixtures are captures;
-            // this is the one whose turn covers both classes.
-            fixture: "fixtures/kimi/permission-flow/hook-payloads.jsonl",
+            fixture: "fixtures/kimi/permission-hermetic/hook-payloads.jsonl",
             wire: Wire::Hooks,
             must_reach: &[Reach::Active, Reach::Waiting],
         },
@@ -393,7 +397,7 @@ fn codex_transcript_line_renders_a_painted_sprite() {
 }
 
 #[test]
-fn antigravity_transcript_line_renders_a_painted_sprite() {
+fn antigravity_hook_envelope_renders_a_painted_sprite() {
     assert_renders_a_sprite(&agent_case("antigravity"));
 }
 
@@ -550,8 +554,8 @@ fn a_failed_provider_degrades_the_gateway_rather_than_downing_it() {
 /// `runtime/driver.rs` uses — NEVER `Reducer::apply`, which is `AgentId`-pure.
 #[test]
 fn openclaw_presence_envelope_renders_a_lobster() {
-    let hooks = core_fixtures_root()
-        .join("fixtures/openclaw/gateway-lifecycle-recorded/hook-payloads.jsonl");
+    let hooks =
+        core_fixtures_root().join("fixtures/openclaw/tool-run-hermetic/hook-payloads.jsonl");
 
     let lines = read_nonblank_lines(&hooks);
     let mut scene = SceneState::uniform(16);

@@ -34,11 +34,19 @@ use crate::{AgentEvent, AgentId, Reducer, Transport};
 
 mod captures;
 pub mod hermetic;
+pub mod host;
+pub mod plan;
+pub mod provenance;
 pub mod reads;
+#[cfg(feature = "native")]
+pub mod tap;
 
 pub use captures::{
-    CAPTURE_NOTE, CAPTURE_RECORD, CAPTURE_WORKSPACE, Capture, CaptureRecord, HOOK_PAYLOADS,
-    PROVENANCE, captures, jsonl_files_under, recorder_flag, transcripts_under,
+    BOOT, CAPTURE_NOTE, CAPTURE_RECORD, CORPUS_REFUSAL, Capture, CaptureRecord, DRIVER_COPY,
+    HOOK_PAYLOADS, NOTE_FILE, PROVENANCE, SecondTurn, canonical_capture, capture_base,
+    capture_root, capture_workspace, capture_workspace_tail, captures, files_under,
+    jsonl_files_under, required_version_probe, slashed_under, transcript_in, transcripts_under,
+    version_answer, wait_until,
 };
 
 /// The committed corpus: every recorded capture, fixture and hermetic script.
@@ -108,14 +116,26 @@ pub struct Driven {
     pub decode_errors: Vec<LineFailure>,
     /// Lines whose decoder PANICKED — the never-panic contract violated.
     pub panics: Vec<LineFailure>,
-    /// Lifecycle classes any slot passed through, in first-reached order.
-    pub reached: Vec<Reach>,
+    /// Each slot's lifecycle classes, as each was first reached: the one record
+    /// [`Self::reached`] unions.
+    pub reaches: Vec<(AgentId, Reach)>,
     /// The drift breadcrumbs the decode and fold logged, each as its fields: a
     /// field whose only use is the breadcrumb its absence logs is still read.
     pub(crate) breadcrumbs: Vec<String>,
 }
 
 impl Driven {
+    /// The classes any slot passed through, in first-reached order.
+    pub fn reached(&self) -> Vec<Reach> {
+        let mut out = Vec::new();
+        for &(_, class) in &self.reaches {
+            if !out.contains(&class) {
+                out.push(class);
+            }
+        }
+        out
+    }
+
     /// Slots the fold registered — "did the wire reach the scene at all".
     pub fn registered(&self) -> usize {
         self.scene.agents.len()
@@ -298,7 +318,7 @@ impl Drive {
             unparseable: 0,
             decode_errors: Vec::new(),
             panics: Vec::new(),
-            reached: Vec::new(),
+            reaches: Vec::new(),
             breadcrumbs: Vec::new(),
         };
         let sink = BreadcrumbSink::default();
@@ -377,9 +397,9 @@ impl Drive {
         let mut reducer = Reducer::new();
         for ev in &d.events {
             reducer.apply(&mut d.scene, ev.clone(), self.now, self.transport);
-            note_reached(&d.scene, &mut d.reached);
+            note_reached(&d.scene, &mut d.reaches);
             reducer.tick(&mut d.scene, self.now + SETTLE);
-            note_reached(&d.scene, &mut d.reached);
+            note_reached(&d.scene, &mut d.reaches);
         }
     }
 }
@@ -430,14 +450,10 @@ impl tracing::Subscriber for BreadcrumbSink {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
-/// Union the lifecycle classes every live slot is in into `reached`.
-///
-/// Every slot, not the first: a `HashMap`'s iteration order is arbitrary, so
-/// reading one slot makes a multi-agent wire report a different class run to
-/// run. Strictly weaker as a result — one slot reaching both classes and two
-/// slots reaching one each are indistinguishable.
-fn note_reached(scene: &SceneState, reached: &mut Vec<Reach>) {
-    for slot in scene.agents.values() {
+/// Record the lifecycle class each live slot is in, once per slot and class:
+/// two slots reaching one class each must not read as one slot reaching both.
+fn note_reached(scene: &SceneState, reaches: &mut Vec<(AgentId, Reach)>) {
+    for (&id, slot) in &scene.agents {
         let r = match &slot.state {
             ActivityState::Active {
                 kind: ToolKind::Task,
@@ -447,8 +463,8 @@ fn note_reached(scene: &SceneState, reached: &mut Vec<Reach>) {
             ActivityState::Waiting { .. } => Reach::Waiting,
             ActivityState::Idle => continue,
         };
-        if !reached.contains(&r) {
-            reached.push(r);
+        if !reaches.contains(&(id, r)) {
+            reaches.push((id, r));
         }
     }
 }
@@ -493,75 +509,59 @@ mod tests {
         assert!(crumbs.iter().any(|c| c.contains("callId")), "{crumbs:?}");
     }
 
-    /// A CC transcript line carrying only tool activity — nothing in it
+    /// An omp transcript line carrying only tool activity — nothing in it
     /// registers a session.
-    fn cc_tool_line() -> String {
+    fn tool_line() -> String {
         serde_json::json!({
-            "type": "assistant",
-            "message": {"content": [
-                {"type": "tool_use", "id": "tu-1", "name": "Bash", "input": {"command": "ls"}}
+            "type": "message",
+            "message": {"role": "assistant", "content": [
+                {"type": "toolCall", "id": "tu-1", "name": "bash", "arguments": {"command": "ls"}}
             ]}
         })
         .to_string()
     }
 
-    const CC_TRANSCRIPT: &str =
-        "/h/.claude/projects/-h-p/01000000-0000-7000-8000-0000000000cc.jsonl";
+    const TRANSCRIPT: &str = "/h/.omp/agent/sessions/-h-p/2026-09-19T18-16-13-370Z_01a0bae2-133a-769f-851a-927926fbca45.jsonl";
+    const SOURCE: &str = "omp";
 
     #[test]
     fn an_unseeded_activity_only_transcript_decodes_but_registers_nothing() {
-        let d = Drive::transcript("claude-code", CC_TRANSCRIPT)
+        let d = Drive::transcript(SOURCE, TRANSCRIPT)
             .unwrap()
-            .lines([cc_tool_line()]);
+            .lines([tool_line()]);
         assert!(!d.events.is_empty(), "the line must decode");
         assert_eq!(
             d.registered(),
             0,
             "a JSONL event for an unknown id is a no-op"
         );
-        assert!(d.reached.is_empty());
+        assert!(d.reaches.is_empty());
     }
 
     #[test]
     fn the_first_sight_seed_registers_and_the_wire_drives_the_slot_active() {
-        let d = Drive::transcript("claude-code", CC_TRANSCRIPT)
+        let d = Drive::transcript(SOURCE, TRANSCRIPT)
             .unwrap()
             .seeded()
-            .lines([cc_tool_line()]);
+            .lines([tool_line()]);
         assert_eq!(d.registered(), 1);
-        assert_eq!(d.reached, vec![Reach::Active]);
-    }
-
-    #[test]
-    fn the_seed_coalesces_with_the_decoders_own_agent_id() {
-        let d = Drive::transcript("claude-code", CC_TRANSCRIPT)
-            .unwrap()
-            .seeded()
-            .lines([cc_tool_line()]);
-        let ids: std::collections::BTreeSet<_> =
-            d.events.iter().map(AgentEvent::agent_id).collect();
-        assert_eq!(ids.len(), 1, "seed + decoded activity must be ONE agent");
-        assert_eq!(
-            ids.into_iter().next().unwrap(),
-            AgentId::from_parts("claude-code", "01000000-0000-7000-8000-0000000000cc"),
-            "the seed must key on the row's derivation (the CC filename stem)"
-        );
+        assert_eq!(d.reached(), vec![Reach::Active]);
     }
 
     #[test]
     fn transcript_at_keys_on_the_normalized_path_like_the_walker_does() {
-        let path = Path::new(CC_TRANSCRIPT);
-        let by_path = Drive::transcript_at("claude-code", path)
+        let path = Path::new(TRANSCRIPT);
+        let by_path = Drive::transcript_at(SOURCE, path)
             .unwrap()
             .seeded()
-            .lines([cc_tool_line()]);
+            .lines([tool_line()]);
         let by_key = Drive::transcript(
-            "claude-code",
+            SOURCE,
             &crate::id::normalize_path_key(&path.to_string_lossy()),
         )
         .unwrap()
         .seeded()
-        .lines([cc_tool_line()]);
+        .lines([tool_line()]);
         assert_eq!(
             by_path.events[0].agent_id(),
             by_key.events[0].agent_id(),
@@ -571,9 +571,12 @@ mod tests {
 
     #[test]
     fn blank_lines_are_skipped_and_non_json_counts_as_unparseable() {
-        let d = Drive::transcript("claude-code", CC_TRANSCRIPT)
-            .unwrap()
-            .lines(["", "   ", "not json at all", "{}"]);
+        let d = Drive::transcript(SOURCE, TRANSCRIPT).unwrap().lines([
+            "",
+            "   ",
+            "not json at all",
+            "{}",
+        ]);
         assert_eq!(d.lines, 2, "only the non-blank lines are driven");
         assert_eq!(d.unparseable, 1);
         assert!(d.decode_errors.is_empty());
@@ -606,8 +609,8 @@ mod tests {
             transport: Transport::Jsonl,
             decode: Decode::Transcript {
                 decode,
-                source: "claude-code".to_string(),
-                logical: CC_TRANSCRIPT.to_string(),
+                source: SOURCE.to_string(),
+                logical: TRANSCRIPT.to_string(),
             },
             seeded: false,
             now: SystemTime::UNIX_EPOCH + Duration::from_secs(DEFAULT_NOW_EPOCH_SECS),
@@ -650,7 +653,7 @@ mod tests {
     #[test]
     fn wire_events_excludes_the_seed_so_garbage_scores_zero() {
         let garbage = ["not json at all", r#"{"totally":"unrelated"}"#];
-        let d = Drive::transcript("claude-code", CC_TRANSCRIPT)
+        let d = Drive::transcript(SOURCE, TRANSCRIPT)
             .unwrap()
             .seeded()
             .lines(garbage);
@@ -663,16 +666,16 @@ mod tests {
         assert_eq!(d.wire_events(), 0, "no wire event came out of garbage");
         assert_eq!(d.events.len(), 1, "the one event is the seed itself");
 
-        let d = Drive::transcript("claude-code", CC_TRANSCRIPT)
+        let d = Drive::transcript(SOURCE, TRANSCRIPT)
             .unwrap()
             .seeded()
-            .lines([cc_tool_line()]);
+            .lines([tool_line()]);
         assert_eq!(d.seed_events, 1);
         assert_eq!(d.wire_events(), d.events.len() - 1);
 
-        let d = Drive::transcript("claude-code", CC_TRANSCRIPT)
+        let d = Drive::transcript(SOURCE, TRANSCRIPT)
             .unwrap()
-            .lines([cc_tool_line()]);
+            .lines([tool_line()]);
         assert_eq!(d.seed_events, 0);
         assert_eq!(d.wire_events(), d.events.len());
     }
@@ -751,28 +754,20 @@ mod tests {
 
     #[test]
     fn a_transient_class_resolved_by_a_later_line_still_counts_as_reached() {
-        let start = serde_json::json!({
-            "type": "assistant",
-            "message": {"content": [
-                {"type": "tool_use", "id": "tu-9", "name": "Bash", "input": {"command": "ls"}}
-            ]}
-        })
-        .to_string();
+        let start = tool_line();
         let end = serde_json::json!({
-            "type": "user",
-            "message": {"content": [
-                {"type": "tool_result", "tool_use_id": "tu-9", "content": "ok"}
-            ]}
+            "type": "message",
+            "message": {"role": "toolResult", "toolCallId": "tu-1"}
         })
         .to_string();
-        let d = Drive::transcript("claude-code", CC_TRANSCRIPT)
+        let d = Drive::transcript(SOURCE, TRANSCRIPT)
             .unwrap()
             .seeded()
             .lines([start, end]);
         assert!(
-            d.reached.contains(&Reach::Active),
+            d.reached().contains(&Reach::Active),
             "the resolved tool call must still count as reached, got {:?}",
-            d.reached
+            d.reaches
         );
     }
 }

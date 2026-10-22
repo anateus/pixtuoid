@@ -1,0 +1,32 @@
+{
+  "origin": "recorded",
+  "cli": "claude",
+  "version": "2.1.306 (Claude Code)",
+  "captured": "2026-10-21",
+  "command": "just hermetic --record claude-code",
+  "deidentified": {
+    "method": "decoder-allowlist",
+    "blanked": 543
+  },
+  "aimock": "1.45.1",
+  "script": "tests/sources/hermetic/claude-code/subagent.json",
+  "dropped": {
+    "os": "macos",
+    "at": {
+      "/message/content/*/type": [
+        "text"
+      ],
+      "/type": [
+        "api-request",
+        "api-request-blob",
+        "api-request-shape",
+        "atis-latch",
+        "attachment",
+        "cost-state",
+        "last-prompt",
+        "queue-operation",
+        "user"
+      ]
+    }
+  }
+}

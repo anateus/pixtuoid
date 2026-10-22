@@ -8,9 +8,9 @@
 //! Sharp edges (real-byte-confirmed):
 //! - **Session id = the PARENT-DIR UUID** of `events.jsonl` (the filename stem is
 //!   the constant `events`, NOT the id).
-//! - **Sub-agents INTERLEAVE in the root file**, distinguished by the top-level
-//!   envelope `agentId` (== the spawning `task` tool's `data.toolCallId`); there
-//!   is no per-agent file split. A line with `agentId` set belongs to that child.
+//! - **Sub-agents INTERLEAVE in the root file**: each line of a child carries its
+//!   own envelope `agentId` (a UUID, not the spawning `task` call's id, which rides
+//!   `data.toolCallId` / `data.parentToolCallId`); there is no per-agent file split.
 //! - `subagent.completed` is **minimal** on disk (`toolCallId`/`agentName`/
 //!   `agentDisplayName` only) — never require model/token/duration fields.
 //! - The `ephemeral` envelope flag is inconsistent across CLI versions — never
@@ -23,8 +23,6 @@ use serde_json::Value;
 
 use crate::AgentId;
 use crate::source::decoder::{MAX_DECODED_FIELD_CHARS, ellipsize};
-#[cfg(any(test, feature = "upstream"))]
-use crate::source::upstream::{At, Doc, Finding, Read, Release, Repo, Watch, When};
 use crate::source::{AgentEvent, ToolDetail};
 
 #[cfg(feature = "native")]
@@ -61,6 +59,21 @@ pub(crate) fn copilot_id_from_path(path: &Path) -> String {
         .to_string()
 }
 
+/// The root's `SessionStart`, at the cwd its event's `context` names.
+fn root_start(root: AgentId, source: &str, session_id: &str, data: Option<&Value>) -> AgentEvent {
+    let cwd = data
+        .and_then(|d| d.get("context"))
+        .and_then(|c| str_at(c, "cwd"))
+        .unwrap_or("");
+    AgentEvent::SessionStart {
+        agent_id: root,
+        source: source.to_string(),
+        session_id: session_id.to_string(),
+        cwd: PathBuf::from(cwd),
+        parent_id: None,
+    }
+}
+
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
@@ -86,6 +99,7 @@ pub(crate) fn extract_copilot_cwd(v: &Value) -> Option<PathBuf> {
 }
 
 const SESSION_START: &str = "session.start";
+const SESSION_RESUME: &str = "session.resume";
 const TOOL_EXECUTION_START: &str = "tool.execution_start";
 const TOOL_EXECUTION_COMPLETE: &str = "tool.execution_complete";
 const PERMISSION_REQUESTED: &str = "permission.requested";
@@ -96,108 +110,6 @@ const SUBAGENT_FAILED: &str = "subagent.failed";
 const SESSION_TASK_COMPLETE: &str = "session.task_complete";
 const SESSION_SHUTDOWN: &str = "session.shutdown";
 
-/// The `kind` values this decoder turns into events. Pinned to the arms by
-/// `the_decoded_kind_set_is_exactly_what_the_arms_match`.
-///
-/// Off shipped builds: only the drift watch and tests read it. The ARMS are what
-/// production dispatches on, and a second copy of the vocabulary must not be
-/// something the shipped crate can read and drift against.
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const DECODED_KINDS: &[&str] = &[
-    SESSION_START,
-    TOOL_EXECUTION_START,
-    TOOL_EXECUTION_COMPLETE,
-    PERMISSION_REQUESTED,
-    PERMISSION_COMPLETED,
-    SUBAGENT_STARTED,
-    SUBAGENT_COMPLETED,
-    SUBAGENT_FAILED,
-    SESSION_TASK_COMPLETE,
-    SESSION_SHUTDOWN,
-];
-
-/// The payload fields `decode_copilot_line` / `extract_copilot_cwd` read.
-///
-/// `type` is excluded: it is the discriminator, watched as `DECODED_KINDS`.
-/// Pinned to the decoder's ACTUAL reads by
-/// `the_field_set_is_exactly_what_the_decoder_reads`, because a field the
-/// decoder starts reading without being added here is a dependency nothing
-/// watches — which is how `tokenCount` and `tokenDetails` came to be read and
-/// unwatched.
-///
-/// Off shipped builds: only the drift watch and tests read it.
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const DECODED_FIELDS: &[&str] = &[
-    "agentDisplayName",
-    "agentId",
-    "arguments",
-    "context",
-    "cwd",
-    "data",
-    "kind",
-    "model",
-    "permissionRequest",
-    "result",
-    "sessionId",
-    "tokenCount",
-    "tokenDetails",
-    "toolCallId",
-    "toolName",
-];
-
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const REPO: Repo = Repo {
-    name: "github/copilot-cli",
-    release: Release::GithubLatest,
-};
-
-/// Since 1.0.85 the npm packages carry no schema; the release's platform
-/// tarball does, which is where github/copilot-sdk's codegen reads it
-/// (`java/scripts/codegen/fetch-schemas.mjs`).
-#[cfg(any(test, feature = "upstream"))]
-const SESSION_EVENTS_SCHEMA: &[Doc] = &[Doc {
-    at: At::ReleaseAsset {
-        repo: &REPO,
-        asset: "github-copilot-{version}-linux-x64.tgz",
-        member: "package/schemas/session-events.schema.json",
-        sums: "SHA256SUMS.txt",
-    },
-    anchor: r#""SessionEvent"\s*:"#,
-    owns: "the `SessionEvent` union",
-}];
-
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const UPSTREAM: &[Watch] = &[
-    Watch {
-        id: "copilot.kinds",
-        ours: || DECODED_KINDS.to_vec(),
-        docs: SESSION_EVENTS_SCHEMA,
-        read: Read::JsonUnion {
-            def: "SessionEvent",
-            prop: Some("type"),
-        },
-        when: When::Vanishes,
-        finding: Finding::Breaking(
-            "the transcript still carries it, but the decoder maps it to nothing \
-             (no sprite, no activity)",
-        ),
-        // `session.*` is a product-wide bus a sibling ledger would just mirror.
-        siblings: None,
-    },
-    Watch {
-        id: "copilot.payload_fields",
-        ours: || DECODED_FIELDS.to_vec(),
-        docs: SESSION_EVENTS_SCHEMA,
-        read: Read::JsonKeys,
-        when: When::Vanishes,
-        finding: Finding::Breaking(
-            "the decoder reads None: a wrong register, no parent link, no tool \
-             label, or a permission that never gates",
-        ),
-        siblings: None,
-    },
-];
-
 /// Decode one `events.jsonl` line into zero or more `AgentEvent`s. Unknown,
 /// ephemeral, or malformed shapes return `vec![]` and never panic — real files
 /// carry embedded-newline / U+2028 corruption (upstream copilot-cli #2649/#2012).
@@ -205,7 +117,7 @@ pub(crate) const UPSTREAM: &[Watch] = &[
 /// # Errors
 ///
 /// Never: the `Result` is the [`LineDecoder`](crate::source::decoder::LineDecoder) signature, and a malformed line decodes to `vec![]`.
-pub fn decode_copilot_line(
+pub(crate) fn decode_copilot_line(
     transcript_path: &str,
     source: &str,
     v: Value,
@@ -230,18 +142,16 @@ pub fn decode_copilot_line(
                     crate::source::drift::missing_field(source, "session.start", "sessionId");
                     ""
                 });
-            let cwd = data
-                .and_then(|d| d.get("context"))
-                .and_then(|c| str_at(c, "cwd"))
-                .unwrap_or("");
-            vec![AgentEvent::SessionStart {
-                agent_id: root,
-                source: source.to_string(),
-                session_id: session_id.to_string(),
-                cwd: PathBuf::from(cwd),
-                parent_id: None,
-            }]
+            vec![root_start(root, source, session_id, data)]
         }
+        // The id rides the path: a resume keeps the sessionId, and its
+        // `ResumeData` carries none.
+        SESSION_RESUME => vec![root_start(
+            root,
+            source,
+            &copilot_id_from_path(Path::new(transcript_path)),
+            data,
+        )],
         TOOL_EXECUTION_START => {
             let Some(d) = data else {
                 crate::source::drift::missing_field(source, "tool.execution_start", "data");
@@ -292,8 +202,8 @@ pub fn decode_copilot_line(
             out
         }
         PERMISSION_REQUESTED => {
-            let reason = data
-                .and_then(|d| d.get("permissionRequest"))
+            let request = data.and_then(|d| d.get("permissionRequest"));
+            let reason = request
                 .and_then(|p| str_at(p, "kind"))
                 // Capped at the decode boundary: `kind` is raw wire content that
                 // persists in the slot + egresses on the headless summary.
@@ -302,26 +212,27 @@ pub fn decode_copilot_line(
             vec![AgentEvent::Waiting {
                 agent_id: acting,
                 reason,
-                tool_use_id: None,
+                // The gated call (#951), so its own end resolves the wait.
+                tool_use_id: request
+                    .and_then(|p| str_at(p, "toolCallId"))
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned),
             }]
         }
-        // On APPROVED the gated tool's own `tool.execution_start` follows and
-        // clears the Waiting gate, so emit nothing (a detail-less ActivityStart
-        // here would only inflate tool_call_count). On a DENIAL/cancel no tool
-        // runs, so emit the clearing ActivityStart ourselves.
+        // A refusal ends the gated call: a denial's `tool.execution_complete`
+        // follows, a cancel's (Esc at the prompt) never does, and the second
+        // end is a no-op. An approved call ends on its own.
         PERMISSION_COMPLETED => {
             let approved = data
                 .and_then(|d| d.get("result"))
                 .and_then(|r| str_at(r, "kind"))
                 .is_some_and(|k| k.starts_with("approved"));
-            if approved {
-                vec![]
-            } else {
-                vec![AgentEvent::ActivityStart {
+            match data.and_then(|d| str_at(d, "toolCallId")) {
+                Some(id) if !approved && !id.is_empty() => vec![AgentEvent::ActivityEnd {
                     agent_id: acting,
-                    tool_use_id: None,
-                    detail: None,
-                }]
+                    tool_use_id: Some(id.to_owned()),
+                }],
+                _ => vec![],
             }
         }
         SUBAGENT_STARTED => {
@@ -360,7 +271,10 @@ pub fn decode_copilot_line(
                 as_child: true,
             }]
         }
-        SESSION_TASK_COMPLETE => vec![AgentEvent::ActivityEnd {
+        // Only the root's ends its turn: neither listener of it in 1.0.98's
+        // bundled `cli-main.js` (:2122, :3100) passes `includeSubAgents`, without
+        // which `SessionClient._dispatchEvent` (:1536) skips one with an `agentId`.
+        SESSION_TASK_COMPLETE if acting == root => vec![AgentEvent::ActivityEnd {
             agent_id: root,
             tool_use_id: None,
         }],
@@ -423,14 +337,12 @@ fn copilot_tool_detail(tool: &str, args: Option<&Value>) -> ToolDetail {
 mod tests {
     use super::*;
 
-    /// The exported set IS the arms. The arms dispatch on the SAME consts, so a
-    /// value cannot drift; this catches a member dropped from the set, or kept
-    /// after its arm went away. The discriminator is REACHING an arm, not
+    /// Each kind reaches an arm. The discriminator is REACHING an arm, not
     /// emitting an event — several arms legitimately decode a well-formed line
-    /// to nothing — so each kind is fed an EMPTY `data`, where every real arm
-    /// breadcrumbs a missing field and the catch-all stays silent.
+    /// to nothing — so a real arm breadcrumbs a missing field and the catch-all
+    /// stays silent.
     #[test]
-    fn the_decoded_kind_set_is_exactly_what_the_arms_match() {
+    fn each_kind_reaches_an_arm() {
         let path = "/p/11111111-2222-3333-4444-555555555555/events.jsonl";
         let drive = |kind: &str| {
             let line = serde_json::json!({
@@ -443,7 +355,19 @@ mod tests {
             });
             evs > 0 || logs.contains(crate::source::drift::TARGET)
         };
-        for kind in DECODED_KINDS {
+        for kind in [
+            SESSION_START,
+            SESSION_RESUME,
+            TOOL_EXECUTION_START,
+            TOOL_EXECUTION_COMPLETE,
+            PERMISSION_REQUESTED,
+            PERMISSION_COMPLETED,
+            SUBAGENT_STARTED,
+            SUBAGENT_COMPLETED,
+            SUBAGENT_FAILED,
+            SESSION_TASK_COMPLETE,
+            SESSION_SHUTDOWN,
+        ] {
             assert!(drive(kind), "{kind} must reach a real arm");
         }
         assert!(
@@ -562,6 +486,31 @@ mod tests {
                 assert!(as_child);
             }
             other => panic!("expected one child SessionEnd, got {other:?}"),
+        }
+    }
+
+    /// A `--resume` keeps the sessionId and appends to the same events.jsonl
+    /// past its `session.shutdown`, so its structural marker is what revives
+    /// the session; the schema's `ResumeData` carries no sessionId.
+    #[test]
+    fn session_resume_revives_the_root_with_its_cwd() {
+        let line = r#"{"type":"session.resume","data":{"resumeTime":"2026-05-22T06:20:00.000Z","eventCount":42,"context":{"cwd":"d:\\contentforge-fullstack (1)"}},"id":"r1","timestamp":"2026-05-22T06:20:00.010Z","parentId":"220c4131"}"#;
+        match &decode(line)[..] {
+            [
+                AgentEvent::SessionStart {
+                    agent_id,
+                    session_id,
+                    cwd,
+                    parent_id,
+                    ..
+                },
+            ] => {
+                assert_eq!(*agent_id, root());
+                assert_eq!(session_id, "65f8cef9-7dd8-46fa-9f6a-78cc95f68ab3");
+                assert_eq!(cwd, Path::new(r"d:\contentforge-fullstack (1)"));
+                assert_eq!(*parent_id, None);
+            }
+            other => panic!("expected one SessionStart, got {other:?}"),
         }
     }
 
@@ -775,7 +724,7 @@ mod tests {
             r#"{"type":"subagent.completed","data":{"toolCallId":""}}"#,
             r#"{"type":"subagent.failed","agentId":"","data":{"toolCallId":""}}"#,
             // The STARTED arm is the other `copilot_child_key` call site, and
-            // `data.toolCallId` is the documented key for a spawn — the
+            // `data.toolCallId` is its fallback key without an `agentId` — the
             // existing started-arm test omits the key entirely, so the
             // empty-string shape was unpinned there.
             r#"{"type":"subagent.started","data":{"toolCallId":"","agentName":"x"}}"#,
@@ -832,35 +781,54 @@ mod tests {
     }
 
     #[test]
-    fn permission_requested_waits_and_completed_clears() {
+    fn a_permission_waits_on_its_call_and_a_refusal_ends_it() {
         let req = r#"{"type":"permission.requested","data":{"requestId":"8c508e21-0a6c-4a06-8824-3930476499ea","permissionRequest":{"kind":"shell","toolCallId":"call_K8WLZkwufHsI9bTvkZmMKec2","fullCommandText":"cat /etc/hostname","intention":"Print /etc/hostname contents","commands":[{"identifier":"cat","readOnly":true}],"possiblePaths":["/etc/hostname"],"possibleUrls":[],"hasWriteFileRedirection":false,"canOfferSessionApproval":true},"promptRequest":{"kind":"path","accessKind":"shell","paths":["/etc/hostname"],"toolCallId":"call_K8WLZkwufHsI9bTvkZmMKec2"}},"id":"1f975691-a108-4d6f-924b-d48263d46274","timestamp":"2026-06-14T21:35:55.637Z","parentId":"e0a534c6-d548-4def-b0bd-316c83efe5fd"}"#;
         match &decode(req)[..] {
             [
                 AgentEvent::Waiting {
-                    agent_id, reason, ..
+                    agent_id,
+                    reason,
+                    tool_use_id,
                 },
             ] => {
                 assert_eq!(*agent_id, root());
                 assert!(reason.contains("shell"), "reason names the gate: {reason}");
+                assert_eq!(
+                    tool_use_id.as_deref(),
+                    Some("call_K8WLZkwufHsI9bTvkZmMKec2"),
+                    "the wait names the call it gates"
+                );
             }
             other => panic!("expected Waiting, got {other:?}"),
         }
         let approved = r#"{"type":"permission.completed","data":{"requestId":"8c508e21-0a6c-4a06-8824-3930476499ea","toolCallId":"call_K8WLZkwufHsI9bTvkZmMKec2","result":{"kind":"approved"}},"id":"8123a44a-3471-4262-9191-b3cddaf5224d","timestamp":"2026-06-14T21:35:58.218Z","parentId":"1f975691-a108-4d6f-924b-d48263d46274"}"#;
         assert!(
             decode(approved).is_empty(),
-            "approved → no event (tool start clears the gate)"
+            "approved → no event (the call ends on its own)"
         );
 
-        // Two REAL deny variants: the interactive user reject and the
-        // non-interactive no-rule auto-deny.
-        for denied in [
-            r#"{"type":"permission.completed","data":{"requestId":"954afe31-559a-4afc-9eb6-13e30cf48aea","toolCallId":"call_nf1RvU9GxssNg2g7WtPgHqQ4","result":{"kind":"denied-interactively-by-user"}},"id":"60dae716-c76c-45e2-84e1-c3248ce3790c","timestamp":"2026-06-14T21:38:43.086Z","parentId":"5240af45-3ad2-4bf7-bc37-83c329c9c2ea"}"#,
-            r#"{"type":"permission.completed","data":{"requestId":"eab9bd2c-ca42-4ab6-8567-1c11906500a6","toolCallId":"toolu_bdrk_015JoceQkzNKnLkeCj5NaLzT","result":{"kind":"denied-no-approval-rule-and-could-not-request-from-user"}},"id":"2cc6bffe-6443-4d8b-9765-dbfeda13c4de","timestamp":"2026-06-14T21:27:17.209Z","parentId":"c113f81d-6f12-4080-bd13-8613526543dc"}"#,
+        // The REAL refusals: the interactive reject, the non-interactive
+        // no-rule auto-deny, and Esc at the prompt (1.0.98).
+        for (refused, call) in [
+            (
+                r#"{"type":"permission.completed","data":{"requestId":"954afe31-559a-4afc-9eb6-13e30cf48aea","toolCallId":"call_nf1RvU9GxssNg2g7WtPgHqQ4","result":{"kind":"denied-interactively-by-user"}},"id":"60dae716-c76c-45e2-84e1-c3248ce3790c","timestamp":"2026-06-14T21:38:43.086Z","parentId":"5240af45-3ad2-4bf7-bc37-83c329c9c2ea"}"#,
+                "call_nf1RvU9GxssNg2g7WtPgHqQ4",
+            ),
+            (
+                r#"{"type":"permission.completed","data":{"requestId":"eab9bd2c-ca42-4ab6-8567-1c11906500a6","toolCallId":"toolu_bdrk_015JoceQkzNKnLkeCj5NaLzT","result":{"kind":"denied-no-approval-rule-and-could-not-request-from-user"}},"id":"2cc6bffe-6443-4d8b-9765-dbfeda13c4de","timestamp":"2026-06-14T21:27:17.209Z","parentId":"c113f81d-6f12-4080-bd13-8613526543dc"}"#,
+                "toolu_bdrk_015JoceQkzNKnLkeCj5NaLzT",
+            ),
+            (
+                r#"{"type":"permission.completed","data":{"requestId":"b310d4e0-1e0e-4600-955d-871b5a951e13","toolCallId":"call_-Dbzv4Ev_Get6cFh","result":{"kind":"cancelled","reason":"Session aborted"}},"id":"f36f04ef-3c73-4b7e-88a0-f00c036e2185","timestamp":"2026-10-18T08:09:01.252Z","parentId":"571e3185-d040-4403-b319-738711e0bb62"}"#,
+                "call_-Dbzv4Ev_Get6cFh",
+            ),
         ] {
-            assert!(
-                matches!(&decode(denied)[..], [AgentEvent::ActivityStart { .. }]),
-                "a non-approved result must clear Waiting: {denied}"
-            );
+            match &decode(refused)[..] {
+                [AgentEvent::ActivityEnd { tool_use_id, .. }] => {
+                    assert_eq!(tool_use_id.as_deref(), Some(call), "{refused}");
+                }
+                other => panic!("a refusal must end the gated call, got {other:?}"),
+            }
         }
     }
 
@@ -1049,6 +1017,19 @@ mod tests {
     }
 
     #[test]
+    fn a_subagents_task_complete_ends_no_activity() {
+        let line = serde_json::json!({
+            "type": "session.task_complete",
+            "data": {"summary": "done", "success": true},
+            "agentId": "call_X",
+            "parentId": "p"
+        })
+        .to_string();
+        let evs = decode(&line);
+        assert!(evs.is_empty(), "got {evs:?}");
+    }
+
+    #[test]
     fn subagent_started_without_any_child_key_is_ignored() {
         let line = r#"{"type":"subagent.started","data":{"agentDisplayName":"X"},"id":"x","timestamp":"t","parentId":null}"#;
         assert!(
@@ -1107,41 +1088,5 @@ mod tests {
                 "unset COPILOT_HOME → ~/.copilot fallback"
             );
         });
-    }
-
-    /// Every field the decoder reads by a LITERAL key is declared here — reads
-    /// through a variable (the `bucket()` totals: `input`, `cache_write`,
-    /// `output`) are outside the scan entirely. A literal read added without a
-    /// declaration fails this test; a helper-routed one does not.
-    #[test]
-    fn the_field_set_is_exactly_what_the_decoder_reads() {
-        let src = include_str!("copilot.rs");
-        let mut read: Vec<&str> = Vec::new();
-        for m in src.match_indices("str_at(") {
-            let rest = &src[m.0..];
-            if let Some(q) = rest.find('"')
-                && let Some(end) = rest[q + 1..].find('"')
-            {
-                read.push(&rest[q + 1..q + 1 + end]);
-            }
-        }
-        for pat in ["\t.get(\"", ".get(\""] {
-            for m in src.match_indices(pat) {
-                let rest = &src[m.0 + pat.len()..];
-                if let Some(end) = rest.find('"') {
-                    read.push(&rest[..end]);
-                }
-            }
-        }
-        // `type` is watched as DECODED_KINDS; a `/` marks a JSON pointer; the
-        // alphanumeric clause drops the scanner's own non-key artifacts.
-        read.retain(|f| {
-            *f != "type" && !f.contains('/') && f.chars().all(|c| c.is_ascii_alphanumeric())
-        });
-        read.sort_unstable();
-        read.dedup();
-        let mut declared = DECODED_FIELDS.to_vec();
-        declared.sort_unstable();
-        assert_eq!(read, declared, "decoder reads vs DECODED_FIELDS");
     }
 }

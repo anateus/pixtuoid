@@ -3,8 +3,9 @@
 //! the lifecycle signals the shared hook socket lacks — most importantly the
 //! post-approval resume (`function_call_output`).
 //!
-//! Coalescing: hook.session_id == session_meta.id == filename UUID (verified),
-//! so both transports merge onto one sprite.
+//! Coalescing: a root's hook `session_id` (a child's: its `agent_id`) ==
+//! session_meta.id == filename UUID (verified), so both transports merge onto
+//! one sprite.
 
 use std::path::{Path, PathBuf};
 
@@ -12,10 +13,8 @@ use crate::source::decoder::{DecodeError, DecodeResult as Result};
 use serde_json::{Map, Value};
 
 use crate::AgentId;
-use crate::source::AgentEvent;
 use crate::source::decoder::{MAX_DECODED_FIELD_CHARS, ellipsize, make_tool_detail};
-#[cfg(any(test, feature = "upstream"))]
-use crate::source::upstream::{Family, Finding, Read, Release, Repo, Siblings, Watch, When};
+use crate::source::{AgentEvent, ToolDetail};
 
 #[cfg(feature = "native")]
 mod native;
@@ -51,11 +50,17 @@ fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// Codex's source-specific hook arms — `SubagentStart`/`SubagentStop`. These
-/// change the event's SUBJECT (the child's AgentId, not the session's), which
-/// the shared CC-shaped arms cannot express; every other Codex hook event
-/// falls through (`Ok(None)`) to them. The parent link carried here is the
-/// ONLY one a flat Codex rollout gets.
+/// The subagent dispatch tool, `multi_agent_v1`'s `spawn_agent`.
+pub(crate) const DISPATCH_TOOL: &str = "spawn_agent";
+
+/// The `session_meta` field naming a child rollout's parent.
+const PARENT_THREAD_ID: &str = "parent_thread_id";
+
+/// Codex's source-specific hook arms, which change the event's SUBJECT to a
+/// child's AgentId where the shared session-keyed arms cannot:
+/// `SubagentStart`/`SubagentStop`, and any other event a child fires. A
+/// `spawn_agent` call's start is a Task wherever it fires; every other root
+/// event falls through (`Ok(None)`) to the shared arms.
 pub(crate) fn decode_codex_hook_custom(v: &Value) -> Result<Option<Vec<AgentEvent>>> {
     let Some(obj) = v.as_object() else {
         return Ok(None); // shared path reports the malformed payload
@@ -64,10 +69,9 @@ pub(crate) fn decode_codex_hook_custom(v: &Value) -> Result<Option<Vec<AgentEven
         .get("hook_event_name")
         .and_then(|s| s.as_str())
         .unwrap_or("");
-    // The custom-decoder contract: claim our two events FULLY (Err on a
-    // malformed instance), Ok(None) for everything else. An empty
+    // A malformed SubagentStart/Stop is an Err, not Ok(None): an empty
     // `session_id`/`agent_id` would mint a phantom that never coalesces with
-    // the real rollout — reject rather than decode.
+    // the real rollout.
     let guards = |obj: &Map<String, Value>| -> Result<(String, Option<String>)> {
         let session_id = obj
             .get("session_id")
@@ -76,7 +80,7 @@ pub(crate) fn decode_codex_hook_custom(v: &Value) -> Result<Option<Vec<AgentEven
             .ok_or_else(|| DecodeError::missing(SOURCE_NAME, "session_id"))?
             .to_string();
         let child = obj
-            .get("agent_id")
+            .get(crate::source::decoder::SUBAGENT_ID)
             .and_then(|s| s.as_str())
             .filter(|s| !s.is_empty())
             .map(String::from);
@@ -84,14 +88,18 @@ pub(crate) fn decode_codex_hook_custom(v: &Value) -> Result<Option<Vec<AgentEven
     };
     match event {
         // The subagent owns a SEPARATE rollout (filename UUID == this payload's
-        // `agent_id`) that the watcher renders ORPHANED — a flat rollout path
-        // has no `/subagents/` for `detect_parent_id`. Keying the child on
-        // `agent_id` coalesces with that rollout and joins the parent's scope
-        // tree (cascade / liveness / readiness).
+        // `agent_id`). Keying the child on `agent_id` coalesces with that
+        // rollout and joins the parent's scope tree (cascade / liveness /
+        // readiness).
         "SubagentStart" => {
             let (session_id, child) = guards(obj)?;
-            let child = child
-                .ok_or_else(|| DecodeError::missing_in(SOURCE_NAME, "SubagentStart", "agent_id"))?;
+            let child = child.ok_or_else(|| {
+                DecodeError::missing_in(
+                    SOURCE_NAME,
+                    "SubagentStart",
+                    crate::source::decoder::SUBAGENT_ID,
+                )
+            })?;
             let cwd = obj.get("cwd").and_then(|s| s.as_str()).unwrap_or("").into();
             Ok(Some(vec![AgentEvent::SessionStart {
                 agent_id: AgentId::from_parts(SOURCE_NAME, &child),
@@ -106,21 +114,73 @@ pub(crate) fn decode_codex_hook_custom(v: &Value) -> Result<Option<Vec<AgentEven
         // leaves a harmless no-op plus that same fallback.
         "SubagentStop" => {
             let (_session_id, child) = guards(obj)?;
-            let child = child
-                .ok_or_else(|| DecodeError::missing_in(SOURCE_NAME, "SubagentStop", "agent_id"))?;
+            let child = child.ok_or_else(|| {
+                DecodeError::missing_in(
+                    SOURCE_NAME,
+                    "SubagentStop",
+                    crate::source::decoder::SUBAGENT_ID,
+                )
+            })?;
             Ok(Some(vec![AgentEvent::SessionEnd {
                 agent_id: AgentId::from_parts(SOURCE_NAME, &child),
                 as_child: true,
             }]))
         }
-        _ => Ok(None),
+        // A child's other events name it in `agent_id` beside the root's
+        // `session_id`; a root's name none (`codex-rs/hooks/src/schema.rs:282-285`,
+        // `core/src/hook_runtime.rs:1042-1061` at rust-v0.163.0).
+        _ => {
+            let dispatch = obj.get("tool_name").and_then(Value::as_str) == Some(DISPATCH_TOOL);
+            let evs = match crate::source::decoder::subagent_fired(obj, SOURCE_NAME, str::to_owned)?
+            {
+                Some(evs) => evs,
+                None if dispatch => crate::source::decoder::shared_hook_arms(
+                    obj,
+                    SOURCE_NAME,
+                    crate::source::registry::descriptor_for(SOURCE_NAME),
+                )?,
+                None => return Ok(None),
+            };
+            Ok(Some(if dispatch {
+                evs.into_iter().map(dispatched).collect()
+            } else {
+                evs
+            }))
+        }
     }
 }
 
-/// Codex rollouts carry the cwd ONLY on the head `session_meta` line, nested
-/// under `payload`.
+/// The shared arms detail only CC's dispatch as a Task.
+fn dispatched(event: AgentEvent) -> AgentEvent {
+    match event {
+        AgentEvent::ActivityStart {
+            agent_id,
+            tool_use_id,
+            ..
+        } => AgentEvent::ActivityStart {
+            agent_id,
+            tool_use_id,
+            detail: Some(ToolDetail::Task),
+        },
+        other => other,
+    }
+}
+
+/// `payload.cwd`, on the head `session_meta` and each `turn_context`.
 pub(crate) fn extract_codex_cwd(v: &Value) -> Option<PathBuf> {
     v.get("payload")?.get("cwd")?.as_str().map(PathBuf::from)
+}
+
+/// A thread-spawned child's rollout names its parent on the head
+/// `session_meta` line, beside the cwd where the head scan stops
+/// (`codex-rs/protocol/src/protocol.rs:3262` at rust-v0.163.0); its flat path
+/// names none.
+pub(crate) fn extract_codex_parent(v: &Value) -> Option<String> {
+    v.get("payload")?
+        .get(PARENT_THREAD_ID)?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 pub(crate) const EVENT_MSG: &str = "event_msg";
@@ -130,140 +190,35 @@ pub(crate) const TURN_CONTEXT: &str = "turn_context";
 const SANDBOX_PERMISSIONS_FIELD: &str = "sandbox_permissions";
 const REQUIRE_ESCALATED: &str = "require_escalated";
 
-/// The escalation pair this decoder keys on. Listed because the check is a
-/// BOOLEAN: a rename makes it silently `false`, and `false` is a legitimate
-/// answer, so no breadcrumb can exist here — the upstream watch is the only
-/// signal. Pinned by `escalated_function_call_is_waiting`.
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const DECODED_ESCALATION: &[&str] = &[REQUIRE_ESCALATED, SANDBOX_PERMISSIONS_FIELD];
+/// The rollout inners, grouped BY BEHAVIOUR: each group is the matcher (the
+/// arms below guard on `contains`).
+const EM_TURN_START: &[&str] = &["task_started"];
+/// Written only to a Legacy-history rollout (`codex-rs/rollout/src/policy.rs:141-155`):
+/// exec and the TUI ask for a Paginated one (`codex-rs/exec/src/lib.rs:1462`,
+/// `codex-rs/tui/src/app_server_session.rs:2175`), which a thread store without
+/// paginated lists refuses, and exec then retries with none, the Legacy default
+/// (`codex-rs/app-server/src/request_processors/thread_processor.rs:1179-1186`,
+/// `codex-rs/exec/src/lib.rs:1426-1432`, `codex-rs/protocol/src/protocol.rs:880-882`,
+/// at `rust-v0.163.0`).
+const EM_RESUME: &[&str] = &["patch_apply_end"];
+/// As [`EM_RESUME`].
+const EM_SEARCH: &[&str] = &["web_search_end"];
+const EM_TURN_END: &[&str] = &["task_complete", "turn_aborted"];
+const EM_TOKENS: &[&str] = &["token_count"];
 
-/// The rollout inners, grouped BY BEHAVIOUR — each group is both the matcher
-/// (the arms below guard on `contains`) and the export source, so there is one
-/// declaration per name and no second copy to drift.
-pub(crate) const EM_TURN_START: &[&str] = &["task_started"];
-pub(crate) const EM_RESUME: &[&str] = &["exec_command_end", "patch_apply_end"];
-pub(crate) const EM_SEARCH: &[&str] = &["web_search_begin", "web_search_end"];
-pub(crate) const EM_TURN_END: &[&str] = &["task_complete", "turn_aborted"];
-pub(crate) const EM_TOKENS: &[&str] = &["token_count"];
+const RI_TOOL_START: &[&str] = &["function_call", "custom_tool_call"];
+const RI_CALL_OUTPUT: &str = "function_call_output";
+const RI_CUSTOM_OUTPUT: &str = "custom_tool_call_output";
+const RI_RESUME: &[&str] = &[RI_CALL_OUTPUT, RI_CUSTOM_OUTPUT];
+/// The call an output answers. Optional on a `function_call_output`, which
+/// codex also writes for a host-delivered output that answers no call
+/// (`codex-rs/protocol/src/models.rs:1151-1153` at `rust-v0.163.0`), and
+/// required on a `custom_tool_call_output` (`:1195`).
+const CALL_ID: &str = "call_id";
+const RI_SEARCH: &[&str] = &["web_search_call", "tool_search_call", "tool_search_output"];
 
-pub(crate) const RI_TOOL_START: &[&str] = &["function_call", "custom_tool_call"];
-pub(crate) const RI_RESUME: &[&str] = &["function_call_output", "custom_tool_call_output"];
-pub(crate) const RI_SEARCH: &[&str] =
-    &["web_search_call", "tool_search_call", "tool_search_output"];
-
-/// The repository its drift watches read.
-#[cfg(any(test, feature = "upstream"))]
-pub const REPO: Repo = Repo {
-    name: "openai/codex",
-    release: Release::GithubLatest,
-};
-
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const UPSTREAM: &[Watch] = &[
-    Watch {
-        id: "codex.rollout_outers",
-        ours: || vec![EVENT_MSG, RESPONSE_ITEM, TURN_CONTEXT],
-        // The wire enum: `RolloutItem` serializes through it and carries no
-        // serde attributes of its own.
-        docs: &[REPO.doc(
-            "codex-rs/history/src/rollout_payload.rs",
-            r"enum RolloutItemWire\b",
-            "`RolloutItemWire`",
-        )],
-        read: Read::RustEnum {
-            name: "RolloutItemWire",
-        },
-        when: When::Vanishes,
-        finding: Finding::Breaking("the transcript decodes to nothing"),
-        siblings: Some(Siblings {
-            family: Family::LastWord,
-            ignored: &[
-                (
-                    "realtime_item",
-                    "a realtime VOICE sub-session's items (protocol/src/realtime.rs), keyed \
-                     by `realtime_session_id`, not the agent session's key space: \
-                     Started/Closed bracket the voice layer, speech segments are content no \
-                     decoder reads, and `BemItemPromoted` re-presents items already decoded \
-                     from `response_item` (upstream: 'sparse, model-invisible facts')",
-                ),
-                (
-                    "retained_context",
-                    "host-only, model-invisible records (history/src/retained_context.rs: \
-                     'Sparse, model-invisible updates. Only the host may produce these \
-                     records.'); the sole variant `verified_answer` is authorization \
-                     evidence, with no lifecycle, activity, model or token signal",
-                ),
-            ],
-        }),
-    },
-    Watch {
-        id: "codex.event_msg",
-        ours: || [EM_TURN_START, EM_RESUME, EM_SEARCH, EM_TURN_END, EM_TOKENS].concat(),
-        docs: &[REPO.doc(
-            "codex-rs/protocol/src/protocol.rs",
-            r"pub enum EventMsg\b",
-            "`EventMsg`",
-        )],
-        read: Read::RustEnum { name: "EventMsg" },
-        when: When::Vanishes,
-        finding: Finding::Breaking("the transcript decodes to nothing"),
-        // No sweep: its last words are lifecycle words that unrelated
-        // subsystems share, not families.
-        siblings: None,
-    },
-    Watch {
-        id: "codex.response_item",
-        ours: || [RI_TOOL_START, RI_RESUME, RI_SEARCH].concat(),
-        docs: &[REPO.doc(
-            "codex-rs/protocol/src/models.rs",
-            r"pub enum ResponseItem\b",
-            "`ResponseItem`",
-        )],
-        read: Read::RustEnum {
-            name: "ResponseItem",
-        },
-        when: When::Vanishes,
-        finding: Finding::Breaking("the transcript decodes to nothing"),
-        // Each `*_call` here starts an activity with no upstream `*_output`
-        // to end it, so decoding one would strand the session Active until
-        // the stale sweep.
-        siblings: Some(Siblings {
-            family: Family::LastWord,
-            ignored: &[
-                (
-                    "local_shell_call",
-                    "no `local_shell_call_output` sibling exists to end it",
-                ),
-                (
-                    "image_generation_call",
-                    "no `image_generation_call_output` sibling exists to end it",
-                ),
-            ],
-        }),
-    },
-    Watch {
-        id: "codex.escalation",
-        ours: || DECODED_ESCALATION.to_vec(),
-        // The shell tool's own schema, which the model fills in. Quoted: a doc
-        // comment naming the field would keep a renamed one alive.
-        docs: &[REPO.doc(
-            "codex-rs/core/src/tools/handlers/shell_spec.rs",
-            r"fn create_approval_parameters\b",
-            "`create_approval_parameters`",
-        )],
-        read: Read::Each {
-            pattern: r#""{name}""#,
-        },
-        when: When::Vanishes,
-        finding: Finding::Breaking(
-            "the approval gate never fires, so a codex session sits Active through every prompt",
-        ),
-        siblings: None,
-    },
-];
-
-/// Decode one transcript line. `tool_use_id` is always `None` so these events
-/// are never suppressed by the hook-wins dedup (which keys on `tool_use_id`).
+/// Decode one transcript line. Only an output's End carries its call's id
+/// (`tool_use_id`), so only that End meets the hook-wins dedup (#150).
 ///
 /// # Errors
 ///
@@ -305,15 +260,30 @@ pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Resul
                 vec![codex_tool_start(agent_id, payload)]
             }
         }
-        // Resume signals: a command/patch finished running after (auto-)approval.
-        // Each is an ActivityStart so the reducer clears any Waiting set by the
-        // permission gate.
-        (RESPONSE_ITEM, i) if RI_RESUME.contains(&i) => vec![start()],
+        // Resume signals: a command/patch finished, or a call was refused. Each
+        // is an ActivityStart so the reducer clears any Waiting set by the
+        // permission gate. A call's output also ENDS that call: a refused call
+        // gets no `PostToolUse`, so this is its only end.
+        (RESPONSE_ITEM, i) if RI_RESUME.contains(&i) => {
+            let call = payload
+                .and_then(|p| p.get(CALL_ID))
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty());
+            if call.is_none() && i == RI_CUSTOM_OUTPUT {
+                crate::source::drift::missing_field(SOURCE_NAME, i, CALL_ID);
+            }
+            call.map(|c| AgentEvent::ActivityEnd {
+                agent_id,
+                tool_use_id: Some(c.to_owned()),
+            })
+            .into_iter()
+            .chain([start()])
+            .collect()
+        }
         (EVENT_MSG, i) if EM_RESUME.contains(&i) => vec![start()],
         // Web/tool search are turn-INTERNAL work pulses that keep the agent
-        // Active; only task_complete / turn_aborted end the turn. Both the
-        // EventMsg and the raw-Responses-item forms appear in real rollouts.
-        // Searching is never permission-prompted — no Waiting branch.
+        // Active; only task_complete / turn_aborted end the turn. Searching is
+        // never permission-prompted — no Waiting branch.
         (RESPONSE_ITEM, i) if RI_SEARCH.contains(&i) => vec![start()],
         (EVENT_MSG, i) if EM_SEARCH.contains(&i) => vec![start()],
         (EVENT_MSG, i) if EM_TURN_END.contains(&i) => vec![end()],
@@ -415,9 +385,11 @@ fn codex_tool_start(agent_id: AgentId, payload: Option<&Map<String, Value>>) -> 
     AgentEvent::ActivityStart {
         agent_id,
         tool_use_id: None,
-        // Codex tool calls are never subagent dispatches (those arrive as the
-        // SubagentStart hook), so there is no `subagent_type` to pass.
-        detail: Some(make_tool_detail(SOURCE_NAME, name, None)),
+        detail: Some(if name == DISPATCH_TOOL {
+            ToolDetail::Task
+        } else {
+            make_tool_detail(SOURCE_NAME, name, None)
+        }),
     }
 }
 
@@ -475,11 +447,9 @@ mod tests {
     use serde_json::json;
 
     /// Every name in a behaviour group reaches a real arm, and one outside them
-    /// reaches none. The groups ARE the matcher — the arms guard on
-    /// `contains` — so this is not pinning a second copy; it is proving no group
-    /// member has quietly stopped being handled.
+    /// reaches none.
     #[test]
-    fn the_decoded_rollout_sets_are_exactly_what_the_arms_match() {
+    fn each_rollout_inner_reaches_an_arm() {
         let drive = |outer: &str, inner: &str| {
             let v = json!({
                 "type": outer,
@@ -580,10 +550,119 @@ mod tests {
     }
 
     #[test]
-    fn non_subagent_events_fall_through_to_shared_arms() {
+    fn a_roots_events_fall_through_to_shared_arms() {
         let stop = json!({"hook_event_name": "Stop", "session_id": "s"});
         assert!(matches!(decode_codex_hook_custom(&stop), Ok(None)));
         assert!(matches!(decode_codex_hook_custom(&json!("nope")), Ok(None)));
+    }
+
+    const ROOT: &str = "01a14e36-774b-7a43-a766-5159e4eb32f6";
+    const CHILD: &str = "01a14e36-77e4-7220-8c8e-4b2d4c31dd41";
+
+    /// Line shapes from a 0.163.0 `codex exec` whose root spawned a child,
+    /// sanitized of its paths.
+    fn hook(event: &str, child: bool, extra: Value) -> Vec<AgentEvent> {
+        let mut v = json!({
+            "session_id": ROOT, "turn_id": "01a14e36-7827-7f92-a603-b700dc3aa71c",
+            "transcript_path": "/h/.codex/sessions/rollout.jsonl", "cwd": "/repo",
+            "hook_event_name": event, "model": "gpt-5.5",
+            "permission_mode": "bypassPermissions", "_pixtuoid_source": SOURCE_NAME,
+        });
+        if child {
+            v["agent_id"] = json!(CHILD);
+            v["agent_type"] = json!("default");
+        }
+        for (k, x) in extra.as_object().expect("an object") {
+            v[k] = x.clone();
+        }
+        crate::source::decoder::decode_hook_payload(v).expect("decodes")
+    }
+
+    #[test]
+    fn a_childs_own_events_land_on_the_child() {
+        let child = AgentId::from_parts(SOURCE_NAME, CHILD);
+        let root = AgentId::from_parts(SOURCE_NAME, ROOT);
+        let tool = json!({"tool_name": "Bash", "tool_input": {"command": "cat NOTE.txt"},
+                          "tool_use_id": "call_nNP7xMfvOrkUQWwa", "tool_response": "pong"});
+        for event in ["PreToolUse", "PostToolUse"] {
+            let evs = hook(event, true, tool.clone());
+            assert!(!evs.is_empty(), "{event}");
+            assert!(
+                evs.iter().all(|e| e.agent_id() == child),
+                "{event}: {evs:?}"
+            );
+            assert!(
+                evs.iter()
+                    .any(|e| matches!(e, AgentEvent::Identity { session_id, .. }
+                    if session_id == CHILD)),
+                "{event}: the Identity must name the child's session: {evs:?}"
+            );
+            let evs = hook(event, false, tool.clone());
+            assert!(evs.iter().all(|e| e.agent_id() == root), "{event}: {evs:?}");
+        }
+    }
+
+    #[test]
+    fn a_childs_prompt_starts_it_under_its_root() {
+        let evs = hook("UserPromptSubmit", true, json!({"prompt": "CHILD-TASK"}));
+        let [
+            AgentEvent::SessionStart {
+                agent_id,
+                parent_id,
+                ..
+            },
+        ] = &evs[..]
+        else {
+            panic!("one SessionStart: {evs:?}");
+        };
+        assert_eq!(*agent_id, AgentId::from_parts(SOURCE_NAME, CHILD));
+        assert_eq!(*parent_id, Some(AgentId::from_parts(SOURCE_NAME, ROOT)));
+        let evs = hook("UserPromptSubmit", false, json!({"prompt": "go"}));
+        assert!(
+            matches!(
+                &evs[..],
+                [AgentEvent::SessionStart {
+                    parent_id: None,
+                    ..
+                }]
+            ),
+            "{evs:?}"
+        );
+    }
+
+    #[test]
+    fn a_spawn_agent_call_is_a_task_on_either_transport() {
+        let spawn = json!({"tool_name": DISPATCH_TOOL, "tool_use_id": "call_Fxnld0qmszdIwSfB",
+                           "tool_input": {"message": "CHILD-TASK"}});
+        for child in [false, true] {
+            let evs = hook("PreToolUse", child, spawn.clone());
+            assert!(
+                evs.iter().any(|e| matches!(e, AgentEvent::ActivityStart {
+                    detail: Some(d), tool_use_id: Some(_), .. } if d.is_task())),
+                "child={child}: {evs:?}"
+            );
+        }
+        let line = json!({"type": "response_item", "payload": {"type": "function_call",
+            "name": DISPATCH_TOOL, "namespace": "multi_agent_v1",
+            "arguments": "{\"message\":\"CHILD-TASK\"}", "call_id": "call_Fxnld0qmszdIwSfB"}});
+        let evs =
+            decode_codex_line("/p/rollout-2026-10-18T01-52-34-x.jsonl", "codex", line).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, AgentEvent::ActivityStart {
+                detail: Some(d), .. } if d.is_task())),
+            "{evs:?}"
+        );
+        let other = hook(
+            "PreToolUse",
+            false,
+            json!({"tool_name": "Bash", "tool_use_id": "c",
+                                                    "tool_input": {"command": "ls"}}),
+        );
+        assert!(
+            !other.iter().any(|e| matches!(e, AgentEvent::ActivityStart {
+                detail: Some(d), .. } if d.is_task())),
+            "{other:?}"
+        );
     }
 
     #[test]
@@ -658,17 +737,64 @@ mod tests {
         let resumed = ev(json!({"type":"response_item","payload":{
             "type":"custom_tool_call_output","call_id":"call_x","output":"ok"}}));
         assert!(
-            matches!(resumed.as_slice(), [AgentEvent::ActivityStart { .. }]),
-            "its output must resume work like function_call_output does"
+            matches!(resumed.as_slice(), [
+                AgentEvent::ActivityEnd { tool_use_id: Some(c), .. },
+                AgentEvent::ActivityStart { .. },
+            ] if c == "call_x"),
+            "its output must end its call and resume work like function_call_output does"
         );
     }
 
     #[test]
-    fn function_call_output_resumes_work() {
+    fn function_call_output_ends_its_call_and_resumes_work() {
         let out = ev(
             json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"ok"}}),
         );
-        assert!(matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]));
+        assert!(matches!(out.as_slice(), [
+            AgentEvent::ActivityEnd { tool_use_id: Some(c), .. },
+            AgentEvent::ActivityStart { .. },
+        ] if c == "c"));
+        let logs = crate::test_capture::capture_logs(|| {
+            let unpaired = ev(
+                json!({"type":"response_item","payload":{"type":"function_call_output","output":"ok"}}),
+            );
+            assert!(matches!(
+                unpaired.as_slice(),
+                [AgentEvent::ActivityStart { .. }]
+            ));
+        });
+        assert!(
+            !logs.contains("missing_field"),
+            "an output that answers no call is codex's own shape, got:\n{logs}"
+        );
+        for call in [json!(null), json!("")] {
+            let logs = crate::test_capture::capture_logs(|| {
+                let mut line = json!({"type":"response_item","payload":{"type":"custom_tool_call_output","output":"ok"}});
+                if !call.is_null() {
+                    line["payload"]["call_id"] = call.clone();
+                }
+                assert!(matches!(
+                    ev(line).as_slice(),
+                    [AgentEvent::ActivityStart { .. }]
+                ));
+            });
+            assert!(
+                logs.contains("missing_field") && logs.contains("call_id"),
+                "a custom output owes its call, {call}: {logs}"
+            );
+        }
+        let logs = crate::test_capture::capture_logs(|| {
+            let keyed = ev(json!({"type":"response_item","payload":{
+                "type":"custom_tool_call_output","call_id":"call_x","output":"ok"}}));
+            assert!(matches!(keyed.as_slice(), [
+                AgentEvent::ActivityEnd { tool_use_id: Some(c), .. },
+                AgentEvent::ActivityStart { .. },
+            ] if c == "call_x"));
+        });
+        assert!(
+            !logs.contains("missing_field"),
+            "a keyed custom output owes nothing: {logs}"
+        );
     }
 
     #[test]
@@ -682,7 +808,6 @@ mod tests {
     fn web_and_tool_search_keep_the_agent_active() {
         for line in [
             json!({"type":"response_item","payload":{"type":"web_search_call","status":"completed","action":{}}}),
-            json!({"type":"event_msg","payload":{"type":"web_search_begin","call_id":"c"}}),
             json!({"type":"event_msg","payload":{"type":"web_search_end","call_id":"c","query":"q","action":{}}}),
             json!({"type":"response_item","payload":{"type":"tool_search_call","call_id":"c","status":"in_progress","arguments":"{}"}}),
             json!({"type":"response_item","payload":{"type":"tool_search_output","call_id":"c","status":"completed","tools":[]}}),
@@ -697,12 +822,6 @@ mod tests {
 
     #[test]
     fn escalated_function_call_is_waiting() {
-        // Built FROM the exported pair, so the `codex.escalation` watch and the
-        // arm cannot drift apart: the check is a boolean with no breadcrumb.
-        assert_eq!(
-            DECODED_ESCALATION,
-            [REQUIRE_ESCALATED, SANDBOX_PERMISSIONS_FIELD]
-        );
         let args = format!(
             r#"{{"cmd":"date","{SANDBOX_PERMISSIONS_FIELD}":"{REQUIRE_ESCALATED}","justification":"allow?"}}"#
         );

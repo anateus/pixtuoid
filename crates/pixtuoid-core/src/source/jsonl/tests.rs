@@ -5,8 +5,7 @@ use super::health::FailureLatch;
 use super::liveness::{ProbeLadder, ProbeSnapshot, emit_session_exit, revouch_gated_files};
 use super::unclaim::drain_child_end_unclaims;
 use super::walk::{
-    TASK_SCAN_BYTES, detect_parent_id, extract_cwd, park_if_truncated_below_cursor, scan_root,
-    walk_jsonl,
+    TASK_SCAN_BYTES, detect_parent_id, park_if_truncated_below_cursor, scan_root, walk_jsonl,
 };
 use super::*;
 use crate::AgentId;
@@ -308,25 +307,25 @@ fn detect_parent_id_handles_backslash_paths() {
 }
 
 #[test]
-fn extract_cwd_dispatches_the_scanned_sources_shape() {
+fn the_head_scan_dispatches_the_scanned_sources_shape() {
     let top = br#"{"cwd":"/repo/a"}"#;
     assert_eq!(
-        extract_cwd(top, cwd_extractor_for("claude-code")),
+        super::walk::extract_head_fields(top, cwd_extractor_for("omp"), None, None).cwd,
         Some(PathBuf::from("/repo/a"))
     );
     assert_eq!(
-        extract_cwd(top, cwd_extractor_for("test")),
+        super::walk::extract_head_fields(top, cwd_extractor_for("test"), None, None).cwd,
         Some(PathBuf::from("/repo/a")),
         "an unregistered harness source keeps the shared top-level default"
     );
     let nested = br#"{"type":"session_meta","payload":{"cwd":"/repo/b","id":"u"}}"#;
     assert_eq!(
-        extract_cwd(nested, cwd_extractor_for("codex")),
+        super::walk::extract_head_fields(nested, cwd_extractor_for("codex"), None, None).cwd,
         Some(PathBuf::from("/repo/b"))
     );
     let mixed = b"not-json\n{\"type\":\"noise\"}\n{\"cwd\":\"/repo/c\"}\n";
     assert_eq!(
-        extract_cwd(mixed, cwd_extractor_for("claude-code")),
+        super::walk::extract_head_fields(mixed, cwd_extractor_for("omp"), None, None).cwd,
         Some(PathBuf::from("/repo/c"))
     );
 }
@@ -335,7 +334,13 @@ fn extract_cwd_dispatches_the_scanned_sources_shape() {
 fn cc_head_scan_ignores_codex_shaped_payload_cwd() {
     let codex_shaped = br#"{"type":"session_meta","payload":{"cwd":"/foreign/repo","id":"u"}}"#;
     assert_eq!(
-        extract_cwd(codex_shaped, cwd_extractor_for("claude-code")),
+        super::walk::extract_head_fields(
+            codex_shaped,
+            cwd_extractor_for("claude-code"),
+            None,
+            None
+        )
+        .cwd,
         None,
         "a foreign source's cwd shape must not extract for a CC transcript"
     );
@@ -359,7 +364,19 @@ fn t_decode_lifecycle(
             as_child: false,
         }]);
     }
-    Ok(vec![])
+    let agent_id = AgentId::from_parts(s, t);
+    Ok(match v.get("type").and_then(|x| x.as_str()) {
+        Some("tool_use") => vec![AgentEvent::ActivityStart {
+            agent_id,
+            tool_use_id: None,
+            detail: None,
+        }],
+        Some("usage") => vec![AgentEvent::Usage {
+            agent_id,
+            fresh_tokens: 1,
+        }],
+        _ => vec![],
+    })
 }
 fn t_label(_p: &Path, _s: &str, _c: &Path) -> String {
     "t".to_string()
@@ -374,7 +391,7 @@ async fn walk_once_with(
     decode_line: LineDecoder,
     check_ended: SessionEndChecker,
     cursors: &Arc<Mutex<HashMap<PathBuf, u64>>>,
-    seen: &Arc<Mutex<HashMap<PathBuf, bool>>>,
+    seen: &Arc<Mutex<HashMap<PathBuf, Sight>>>,
 ) -> Vec<(Transport, AgentEvent)> {
     walk_once_with_recency(
         path,
@@ -395,7 +412,7 @@ async fn walk_once_with_recency(
     check_ended: SessionEndChecker,
     activity_recency: super::ActivityRecency,
     cursors: &Arc<Mutex<HashMap<PathBuf, u64>>>,
-    seen: &Arc<Mutex<HashMap<PathBuf, bool>>>,
+    seen: &Arc<Mutex<HashMap<PathBuf, Sight>>>,
 ) -> Vec<(Transport, AgentEvent)> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(32);
     let source: Arc<str> = Arc::from("test");
@@ -484,7 +501,7 @@ async fn walk_once_live(
     window: Duration,
     live_ids: &[&str],
     cursors: &Arc<Mutex<HashMap<PathBuf, u64>>>,
-    seen: &Arc<Mutex<HashMap<PathBuf, bool>>>,
+    seen: &Arc<Mutex<HashMap<PathBuf, Sight>>>,
 ) -> Vec<(Transport, AgentEvent)> {
     let live: Arc<Mutex<HashSet<String>>> =
         Arc::new(Mutex::new(live_ids.iter().map(|s| s.to_string()).collect()));
@@ -532,7 +549,7 @@ async fn walk_once(
     window: Duration,
     check_ended: SessionEndChecker,
     cursors: &Arc<Mutex<HashMap<PathBuf, u64>>>,
-    seen: &Arc<Mutex<HashMap<PathBuf, bool>>>,
+    seen: &Arc<Mutex<HashMap<PathBuf, Sight>>>,
 ) -> Vec<(Transport, AgentEvent)> {
     walk_once_with(path, window, t_decode, check_ended, cursors, seen).await
 }
@@ -758,7 +775,7 @@ async fn gated_fixture(
     initial: &str,
 ) -> (
     Arc<Mutex<HashMap<PathBuf, u64>>>,
-    Arc<Mutex<HashMap<PathBuf, bool>>>,
+    Arc<Mutex<HashMap<PathBuf, Sight>>>,
 ) {
     tokio::fs::write(path, initial).await.unwrap();
     backdate_one_hour(path);
@@ -826,6 +843,60 @@ async fn walk_jsonl_honors_the_path_filter() {
 }
 
 #[tokio::test]
+async fn an_oversized_append_revives_an_ended_transcript_only_on_activity() {
+    // The last row's final line is longer than the activity tail's window.
+    let long_tool = format!(
+        "{{\"type\":\"tool_use\",\"pad\":\"{}\"}}\n",
+        "x".repeat(super::walk::TAIL_BYTES as usize * 2)
+    );
+    for (filler, last, revives) in [
+        ("{\"type\":\"usage\"}\n", "", false),
+        ("{\"type\":\"tool_use\"}\n", "", true),
+        ("{\"type\":\"usage\"}\n", long_tool.as_str(), true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ended-big.jsonl");
+        std::fs::write(&path, "{\"type\":\"tool_use\"}\n").unwrap();
+        let cursors = Arc::new(Mutex::new(HashMap::new()));
+        let seen = Arc::new(Mutex::new(HashMap::new()));
+        let window = Duration::from_secs(3600);
+        let append = |bytes: &[u8]| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        };
+        walk_once_with(&path, window, t_decode_lifecycle, t_ended, &cursors, &seen).await;
+        append(b"{\"type\":\"system\",\"subtype\":\"session_end\"}\n");
+        walk_once_with(&path, window, t_decode_lifecycle, t_ended, &cursors, &seen).await;
+        assert_eq!(
+            seen.lock().await.get(&path),
+            Some(&Sight::Ended),
+            "fixture: ended"
+        );
+
+        let span = filler.repeat(70_000) + last;
+        assert!(
+            span.len() as u64 > super::walk::MAX_PENDING_BYTES,
+            "fixture: oversized"
+        );
+        append(span.as_bytes());
+        let events =
+            walk_once_with(&path, window, t_decode_lifecycle, t_ended, &cursors, &seen).await;
+        assert_eq!(
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, AgentEvent::SessionStart { .. })),
+            revives,
+            "an oversized {filler:?} span ending {:?} revives only on activity: {events:?}",
+            last.get(..24)
+        );
+    }
+}
+
+#[tokio::test]
 async fn gated_file_registers_on_oversized_first_append() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("gated-big.jsonl");
@@ -868,36 +939,44 @@ fn t_head_label(v: &serde_json::Value) -> Option<String> {
 #[test]
 fn a_head_read_yields_cwd_and_the_optional_title_in_one_pass() {
     let plain = "{\"type\":\"session\",\"cwd\":\"/repo/head\"}\n{\"type\":\"assistant\"}\n";
-    let (cwd, label) =
-        super::walk::extract_head_fields(plain.as_bytes(), cwd_extractor_for("test"), None);
-    assert_eq!(cwd.as_deref(), Some(Path::new("/repo/head")));
-    assert_eq!(label, None, "a source with no head label must name nothing");
+    let head =
+        super::walk::extract_head_fields(plain.as_bytes(), cwd_extractor_for("test"), None, None);
+    assert_eq!(head.cwd.as_deref(), Some(Path::new("/repo/head")));
+    assert_eq!(
+        head.label, None,
+        "a source with no head label must name nothing"
+    );
 
     let titled = "{\"type\":\"title\",\"title\":\"Ship it\"}\n{\"type\":\"session\",\"cwd\":\"/repo/head\"}\n";
-    let (cwd, label) = super::walk::extract_head_fields(
+    let head = super::walk::extract_head_fields(
         titled.as_bytes(),
         cwd_extractor_for("test"),
         Some(t_head_label),
+        None,
     );
-    assert_eq!(cwd.as_deref(), Some(Path::new("/repo/head")));
-    assert_eq!(label.as_deref(), Some("t·Ship it"));
+    assert_eq!(head.cwd.as_deref(), Some(Path::new("/repo/head")));
+    assert_eq!(head.label.as_deref(), Some("t·Ship it"));
 
     // The title slot exists but is EMPTY (omp's subagents, forever): the head
     // read must fall through to the cwd-basename deriver, not name it "".
     let empty =
         "{\"type\":\"title\",\"title\":\"\"}\n{\"type\":\"session\",\"cwd\":\"/repo/head\"}\n";
-    let (_, label) = super::walk::extract_head_fields(
+    let head = super::walk::extract_head_fields(
         empty.as_bytes(),
         cwd_extractor_for("test"),
         Some(t_head_label),
+        None,
     );
-    assert_eq!(label, None, "an empty slot must not become an empty name");
+    assert_eq!(
+        head.label, None,
+        "an empty slot must not become an empty name"
+    );
 }
 
 async fn walk_once_with_head_label(
     path: &Path,
     cursors: &Arc<Mutex<HashMap<PathBuf, u64>>>,
-    seen: &Arc<Mutex<HashMap<PathBuf, bool>>>,
+    seen: &Arc<Mutex<HashMap<PathBuf, Sight>>>,
 ) -> Vec<(Transport, AgentEvent)> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(64);
     let source: Arc<str> = Arc::from("test");
@@ -927,6 +1006,117 @@ async fn walk_once_with_head_label(
         events.push(ev);
     }
     events
+}
+
+const CODEX_CHILD: &str = "01a14e51-6b67-7d71-bf09-674db3be3c5e";
+const CODEX_ROOT: &str = "01a14e51-5f02-7a71-aed3-a441edeac91d";
+
+/// A codex child's head: its rollout path is flat, so its parent rides this
+/// `session_meta` line (the shape a recorded 0.163.0 child rollout carries).
+fn codex_child_head() -> String {
+    format!(
+        "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{CODEX_CHILD}\",\
+         \"parent_thread_id\":\"{CODEX_ROOT}\",\"cwd\":\"/repo\"}}}}\n"
+    )
+}
+
+fn codex_child_path(dir: &Path) -> PathBuf {
+    dir.join(format!("rollout-2026-10-18T02-22-01-{CODEX_CHILD}.jsonl"))
+}
+
+/// One codex walk of `path`: each first sight's `(agent, parent)`.
+async fn codex_first_sights(
+    path: &Path,
+    cursors: &Arc<Mutex<HashMap<PathBuf, u64>>>,
+    seen: &Arc<Mutex<HashMap<PathBuf, Sight>>>,
+) -> Vec<(AgentId, Option<AgentId>)> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(64);
+    let source: Arc<str> = Arc::from(crate::source::codex::SOURCE_NAME);
+    let decoders = SourceDecoders {
+        decode_line: crate::source::codex::decode_codex_line,
+        derive_label: t_label,
+        check_ended: t_ended,
+        activity_recency: super::no_activity_recency,
+        id_derive: super::folded::FoldedDeriver::new(crate::source::codex::codex_id_from_path),
+        path_filter: accept_all_paths,
+        cwd_derive: no_cwd_from_path,
+        head_label: None,
+    };
+    let live = Arc::new(Mutex::new(HashSet::new()));
+    let ctx = WatchCtx {
+        source: &source,
+        cursors,
+        seen,
+        tx: &tx,
+        window: Duration::from_secs(3600),
+        live: &live,
+    };
+    walk_jsonl(path, decoders, &ctx).await;
+    drop(tx);
+    let mut starts = Vec::new();
+    while let Ok((_, e)) = rx.try_recv() {
+        if let AgentEvent::SessionStart {
+            agent_id,
+            parent_id,
+            ..
+        } = e
+        {
+            starts.push((agent_id, parent_id));
+        }
+    }
+    starts
+}
+
+fn the_parented_child() -> Vec<(AgentId, Option<AgentId>)> {
+    vec![(
+        AgentId::from_parts("codex", CODEX_CHILD),
+        Some(AgentId::from_parts("codex", CODEX_ROOT)),
+    )]
+}
+
+#[tokio::test]
+async fn a_codex_child_rollouts_first_sight_names_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = codex_child_path(dir.path());
+    tokio::fs::write(&path, codex_child_head()).await.unwrap();
+    let (cursors, seen) = Default::default();
+    assert_eq!(
+        codex_first_sights(&path, &cursors, &seen).await,
+        the_parented_child()
+    );
+}
+
+/// The oversized path reads only the head, which must still carry the parent.
+#[tokio::test]
+async fn an_oversized_codex_child_rollouts_first_sight_names_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = codex_child_path(dir.path());
+    let mut full = codex_child_head();
+    full.push_str(&"{\"type\":\"event_msg\"}\n".repeat(60_000));
+    assert!(full.len() as u64 > super::walk::MAX_PENDING_BYTES);
+    tokio::fs::write(&path, &full).await.unwrap();
+    let (cursors, seen) = Default::default();
+    assert_eq!(
+        codex_first_sights(&path, &cursors, &seen).await,
+        the_parented_child()
+    );
+}
+
+/// A revived gated rollout reads its parent off the head too: the append
+/// carries none, though its `turn_context` carries a cwd.
+#[tokio::test]
+async fn a_revived_codex_child_rollout_names_its_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = codex_child_path(dir.path());
+    let (cursors, seen) = gated_fixture(&path, &codex_child_head()).await;
+    let mut full = codex_child_head();
+    full.push_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n");
+    full.push_str("{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/repo\"}}\n");
+    tokio::fs::write(&path, &full).await.unwrap();
+    assert_eq!(
+        codex_first_sights(&path, &cursors, &seen).await,
+        the_parented_child()
+    );
 }
 
 fn first_rename(events: &[(Transport, AgentEvent)]) -> Option<&str> {
@@ -1079,7 +1269,7 @@ async fn gated_file_oversized_metadata_only_append_stays_unregistered() {
 }
 
 #[tokio::test]
-async fn session_end_unclaims_seen_so_a_later_append_re_registers() {
+async fn session_end_ends_its_claim_so_later_activity_re_registers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resumed.jsonl");
     tokio::fs::write(&path, "{\"type\":\"assistant\",\"cwd\":\"/repo\"}\n")
@@ -1119,8 +1309,8 @@ async fn session_end_unclaims_seen_so_a_later_append_re_registers() {
     );
     assert_eq!(
         seen.lock().await.get(&path),
-        Some(&false),
-        "SessionEnd must RELEASE `seen` (not remove it) so a revival can \
+        Some(&Sight::Ended),
+        "SessionEnd must END `seen` (not remove it) so a revival can \
          re-register while the re-vouch sweep still skips the path"
     );
 
@@ -1129,17 +1319,76 @@ async fn session_end_unclaims_seen_so_a_later_append_re_registers() {
         .open(&path)
         .await
         .unwrap();
-    tokio::io::AsyncWriteExt::write_all(&mut f, b"{\"type\":\"assistant\"}\n")
+    tokio::io::AsyncWriteExt::write_all(&mut f, b"{\"type\":\"tool_use\"}\n")
         .await
         .unwrap();
     tokio::io::AsyncWriteExt::flush(&mut f).await.unwrap();
     drop(f);
     let events = walk_once_with(&path, window, t_decode_lifecycle, t_ended, &cursors, &seen).await;
     assert!(
+        matches!(
+            events.as_slice(),
+            [
+                (_, AgentEvent::SessionStart { .. }),
+                ..,
+                (_, AgentEvent::ActivityStart { .. })
+            ]
+        ),
+        "a post-end append that decodes to activity must re-register the agent \
+         ahead of that activity, got {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_post_end_trailer_that_decodes_to_nothing_never_re_registers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ended.jsonl");
+    tokio::fs::write(&path, "{\"type\":\"tool_use\"}\n")
+        .await
+        .unwrap();
+    let cursors = Arc::new(Mutex::new(HashMap::new()));
+    let seen = Arc::new(Mutex::new(HashMap::new()));
+    let window = Duration::from_secs(3600);
+    let append = |line: &[u8]| {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(line)
+            .unwrap();
+    };
+    walk_once_with(&path, window, t_decode_lifecycle, t_ended, &cursors, &seen).await;
+    append(b"{\"type\":\"system\",\"subtype\":\"session_end\"}\n");
+    walk_once_with(&path, window, t_decode_lifecycle, t_ended, &cursors, &seen).await;
+    assert_eq!(
+        seen.lock().await.get(&path),
+        Some(&Sight::Ended),
+        "fixture: ended"
+    );
+
+    // grok flushes `hook_execution{stop}` after its end line; it decodes to nothing.
+    // Nor does one that decodes to usage, which proves no life either.
+    append(b"{\"type\":\"system\",\"subtype\":\"hook_trailer\"}\n{\"type\":\"usage\"}\n");
+    let events = walk_once_with(&path, window, t_decode_lifecycle, t_ended, &cursors, &seen).await;
+    assert!(
+        !events
+            .iter()
+            .any(|(_, e)| matches!(e, AgentEvent::SessionStart { .. })),
+        "a trailer that proves no life must not resurrect the ended session, got {events:?}"
+    );
+    assert_eq!(
+        seen.lock().await.get(&path),
+        Some(&Sight::Ended),
+        "the claim stays ended, so a real revival still re-registers"
+    );
+
+    append(b"{\"type\":\"tool_use\"}\n");
+    let events = walk_once_with(&path, window, t_decode_lifecycle, t_ended, &cursors, &seen).await;
+    assert!(
         events
             .iter()
             .any(|(_, e)| matches!(e, AgentEvent::SessionStart { .. })),
-        "a post-end append must re-register the agent, got {events:?}"
+        "activity after the trailer is the revival, got {events:?}"
     );
 }
 
@@ -1327,7 +1576,7 @@ fn drain_events(
 }
 
 #[tokio::test]
-async fn child_end_unclaim_drains_stragglers_then_releases_without_session_end() {
+async fn child_end_unclaim_drains_stragglers_then_ends_the_claim_without_session_end() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("child.jsonl");
     std::fs::write(&path, "{\"type\":\"assistant\"}\n").unwrap();
@@ -1379,28 +1628,28 @@ async fn child_end_unclaim_drains_stragglers_then_releases_without_session_end()
     assert_eq!(
         cursors.lock().await.get(&path).copied(),
         Some(file_len),
-        "stragglers must be drained to EOF BEFORE the release (#228)"
+        "stragglers must be drained to EOF BEFORE the end (#228)"
     );
     assert_eq!(
         seen.lock().await.get(&path),
-        Some(&false),
-        "the claim must be RELEASED (kept known, so the re-vouch sweep \
+        Some(&Sight::Ended),
+        "the claim must be ENDED (kept known, so the re-vouch sweep \
          cannot replay it)"
     );
 
     let events = walk_once(&path, window, t_ended, &cursors, &seen).await;
     assert!(
         events.is_empty(),
-        "a straggler walk after the release must not resurrect, got {events:?}"
+        "a straggler walk after the end must not resurrect, got {events:?}"
     );
 
     std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .unwrap()
-        .write_all(b"{\"type\":\"assistant\"}\n")
+        .write_all(b"{\"type\":\"tool_use\"}\n")
         .unwrap();
-    let events = walk_once(&path, window, t_ended, &cursors, &seen).await;
+    let events = walk_once_with(&path, window, t_decode_lifecycle, t_ended, &cursors, &seen).await;
     assert!(
         events.iter().any(|(_, e)| matches!(
             e,
@@ -1411,7 +1660,7 @@ async fn child_end_unclaim_drains_stragglers_then_releases_without_session_end()
 }
 
 #[tokio::test]
-async fn released_claim_is_not_revouched_into_a_full_replay() {
+async fn an_ended_claim_is_not_revouched_into_a_full_replay() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("child.jsonl");
     std::fs::write(&path, "{\"type\":\"assistant\"}\n").unwrap();
@@ -1443,11 +1692,11 @@ async fn released_claim_is_not_revouched_into_a_full_replay() {
     };
     drain_child_end_unclaims(Some(&unclaims), t_decoders(), &ctx).await;
     let events = drain_events(&mut rx);
-    assert!(events.is_empty(), "release emits nothing, got {events:?}");
+    assert!(events.is_empty(), "the end emits nothing, got {events:?}");
     assert_eq!(
         seen.lock().await.get(&path),
-        Some(&false),
-        "the claim must be RELEASED (false), not removed — removal is \
+        Some(&Sight::Ended),
+        "the claim must be ENDED (`Sight::Ended`), not removed — removal is \
          exactly what would expose the path to the re-vouch replay below"
     );
 
@@ -1456,17 +1705,17 @@ async fn released_claim_is_not_revouched_into_a_full_replay() {
     let events = drain_events(&mut rx);
     assert!(
         events.is_empty(),
-        "a re-vouch sweep over a RELEASED claim must not replay/re-register, got {events:?}"
+        "a re-vouch sweep over an ENDED claim must not replay/re-register, got {events:?}"
     );
     assert_eq!(
         cursors.lock().await.get(&path).copied(),
         Some(file_len),
-        "the released path's cursor must stay parked at EOF (no reset-to-0 replay)"
+        "the ended path's cursor must stay parked at EOF (no reset-to-0 replay)"
     );
 }
 
 #[tokio::test]
-async fn decoded_terminator_release_is_not_revouched_into_a_full_replay() {
+async fn a_decoded_terminators_ended_claim_is_not_revouched_into_a_full_replay() {
     fn never_ended(_tail: &[u8]) -> bool {
         false
     }
@@ -1499,8 +1748,8 @@ async fn decoded_terminator_release_is_not_revouched_into_a_full_replay() {
     );
     assert_eq!(
         seen.lock().await.get(&path),
-        Some(&false),
-        "the claim must be RELEASED (false), not removed — removal is exactly \
+        Some(&Sight::Ended),
+        "the claim must be ENDED (`Sight::Ended`), not removed — removal is exactly \
          what exposes the path to the re-vouch replay below"
     );
 
@@ -1530,12 +1779,12 @@ async fn decoded_terminator_release_is_not_revouched_into_a_full_replay() {
     let events = drain_events(&mut rx);
     assert!(
         events.is_empty(),
-        "a re-vouch sweep over an ENDED, released path must not replay it, got {events:?}"
+        "a re-vouch sweep over an ENDED path must not replay it, got {events:?}"
     );
     assert_eq!(
         cursors.lock().await.get(&path).copied(),
         Some(file_len),
-        "the released path's cursor must stay parked at EOF (no reset-to-0 replay)"
+        "the ended path's cursor must stay parked at EOF (no reset-to-0 replay)"
     );
 }
 
@@ -1547,7 +1796,7 @@ async fn unclaim_for_foreign_id_stays_pending_and_leaves_local_claims_alone() {
     let cursors = Arc::new(Mutex::new(HashMap::new()));
     let seen = Arc::new(Mutex::new(HashMap::new()));
     walk_once(&path, Duration::from_secs(3600), t_ended, &cursors, &seen).await;
-    assert_eq!(seen.lock().await.get(&path), Some(&true));
+    assert_eq!(seen.lock().await.get(&path), Some(&Sight::Claimed));
 
     let unclaims = ChildEndUnclaims::new();
     let foreign = AgentId::from_parts("codex", "not-claimed-here");
@@ -1566,8 +1815,8 @@ async fn unclaim_for_foreign_id_stays_pending_and_leaves_local_claims_alone() {
     drain_child_end_unclaims(Some(&unclaims), t_decoders(), &ctx).await;
     assert_eq!(
         seen.lock().await.get(&path),
-        Some(&true),
-        "a foreign id must not release this watcher's claims"
+        Some(&Sight::Claimed),
+        "a foreign id must not end this watcher's claims"
     );
     assert_eq!(
         unclaims.take_matching(|x| *x == foreign),
@@ -1602,7 +1851,7 @@ async fn child_end_unclaims_ttl_prunes_unmatched_entries() {
 }
 
 #[tokio::test]
-async fn child_end_unclaim_releases_only_the_matched_ids_own_path() {
+async fn child_end_unclaim_ends_only_the_matched_ids_own_path() {
     let dir = tempfile::tempdir().unwrap();
     let ended_child = dir.path().join("ended-child.jsonl");
     let sibling = dir.path().join("live-sibling.jsonl");
@@ -1611,7 +1860,11 @@ async fn child_end_unclaim_releases_only_the_matched_ids_own_path() {
     for p in [&ended_child, &sibling] {
         std::fs::write(p, "{\"type\":\"assistant\"}\n").unwrap();
         walk_once(p, Duration::from_secs(3600), t_ended, &cursors, &seen).await;
-        assert_eq!(seen.lock().await.get(p), Some(&true), "fixture: registered");
+        assert_eq!(
+            seen.lock().await.get(p),
+            Some(&Sight::Claimed),
+            "fixture: registered"
+        );
     }
 
     let unclaims = ChildEndUnclaims::new();
@@ -1633,18 +1886,18 @@ async fn child_end_unclaim_releases_only_the_matched_ids_own_path() {
     drain_child_end_unclaims(Some(&unclaims), t_decoders(), &ctx).await;
     assert_eq!(
         seen.lock().await.get(&ended_child),
-        Some(&false),
-        "the ended child's claim is released"
+        Some(&Sight::Ended),
+        "the ended child's claim is ended"
     );
     assert_eq!(
         seen.lock().await.get(&sibling),
-        Some(&true),
+        Some(&Sight::Claimed),
         "the sibling session's claim must survive another child's un-claim"
     );
 }
 
 #[tokio::test]
-async fn oversized_ended_skip_unclaims_seen_so_a_later_append_re_registers() {
+async fn oversized_ended_skip_ends_its_claim_so_later_activity_re_registers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("big-resumed.jsonl");
     let initial = "{\"type\":\"assistant\",\"cwd\":\"/repo\"}\n";
@@ -1673,8 +1926,8 @@ async fn oversized_ended_skip_unclaims_seen_so_a_later_append_re_registers() {
         "the buried terminator must emit SessionEnd, got {events:?}"
     );
     assert!(
-        !seen.lock().await.contains_key(&path),
-        "the oversized-ended skip must un-claim `seen`"
+        seen.lock().await.get(&path) == Some(&Sight::Ended),
+        "the oversized-ended skip must end `seen`"
     );
 
     let mut f = tokio::fs::OpenOptions::new()
@@ -1682,17 +1935,17 @@ async fn oversized_ended_skip_unclaims_seen_so_a_later_append_re_registers() {
         .open(&path)
         .await
         .unwrap();
-    tokio::io::AsyncWriteExt::write_all(&mut f, b"{\"type\":\"assistant\"}\n")
+    tokio::io::AsyncWriteExt::write_all(&mut f, b"{\"type\":\"tool_use\"}\n")
         .await
         .unwrap();
     tokio::io::AsyncWriteExt::flush(&mut f).await.unwrap();
     drop(f);
-    let events = walk_once(&path, window, t_ended, &cursors, &seen).await;
+    let events = walk_once_with(&path, window, t_decode_lifecycle, t_ended, &cursors, &seen).await;
     assert!(
         events
             .iter()
             .any(|(_, e)| matches!(e, AgentEvent::SessionStart { .. })),
-        "a post-end append must re-register the agent, got {events:?}"
+        "post-end activity must re-register the agent, got {events:?}"
     );
 }
 
@@ -2240,19 +2493,15 @@ async fn probe_parent_uuid_does_not_admit_subagent_transcript() {
 }
 
 const FILLER_LINE: &str = "{\"type\":\"assistant\"}\n";
-const CC_HEAD_LINE: &str = "{\"type\":\"assistant\",\"cwd\":\"/repo/head\"}\n";
+const HEAD_LINE: &str = "{\"type\":\"assistant\",\"cwd\":\"/repo/head\"}\n";
 
-fn cc_task_dispatch_line(tuid: &str) -> String {
+fn task_dispatch_line(tuid: &str) -> String {
     serde_json::json!({
-        "type": "assistant",
-        "cwd": "/repo/head",
+        "type": "message",
         "message": {
             "role": "assistant",
             "content": [
-                { "type": "tool_use", "id": tuid, "name": "Agent",
-                  "input": { "description": "explore",
-                             "subagent_type": "code-explorer",
-                             "prompt": "go" } }
+                { "type": "toolCall", "id": tuid, "name": "task", "arguments": {} }
             ]
         }
     })
@@ -2260,22 +2509,17 @@ fn cc_task_dispatch_line(tuid: &str) -> String {
         + "\n"
 }
 
-fn cc_task_result_line(tuid: &str) -> String {
+fn task_result_line(tuid: &str) -> String {
     serde_json::json!({
-        "type": "user",
-        "message": {
-            "role": "user",
-            "content": [
-                { "type": "tool_result", "tool_use_id": tuid, "content": "done" }
-            ]
-        }
+        "type": "message",
+        "message": { "role": "toolResult", "toolCallId": tuid }
     })
     .to_string()
         + "\n"
 }
 
 fn oversized_body(tail_lines: &[String]) -> String {
-    let mut full = String::from(CC_HEAD_LINE);
+    let mut full = String::from(HEAD_LINE);
     while full.len() <= (1usize << 20) + 4096 {
         full.push_str(FILLER_LINE);
     }
@@ -2302,16 +2546,16 @@ fn task_start_tuids(events: &[(Transport, AgentEvent)]) -> Vec<String> {
         .collect()
 }
 
-async fn walk_oversized_cc(
+async fn walk_oversized(
     path: &Path,
     window: Duration,
     cursors: &Arc<Mutex<HashMap<PathBuf, u64>>>,
-    seen: &Arc<Mutex<HashMap<PathBuf, bool>>>,
+    seen: &Arc<Mutex<HashMap<PathBuf, Sight>>>,
 ) -> Vec<(Transport, AgentEvent)> {
     walk_once_with(
         path,
         window,
-        crate::source::claude_code::decode_cc_line,
+        crate::source::omp::decode_omp_line,
         t_ended,
         cursors,
         seen,
@@ -2323,12 +2567,12 @@ async fn walk_oversized_cc(
 async fn oversized_attach_seeds_unmatched_task_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deleg-big.jsonl");
-    let full = oversized_body(&[cc_task_dispatch_line("tu_task")]);
+    let full = oversized_body(&[task_dispatch_line("tu_task")]);
     tokio::fs::write(&path, &full).await.unwrap();
     let cursors = Arc::new(Mutex::new(HashMap::new()));
     let seen = Arc::new(Mutex::new(HashMap::new()));
 
-    let events = walk_oversized_cc(&path, Duration::from_secs(3600), &cursors, &seen).await;
+    let events = walk_oversized(&path, Duration::from_secs(3600), &cursors, &seen).await;
     let start_pos = events
         .iter()
         .position(|(_, e)| matches!(e, AgentEvent::SessionStart { .. }))
@@ -2357,15 +2601,12 @@ async fn oversized_attach_seeds_unmatched_task_dispatch() {
 async fn oversized_attach_matched_task_is_not_seeded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deleg-done.jsonl");
-    let full = oversized_body(&[
-        cc_task_dispatch_line("tu_task"),
-        cc_task_result_line("tu_task"),
-    ]);
+    let full = oversized_body(&[task_dispatch_line("tu_task"), task_result_line("tu_task")]);
     tokio::fs::write(&path, &full).await.unwrap();
     let cursors = Arc::new(Mutex::new(HashMap::new()));
     let seen = Arc::new(Mutex::new(HashMap::new()));
 
-    let events = walk_oversized_cc(&path, Duration::from_secs(3600), &cursors, &seen).await;
+    let events = walk_oversized(&path, Duration::from_secs(3600), &cursors, &seen).await;
     assert!(
         events
             .iter()
@@ -2383,12 +2624,12 @@ async fn oversized_attach_matched_task_is_not_seeded() {
 #[tokio::test]
 async fn pending_span_of_exactly_max_bytes_replays_instead_of_skipping() {
     let bash_line = serde_json::json!({
-        "type": "assistant",
+        "type": "message",
         "message": {
             "role": "assistant",
             "content": [
-                { "type": "tool_use", "id": "tu_bash", "name": "Bash",
-                  "input": { "command": "ls" } }
+                { "type": "toolCall", "id": "tu_bash", "name": "bash",
+                  "arguments": { "command": "ls" } }
             ]
         }
     })
@@ -2398,9 +2639,9 @@ async fn pending_span_of_exactly_max_bytes_replays_instead_of_skipping() {
     let target = 1usize << 20;
     let pad_open = "{\"type\":\"assistant\",\"pad\":\"";
     let pad_close = "\"}\n";
-    let pad_len = target - CC_HEAD_LINE.len() - bash_line.len() - pad_open.len() - pad_close.len();
+    let pad_len = target - HEAD_LINE.len() - bash_line.len() - pad_open.len() - pad_close.len();
     let full = format!(
-        "{CC_HEAD_LINE}{pad_open}{}{pad_close}{bash_line}",
+        "{HEAD_LINE}{pad_open}{}{pad_close}{bash_line}",
         "x".repeat(pad_len)
     );
     assert_eq!(full.len(), target, "fixture: exactly 1 MiB pending");
@@ -2410,7 +2651,7 @@ async fn pending_span_of_exactly_max_bytes_replays_instead_of_skipping() {
     tokio::fs::write(&path, &full).await.unwrap();
     let cursors = Arc::new(Mutex::new(HashMap::new()));
     let seen = Arc::new(Mutex::new(HashMap::new()));
-    let events = walk_oversized_cc(&path, Duration::from_secs(3600), &cursors, &seen).await;
+    let events = walk_oversized(&path, Duration::from_secs(3600), &cursors, &seen).await;
     assert!(
         events
             .iter()
@@ -2424,15 +2665,15 @@ async fn pending_span_of_exactly_max_bytes_replays_instead_of_skipping() {
 async fn oversized_attach_seeds_dispatches_across_the_full_scan_window() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deleg-deep.jsonl");
-    let mut tail = vec![cc_task_dispatch_line("tu_deep")];
+    let mut tail = vec![task_dispatch_line("tu_deep")];
     tail.extend(std::iter::repeat_n(FILLER_LINE.to_string(), 200));
-    tail.push(cc_task_dispatch_line("tu_near"));
+    tail.push(task_dispatch_line("tu_near"));
     let full = oversized_body(&tail);
     tokio::fs::write(&path, &full).await.unwrap();
     let cursors = Arc::new(Mutex::new(HashMap::new()));
     let seen = Arc::new(Mutex::new(HashMap::new()));
 
-    let events = walk_oversized_cc(&path, Duration::from_secs(3600), &cursors, &seen).await;
+    let events = walk_oversized(&path, Duration::from_secs(3600), &cursors, &seen).await;
     assert_eq!(
         task_start_tuids(&events),
         vec!["tu_deep".to_string(), "tu_near".to_string()],
@@ -2447,17 +2688,17 @@ async fn oversized_attach_ended_session_skips_task_scan() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deleg-ended.jsonl");
     let full = oversized_body(&[
-        cc_task_dispatch_line("tu_task"),
+        task_dispatch_line("tu_task"),
         "{\"type\":\"system\",\"subtype\":\"session_end\"}\n".to_string(),
     ]);
     tokio::fs::write(&path, &full).await.unwrap();
     let cursors = Arc::new(Mutex::new(HashMap::from([(
         path.clone(),
-        CC_HEAD_LINE.len() as u64,
+        HEAD_LINE.len() as u64,
     )])));
     let seen = Arc::new(Mutex::new(HashMap::new()));
 
-    let events = walk_oversized_cc(&path, Duration::from_secs(3600), &cursors, &seen).await;
+    let events = walk_oversized(&path, Duration::from_secs(3600), &cursors, &seen).await;
     assert!(
         events
             .iter()
@@ -2482,13 +2723,13 @@ async fn oversized_attach_ended_session_skips_task_scan() {
 async fn oversized_attach_unregistered_skips_task_scan() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deleg-stale.jsonl");
-    let full = oversized_body(&[cc_task_dispatch_line("tu_task")]);
+    let full = oversized_body(&[task_dispatch_line("tu_task")]);
     tokio::fs::write(&path, &full).await.unwrap();
     backdate_one_hour(&path);
     let cursors = Arc::new(Mutex::new(HashMap::new()));
     let seen = Arc::new(Mutex::new(HashMap::new()));
 
-    let events = walk_oversized_cc(&path, Duration::from_secs(60), &cursors, &seen).await;
+    let events = walk_oversized(&path, Duration::from_secs(60), &cursors, &seen).await;
     assert!(
         events.is_empty(),
         "a gated unregistered oversized file must emit NOTHING — no Task seeding without a slot, got {events:?}"
@@ -2504,8 +2745,8 @@ async fn oversized_attach_unregistered_skips_task_scan() {
 async fn oversized_attach_dispatch_outside_window_is_missed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deleg-buried.jsonl");
-    let mut full = String::from(CC_HEAD_LINE);
-    let dispatch = cc_task_dispatch_line("tu_buried");
+    let mut full = String::from(HEAD_LINE);
+    let dispatch = task_dispatch_line("tu_buried");
     full.push_str(&dispatch);
     let dispatch_end = full.len();
     while full.len() <= (1usize << 20) + 4096 {
@@ -2519,7 +2760,7 @@ async fn oversized_attach_dispatch_outside_window_is_missed() {
     let cursors = Arc::new(Mutex::new(HashMap::new()));
     let seen = Arc::new(Mutex::new(HashMap::new()));
 
-    let events = walk_oversized_cc(&path, Duration::from_secs(3600), &cursors, &seen).await;
+    let events = walk_oversized(&path, Duration::from_secs(3600), &cursors, &seen).await;
     assert!(
         events
             .iter()
@@ -2536,10 +2777,10 @@ async fn oversized_attach_dispatch_outside_window_is_missed() {
 async fn task_scan_handles_partial_first_line() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deleg-straddle.jsonl");
-    let task_a = cc_task_dispatch_line("tu_straddle");
-    let task_b = cc_task_dispatch_line("tu_inside");
+    let task_a = task_dispatch_line("tu_straddle");
+    let task_b = task_dispatch_line("tu_inside");
 
-    let mut full = String::from(CC_HEAD_LINE);
+    let mut full = String::from(HEAD_LINE);
     // Deep enough that suffix + window keeps the total > MAX_PENDING_BYTES.
     while full.len() < (1usize << 20) {
         full.push_str(FILLER_LINE);
@@ -2564,7 +2805,7 @@ async fn task_scan_handles_partial_first_line() {
     let cursors = Arc::new(Mutex::new(HashMap::new()));
     let seen = Arc::new(Mutex::new(HashMap::new()));
 
-    let events = walk_oversized_cc(&path, Duration::from_secs(3600), &cursors, &seen).await;
+    let events = walk_oversized(&path, Duration::from_secs(3600), &cursors, &seen).await;
     assert_eq!(
         task_start_tuids(&events),
         vec!["tu_inside".to_string()],
@@ -2720,7 +2961,7 @@ async fn session_exit_parks_truncated_transcript_so_a_straggler_walk_cannot_resu
 }
 
 #[tokio::test]
-async fn child_end_unclaim_parks_truncated_transcript_before_release() {
+async fn child_end_unclaim_parks_truncated_transcript_before_the_end() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("child.jsonl");
     std::fs::write(
@@ -2770,27 +3011,27 @@ async fn child_end_unclaim_parks_truncated_transcript_before_release() {
     assert_eq!(
         cursors.lock().await.get(&path).copied(),
         Some(new_len),
-        "a truncated rollout must be PARKED at the new EOF before release"
+        "a truncated rollout must be PARKED at the new EOF before the end"
     );
     assert_eq!(
         seen.lock().await.get(&path),
-        Some(&false),
-        "the claim must still be RELEASED (kept known)"
+        Some(&Sight::Ended),
+        "the claim must still be ENDED (kept known)"
     );
 
     let events = walk_once(&path, window, t_ended, &cursors, &seen).await;
     assert!(
         events.is_empty(),
-        "a straggler walk after the release must not resurrect, got {events:?}"
+        "a straggler walk after the end must not resurrect, got {events:?}"
     );
 
     std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .unwrap()
-        .write_all(b"{\"type\":\"assistant\"}\n")
+        .write_all(b"{\"type\":\"tool_use\"}\n")
         .unwrap();
-    let events = walk_once(&path, window, t_ended, &cursors, &seen).await;
+    let events = walk_once_with(&path, window, t_decode_lifecycle, t_ended, &cursors, &seen).await;
     assert!(
         events.iter().any(|(_, e)| matches!(
             e,
@@ -3040,7 +3281,7 @@ async fn walk_jsonl_resets_cursor_to_zero_when_known_file_truncated_below_cursor
     // `seen` is pre-claimed so this takes the normal-walk truncation arm (the
     // first-sight gate is skipped for a known file).
     let cursors = Arc::new(Mutex::new(HashMap::from([(path.clone(), 999u64)])));
-    let seen = Arc::new(Mutex::new(HashMap::from([(path.clone(), true)])));
+    let seen = Arc::new(Mutex::new(HashMap::from([(path.clone(), Sight::Claimed)])));
 
     let events = walk_once(&path, Duration::from_secs(3600), t_ended, &cursors, &seen).await;
     assert!(
@@ -3102,7 +3343,7 @@ async fn walk_jsonl_skips_a_line_whose_decoder_errors_and_advances_cursor() {
 }
 
 fn oversized_body_bytes(tail_chunks: &[Vec<u8>]) -> Vec<u8> {
-    let mut full = Vec::from(CC_HEAD_LINE_BYTES);
+    let mut full = Vec::from(HEAD_LINE_BYTES);
     while full.len() <= (1usize << 20) + 4096 {
         full.extend_from_slice(FILLER_LINE_BYTES);
     }
@@ -3112,7 +3353,7 @@ fn oversized_body_bytes(tail_chunks: &[Vec<u8>]) -> Vec<u8> {
     full
 }
 
-const CC_HEAD_LINE_BYTES: &[u8] = b"{\"type\":\"assistant\",\"cwd\":\"/repo/head\"}\n";
+const HEAD_LINE_BYTES: &[u8] = b"{\"type\":\"assistant\",\"cwd\":\"/repo/head\"}\n";
 const FILLER_LINE_BYTES: &[u8] = b"{\"type\":\"assistant\"}\n";
 
 #[tokio::test]
@@ -3122,13 +3363,13 @@ async fn task_scan_skips_empty_and_non_utf8_lines_and_still_seeds_a_dispatch() {
     let full = oversized_body_bytes(&[
         b"\n".to_vec(),
         b"\xff\xfe garbage \xff\n".to_vec(),
-        cc_task_dispatch_line("tu_x").into_bytes(),
+        task_dispatch_line("tu_x").into_bytes(),
     ]);
     tokio::fs::write(&path, &full).await.unwrap();
     let cursors = Arc::new(Mutex::new(HashMap::new()));
     let seen = Arc::new(Mutex::new(HashMap::new()));
 
-    let events = walk_oversized_cc(&path, Duration::from_secs(3600), &cursors, &seen).await;
+    let events = walk_oversized(&path, Duration::from_secs(3600), &cursors, &seen).await;
     assert_eq!(
         task_start_tuids(&events),
         vec!["tu_x".to_string()],
@@ -3148,12 +3389,12 @@ async fn task_scan_skips_a_decoder_error_line_and_still_seeds_a_later_dispatch()
                 "fixture", "x",
             ));
         }
-        crate::source::claude_code::decode_cc_line(t, s, v)
+        crate::source::omp::decode_omp_line(t, s, v)
     }
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("deleg-decode-err.jsonl");
-    let full = oversized_body(&["{\"boom\":1}\n".to_string(), cc_task_dispatch_line("tu_y")]);
+    let full = oversized_body(&["{\"boom\":1}\n".to_string(), task_dispatch_line("tu_y")]);
     tokio::fs::write(&path, &full).await.unwrap();
     let cursors = Arc::new(Mutex::new(HashMap::new()));
     let seen = Arc::new(Mutex::new(HashMap::new()));

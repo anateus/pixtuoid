@@ -45,10 +45,23 @@ default = ["native"]
 native  = ["dep:tokio", "dep:notify"]
 # The recorder writes captured lines back; without insertion order every
 # rewritten object would come out alphabetized, an edit past the sanctioned one.
-harness = ["serde_json/preserve_order"]
-# What each source depends on upstream, for pixtuoid's drift watch and its
-# tests: no shipped build reads it.
-upstream = []
+harness = [
+    "serde_json/preserve_order",
+    # The capture rig's host calls (`harness::{host, tap}`), kept off the
+    # shipped build's feature set.
+    "windows-sys/Win32_Storage_FileSystem",
+    "windows-sys/Win32_System_Com",
+    "windows-sys/Win32_System_Pipes",
+    "windows-sys/Win32_System_Registry",
+    "windows-sys/Win32_UI_Shell",
+    # A release-binary profile's download is checked against its sums file.
+    "dep:sha2",
+    # The literal census parses the decoders (`hermetic::literals`).
+    "dep:syn",
+    # A re-record's capture is read up to the ids its run mints
+    # (`harness::captures::canonical_capture`).
+    "dep:regex",
+]
 
 [dependencies]
 tokio       = { workspace = true, features = ["sync", "rt", "macros", "fs", "net", "time", "io-util"], optional = true }
@@ -66,6 +79,12 @@ enum-map    = { workspace = true }
 vec1        = { workspace = true }
 # A CLI's version and its ordering, prerelease included: `registry::parse_version`.
 semver      = { workspace = true }
+# A download's digest against its sums file or manifest: `hermetic::digest::digest_hex`.
+sha2        = { workspace = true, optional = true }
+# The literal census reads what the decoders compare (`hermetic::literals`).
+syn         = { workspace = true, optional = true }
+# The id families a re-record may rename: `harness::captures::canonical_capture`.
+regex       = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -92,7 +111,11 @@ pixtuoid-core = { path = ".", features = ["harness"] }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "fs", "net", "time", "io-util", "rt-multi-thread"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
+dunce = { workspace = true }
 temp-env = { workspace = true }
+schemars = { workspace = true }
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
 filetime = "0.2"
 insta = { workspace = true, features = ["yaml"] }
 tracing-subscriber = { workspace = true }
@@ -112,4 +135,8 @@ test = true
 
 [[example]]
 name = "hermetic"
+test = true
+
+[[example]]
+name = "tui_drive"
 test = true

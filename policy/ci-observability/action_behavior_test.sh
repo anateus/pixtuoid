@@ -155,12 +155,17 @@ cat >"$brew_bin/curl" <<'STUB'
 cat "$FAKE_FORMULA"
 STUB
 printf '#!/usr/bin/env bash\n' >"$brew_bin/cargo"
-# This tree dropped `gone-cmd`, and `connect needs-cli` fails over two lines.
+# This tree dropped `gone-cmd` and the source `renamed`, and `connect needs-cli`
+# fails with its `failed` row and two lines of cause; `wrong-id` and
+# `wrong-outcome` fail with a row the formula's assertions refuse.
 cat >"$brew_dir/target/debug/pixtuoid" <<'STUB'
 #!/usr/bin/env bash
 case "$1 ${2:-}" in
 "gone-cmd --help") exit 2 ;;
-"connect needs-cli") printf 'line one\nline two\n' && exit 1 ;;
+"connect needs-cli") printf '[{"id":"needs-cli","outcome":"failed"}]\n' && printf 'line one\nline two\n' >&2 && exit 1 ;;
+"connect renamed") printf 'unknown source\n' >&2 && exit 1 ;;
+"connect wrong-id") printf '[{"id":"other","outcome":"failed"}]\n' && exit 1 ;;
+"connect wrong-outcome") printf '[{"id":"wrong-outcome","outcome":"connected"}]\n' && exit 1 ;;
 esac
 STUB
 chmod +x "$brew_bin/curl" "$brew_bin/cargo" "$brew_dir/target/debug/pixtuoid"
@@ -192,6 +197,20 @@ assert_brew "a dropped subcommand and a failing connect" \
 { grep -q 'gone-cmd' "$brew_dir/summary" && grep -q 'needs-cli.*line one line two' "$brew_dir/summary"; } ||
     fail "the homebrew step didn't name each miss with its cause: $(<"$brew_dir/summary")"
 assert_brew "a test block this tree runs" $'  test do\n    shell_output("#{bin}/pixtuoid connect works --json")\n  end' 0
+assert_brew "an expected failure this tree fails" $'  test do\n    shell_output("#{bin}/pixtuoid connect needs-cli --json", 1)\n  end' 0
+assert_brew "an expected failure this tree passes" $'  test do\n    shell_output("#{bin}/pixtuoid connect works --json", 1)\n  end' 1
+grep -q 'exit 1, and this tree exits 0' "$brew_dir/summary" ||
+    fail "the homebrew step didn't name the exit it expected: $(<"$brew_dir/summary")"
+assert_brew "an expected failure of a source this tree renamed" $'  test do\n    shell_output("#{bin}/pixtuoid connect renamed --json", 1)\n  end' 1
+grep -q 'renamed.*print its .failed. row.*unknown source' "$brew_dir/summary" ||
+    fail "the homebrew step didn't name the missing row: $(<"$brew_dir/summary")"
+for refused in wrong-id wrong-outcome; do
+    assert_brew "an expected failure printing $refused" "  test do
+    shell_output(\"#{bin}/pixtuoid connect $refused --json\", 1)
+  end" 1
+    grep -q "$refused.*print its .failed. row" "$brew_dir/summary" ||
+        fail "the homebrew step didn't refuse $refused's row: $(<"$brew_dir/summary")"
+done
 
 # ── apt-install: a failed or stalled update or download retries under the
 # action's own bound, and the install never runs under it or after a failed
@@ -268,3 +287,77 @@ git init -q "$test_dir/no-parent" && echo a >"$test_dir/no-parent/lock" && git -
     fail "path-changed passed a diff it could not run: $(<"$test_dir/no-parent.err")"
 grep -q 'bad revision' "$test_dir/no-parent.err" ||
     fail "the parentless repo's diff did not fail on its missing parent: $(<"$test_dir/no-parent.err")"
+
+# ── hermetic-nightly.yml: one issue, titled by every uploaded leg, each report on it ──
+file_script="$(workflow_step_script .github/workflows/hermetic-nightly.yml "Open or update tracking issue")"
+file_bin="$test_dir/file-bin"
+mkdir -p "$file_bin"
+cat >"$file_bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$GH_LOG"
+case "$1 $2" in
+"issue list") echo "${FAKE_OPEN:-}" ;;
+"issue create") echo "https://github.com/o/r/issues/9" ;;
+esac
+STUB
+chmod +x "$file_bin/gh"
+file_runs="$test_dir/file-runs"
+for os in macos windows; do
+    mkdir -p "$file_runs/hermetic-runs-1-1-$os"
+    printf '# hermetic, latest CLIs on %s: Fail\n\nbody %s\n' "$os" "$os" >"$file_runs/hermetic-runs-1-1-$os/report.md"
+done
+filed() {
+    : >"$test_dir/gh.log"
+    (cd "$file_runs" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" FAKE_OPEN="$1" GH_TOKEN=t GH_REPO=o/r \
+        bash -c "$file_script") >/dev/null 2>&1 || fail "the file step exited non-zero"
+    cat "$test_dir/gh.log"
+}
+title='hermetic, latest CLIs on macos: Fail; hermetic, latest CLIs on windows: Fail'
+log="$(filed '')"
+if ! { grep -qxF "issue create --title $title --label hermetic --body-file hermetic-runs-1-1-macos/report.md" <<<"$log" &&
+    grep -qxF "issue comment 9 --body-file hermetic-runs-1-1-windows/report.md" <<<"$log"; }; then
+    fail "a new issue is not titled by both legs' H1s with both reports on it: $log"
+fi
+log="$(filed 7)"
+if ! { grep -qxF "issue edit 7 --title $title" <<<"$log" && [[ $(grep -c '^issue comment 7 --body-file' <<<"$log") == 2 ]]; }; then
+    fail "an open issue is not retitled with both legs' reports added: $log"
+fi
+# A leg whose run never finished uploads runs with no report.md: the others still file, and the step goes red.
+mkdir -p "$file_runs/hermetic-runs-1-1-linux"
+: >"$test_dir/gh.log"
+if (cd "$file_runs" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" FAKE_OPEN=7 GH_TOKEN=t GH_REPO=o/r \
+    bash -c "$file_script") >/dev/null 2>&1; then
+    fail "the file step passed with a leg that wrote no report"
+fi
+[[ $(grep -c '^issue comment 7 --body-file' "$test_dir/gh.log") == 2 ]] ||
+    fail "a leg with no report kept the others' reports off the issue: $(<"$test_dir/gh.log")"
+# A lone uploaded leg lands flat: it files under its own H1.
+flat="$test_dir/file-flat"
+mkdir -p "$flat/copilot"
+printf '# hermetic, latest CLIs on macos, shard 1: New\n\nbody\n' >"$flat/report.md"
+: >"$test_dir/gh.log"
+(cd "$flat" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" FAKE_OPEN='' GH_TOKEN=t GH_REPO=o/r \
+    bash -c "$file_script") >/dev/null 2>&1 || fail "the file step failed a lone leg that landed flat"
+grep -qxF "issue create --title hermetic, latest CLIs on macos, shard 1: New --label hermetic --body-file report.md" "$test_dir/gh.log" ||
+    fail "a lone flat leg is not filed under its H1: $(<"$test_dir/gh.log")"
+# None uploaded: a green drift files nothing, and a failed one is red.
+empty="$test_dir/file-empty"
+mkdir -p "$empty"
+: >"$test_dir/gh.log"
+(cd "$empty" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" DRIFT=success GH_TOKEN=t GH_REPO=o/r \
+    bash -c "$file_script") >/dev/null 2>&1 || fail "the file step failed a night nothing uploaded on"
+[[ ! -s "$test_dir/gh.log" ]] || fail "a night nothing uploaded on filed something: $(<"$test_dir/gh.log")"
+if (cd "$empty" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" DRIFT=failure GH_TOKEN=t GH_REPO=o/r \
+    bash -c "$file_script") >/dev/null 2>&1; then
+    fail "the file step passed a failed drift that uploaded nothing"
+fi
+# Every uploaded leg failed before its report: red, and no issue retitled or opened.
+bare="$test_dir/file-bare"
+mkdir -p "$bare/hermetic-runs-1-1-linux"
+: >"$test_dir/gh.log"
+if (cd "$bare" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" FAKE_OPEN=7 GH_TOKEN=t GH_REPO=o/r \
+    bash -c "$file_script") >/dev/null 2>&1; then
+    fail "the file step passed with no uploaded leg holding a report"
+fi
+! grep -qE '^issue (edit|create)' "$test_dir/gh.log" ||
+    fail "a night with no report touched an issue: $(<"$test_dir/gh.log")"

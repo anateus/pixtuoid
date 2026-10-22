@@ -15,7 +15,7 @@
 //! - **Keying**: `sessionId` is consistent across every event of a session, ==
 //!   the transcript's parent-DIR name, == a subagent's `subagentId`. Hook and
 //!   watcher keys therefore coalesce, and a child's tool hooks carry the
-//!   CHILD's `sessionId`, so no CC-style `active_tasks` suppression is needed.
+//!   CHILD's `sessionId`.
 //! - **Subagents**: in-process children persisted as FLAT siblings in the
 //!   normal sessions tree. Children fire NO `session_start` hook of their own
 //!   — the `subagent_start` hook (or the parent transcript's
@@ -28,8 +28,6 @@
 //!   handle, unlike Codex's for-lifetime rollout fd.
 
 use crate::source::decoder::{DecodeError, DecodeResult as Result};
-#[cfg(any(test, feature = "upstream"))]
-use crate::source::upstream::{Family, Finding, Read, Release, Repo, Siblings, Watch, When};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -53,100 +51,8 @@ const XAI_SESSION_UPDATE_METHOD: &str = "_x.ai/session/update";
 
 const XAI_SUBAGENT_SPAWNED: &str = "subagent_spawned";
 const XAI_SUBAGENT_FINISHED: &str = "subagent_finished";
-const XAI_MODEL_CHANGED: &str = "model_changed";
-const XAI_MODEL_AUTO_SWITCHED: &str = "model_auto_switched";
 const XAI_TURN_COMPLETED: &str = "turn_completed";
 const XAI_HOOK_EXECUTION: &str = "hook_execution";
-
-/// The xAI extension tags this decoder turns into events. Listed for the
-/// drift watch: the arm below ends `_ => Ok(vec![])`, so a renamed tag decodes
-/// to nothing with no breadcrumb to say so, and the upstream watch is the only
-/// signal. Pinned to the arms by
-/// `the_exported_xai_tag_set_is_exactly_what_the_arms_match`.
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const DECODED_XAI_TAGS: &[&str] = &[
-    XAI_SUBAGENT_SPAWNED,
-    XAI_SUBAGENT_FINISHED,
-    XAI_MODEL_CHANGED,
-    XAI_MODEL_AUTO_SWITCHED,
-    XAI_TURN_COMPLETED,
-    XAI_HOOK_EXECUTION,
-];
-
-/// grok-build publishes no release.
-#[cfg(any(test, feature = "upstream"))]
-pub const REPO: Repo = Repo {
-    name: "xai-org/grok-build",
-    release: Release::Branch,
-};
-
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const UPSTREAM: &[Watch] = &[
-    Watch {
-        id: "grok.xai_method",
-        ours: || vec![XAI_SESSION_UPDATE_METHOD],
-        // The module that WRITES the method into updates.jsonl owns it; the
-        // notification module only mentions it in a `///`.
-        docs: &[REPO.doc(
-            "crates/codegen/xai-grok-shell/src/session/storage/mod.rs",
-            r"const XAI_SESSION_UPDATE_METHOD\s*:",
-            "`XAI_SESSION_UPDATE_METHOD`",
-        )],
-        read: Read::RustStr {
-            item: "XAI_SESSION_UPDATE_METHOD",
-        },
-        when: When::Vanishes,
-        finding: Finding::Breaking(
-            "the whole xAI block is gated on it, so every subagent link, model change and \
-             end marker is lost",
-        ),
-        siblings: None,
-    },
-    Watch {
-        id: "grok.xai_tags",
-        ours: || DECODED_XAI_TAGS.to_vec(),
-        docs: &[REPO.doc(
-            "crates/codegen/xai-grok-shell/src/extensions/notification.rs",
-            r"pub enum SessionUpdate\b",
-            "the xAI `SessionUpdate`",
-        )],
-        read: Read::RustEnum {
-            name: "SessionUpdate",
-        },
-        when: When::Vanishes,
-        finding: Finding::Breaking(
-            "the line decodes to nothing: no subagent link, no model info, no end marker",
-        ),
-        siblings: Some(Siblings {
-            family: Family::FirstWord,
-            ignored: &[
-                (
-                    "hook_annotation",
-                    "TUI scrollback text; carries no state we render",
-                ),
-                (
-                    "subagent_progress",
-                    "cumulative per-child totals (turns, tool calls): summing a running \
-                     total into the delta-accumulating reducer double-counts (codex's \
-                     `token_count_emits_fresh_usage_from_last_reading` is the precedent)",
-                ),
-                (
-                    "turn_usage",
-                    "declared but nothing constructs it, so it never reaches \
-                     updates.jsonl; a prompt's usage rides `turn_completed.usage`",
-                ),
-                (
-                    "hook_run_started",
-                    "never in the transcript: upstream emits it through \
-                     `send_xai_notification_transient` \
-                     (session/acp_session_impl/hook_dispatch.rs), which only forwards to \
-                     the live client; a pager spinner phase whose end `hook_execution` \
-                     decodes to nothing but session_end",
-                ),
-            ],
-        }),
-    },
-];
 
 /// Decode one grok hook payload (already identified by
 /// `_pixtuoid_source == "grok"`), keyed on `sessionId`.
@@ -342,7 +248,7 @@ pub(crate) fn decode_grok_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
             }
             Ok(evs)
         }
-        "subagent_stop" | "subagent_end" => Ok(vec![AgentEvent::SessionEnd {
+        "subagent_stop" => Ok(vec![AgentEvent::SessionEnd {
             agent_id: subagent_child_id(obj, event)?,
             as_child: true,
         }]),
@@ -398,9 +304,8 @@ fn subagent_child_id(obj: &serde_json::Map<String, Value>, event: &str) -> Resul
 /// alive, and the reducer's b1 drain-cascade would then `cascade_exit` the LIVE
 /// child subtree, unrecoverably. Blocking spawns are the one shape where
 /// End == completion. Skipping Task detail elsewhere loses nothing: grok
-/// children are FIRST-CLASS (child-keyed tool hooks, no misattribution to
-/// suppress) and their ends are wire-carried, so neither job `active_tasks`
-/// exists for applies.
+/// children are FIRST-CLASS (child-keyed tool hooks) and their ends are
+/// wire-carried, so b1 has no end to infer.
 fn grok_tool_detail(tool: &str, args: Option<&Value>) -> ToolDetail {
     let is_spawn = tool == "spawn_subagent" || args.and_then(|a| a.get("subagent_type")).is_some();
     if is_spawn && spawn_is_blocking(args) {
@@ -493,39 +398,6 @@ pub(crate) fn decode_grok_line(path: &str, source: &str, v: Value) -> Result<Vec
                     as_child: true,
                 }])
             }
-            XAI_MODEL_CHANGED => {
-                let model = str_field("model_id")
-                    .filter(|s| !s.is_empty())
-                    .map(|m| ellipsize(m, MAX_DECODED_FIELD_CHARS));
-                let effort = str_field("reasoning_effort")
-                    .filter(|s| !s.is_empty())
-                    .map(|e| ellipsize(e, MAX_DECODED_FIELD_CHARS));
-                if model.is_none() && effort.is_none() {
-                    return Ok(vec![]);
-                }
-                Ok(vec![AgentEvent::ModelInfo {
-                    agent_id,
-                    model,
-                    effort,
-                }])
-            }
-            // Fires INSTEAD of `model_changed` when the persisted model is no
-            // longer available — undecoded, the flame shows the dead model
-            // until the next `_meta.modelId`-bearing update corrects it.
-            XAI_MODEL_AUTO_SWITCHED => {
-                let model = str_field("new_model_id")
-                    .filter(|s| !s.is_empty())
-                    .map(|m| ellipsize(m, MAX_DECODED_FIELD_CHARS));
-                let Some(model) = model else {
-                    crate::source::drift::missing_field(SOURCE_NAME, tag, "new_model_id");
-                    return Ok(vec![]);
-                };
-                Ok(vec![AgentEvent::ModelInfo {
-                    agent_id,
-                    model: Some(model),
-                    effort: None,
-                }])
-            }
             // The transcript twin of the `stop` hook: a tool-less turn's only
             // end signal for transcript-only setups.
             XAI_TURN_COMPLETED => Ok(vec![AgentEvent::ActivityEnd {
@@ -586,18 +458,16 @@ fn grok_transcript_tool_detail(title: &str, raw_input: Option<&Value>) -> ToolDe
     generic_tool_display(title, None)
 }
 
-/// Whether spawn args explicitly request a BLOCKING run (`false`), under EITHER
-/// spelling of the flag: the bool travels as `background` in the hook's
-/// `toolInput` (the model-facing schema's rename) and as `run_in_background` in
-/// the ACP `tool_call`'s `rawInput` (the struct's own field name). Reading both
-/// keys on both transports also survives either layer dropping its rename.
+/// Whether spawn args explicitly request a BLOCKING run (`false`): the model's
+/// `background` on both transports, since the hook's `toolInput` and a fresh
+/// `tool_call`'s `rawInput` carry its arguments as sent; the struct's own
+/// `run_in_background` rides only the later `tool_call_update` (1.0.62's run).
 /// Upstream parses the flag LENIENTLY — a model-emitted `"false"` STRING still
 /// runs blocking — which this `as_bool` read misses toward the SAFE side only:
 /// a missed `false` skips the Task detail, never over-mints it into b1.
 fn spawn_is_blocking(args: Option<&Value>) -> bool {
-    ["background", "run_in_background"]
-        .iter()
-        .find_map(|k| args.and_then(|a| a.get(k)).and_then(Value::as_bool))
+    args.and_then(|a| a.get("background"))
+        .and_then(Value::as_bool)
         == Some(false)
 }
 
@@ -799,7 +669,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_updates_meta_carries_the_model() {
-        // The shape from fixtures/grok/permission-recorded — `model_changed`
+        // The shape from fixtures/grok/permission-hermetic — `model_changed`
         // never appears in a real session.
         let evs = decode_line(json!({
             "method": "session/update",
@@ -957,21 +827,17 @@ mod tests {
     }
 
     #[test]
-    fn blocking_flag_reads_both_wire_spellings_on_both_transports() {
-        for key in ["background", "run_in_background"] {
-            let blocking = json!({"subagent_type": "explore", key: false});
-            assert!(
-                grok_tool_detail("spawn_subagent", Some(&blocking)).is_task(),
-                "hook side must read {key}"
-            );
-            assert!(
-                grok_transcript_tool_detail("Spawn subagent", Some(&blocking)).is_task(),
-                "transcript side must read {key}"
-            );
-            let background = json!({"subagent_type": "explore", key: true});
-            assert!(!grok_tool_detail("spawn_subagent", Some(&background)).is_task());
-            assert!(!grok_transcript_tool_detail("Spawn subagent", Some(&background)).is_task());
-        }
+    fn blocking_flag_is_the_models_background_on_both_transports() {
+        let blocking = json!({"subagent_type": "explore", "background": false});
+        assert!(grok_tool_detail("spawn_subagent", Some(&blocking)).is_task());
+        assert!(grok_transcript_tool_detail("Spawn subagent", Some(&blocking)).is_task());
+        let background = json!({"subagent_type": "explore", "background": true});
+        assert!(!grok_tool_detail("spawn_subagent", Some(&background)).is_task());
+        assert!(!grok_transcript_tool_detail("Spawn subagent", Some(&background)).is_task());
+        // The struct's spelling rides no line either transport reads.
+        let structs_spelling = json!({"subagent_type": "explore", "run_in_background": false});
+        assert!(!grok_tool_detail("spawn_subagent", Some(&structs_spelling)).is_task());
+        assert!(!grok_transcript_tool_detail("Spawn subagent", Some(&structs_spelling)).is_task());
         // A model-emitted STRING "false" (upstream parses leniently).
         let lenient = json!({"subagent_type": "explore", "background": "false"});
         assert!(!grok_tool_detail("spawn_subagent", Some(&lenient)).is_task());
@@ -1117,27 +983,23 @@ mod tests {
     }
 
     #[test]
-    fn both_subagent_stop_spellings_end_the_child_as_child() {
-        // grok's docs name SubagentStop, but upstream's finish site fires
-        // SubagentEnd — whichever spelling a build emits must decode.
-        for event in ["subagent_stop", "subagent_end"] {
-            let mut v = envelope(event);
-            v["subagentId"] = json!("0197fa31-child");
-            v["subagentType"] = json!("explore");
-            v["exitCode"] = json!(0);
-            let evs = decode_all(v);
-            assert_eq!(evs.len(), 1);
-            assert!(
-                matches!(&evs[0], AgentEvent::SessionEnd { agent_id, as_child: true }
-                    if *agent_id == AgentId::from_parts(SOURCE_NAME, "0197fa31-child")),
-                "{event} must end the CHILD with the as_child stamp"
-            );
-        }
+    fn subagent_stop_ends_the_child_as_child() {
+        let mut v = envelope("subagent_stop");
+        v["subagentId"] = json!("0197fa31-child");
+        v["subagentType"] = json!("explore");
+        v["exitCode"] = json!(0);
+        let evs = decode_all(v);
+        assert_eq!(evs.len(), 1);
+        assert!(
+            matches!(&evs[0], AgentEvent::SessionEnd { agent_id, as_child: true }
+                if *agent_id == AgentId::from_parts(SOURCE_NAME, "0197fa31-child")),
+            "subagent_stop must end the CHILD with the as_child stamp"
+        );
     }
 
     #[test]
     fn subagent_events_without_subagent_id_are_malformed() {
-        for event in ["subagent_start", "subagent_stop", "subagent_end"] {
+        for event in ["subagent_start", "subagent_stop"] {
             assert!(
                 decode_grok_hook_payload(&envelope(event)).is_err(),
                 "{event} without subagentId must bail"
@@ -1217,22 +1079,6 @@ mod tests {
     fn acp_line(update: Value) -> Value {
         json!({"timestamp": 1721131200u64, "method": "session/update",
                "params": {"sessionId": "0197fa30-sess", "update": update}})
-    }
-
-    #[test]
-    fn model_info_surfaces_when_only_one_of_model_or_effort_is_present() {
-        for (field, value) in [("model_id", "grok-4"), ("reasoning_effort", "high")] {
-            let evs = decode_line(json!({
-                "timestamp": 1721131200u64, "method": "_x.ai/session/update",
-                "params": {"sessionId": "0197fa30-sess",
-                           "update": {"sessionUpdate": "model_changed", field: value}}
-            }));
-            assert!(
-                evs.iter()
-                    .any(|e| matches!(e, AgentEvent::ModelInfo { .. })),
-                "{field} alone must still surface ModelInfo, got {evs:?}"
-            );
-        }
     }
 
     #[test]
@@ -1340,8 +1186,7 @@ mod tests {
     #[test]
     fn transcript_blocking_spawn_is_task_background_is_not() {
         // In a live capture the transcript's rawInput carried the CLIENT-form
-        // `background` key, not the canonical `run_in_background`; the
-        // cross-spelling test covers both.
+        // `background` key, not the struct's `run_in_background`.
         let blocking = decode_line(acp_line(json!({
             "sessionUpdate": "tool_call", "toolCallId": "call-0b8fe95b-2070-4e76-a5c7-036d4ad88f12-0",
             "title": "spawn_subagent",
@@ -1363,52 +1208,33 @@ mod tests {
         );
     }
 
-    /// The exported tag set is exactly what the arms match.
-    ///
-    /// Two copies otherwise: a tag added to an arm but not the export leaves it
-    /// unwatched, and one dropped from an arm but not the export watches a name
-    /// we no longer read. The bare-word probe is a control — an unread tag must
-    /// reach neither arm.
+    /// Each xAI tag reaches a real arm. The bare-word probe is a control — an
+    /// unread tag must reach neither arm.
     #[test]
-    fn the_exported_xai_tag_set_is_exactly_what_the_arms_match() {
+    fn each_xai_tag_reaches_an_arm() {
         let reaches = |tag: &str| {
             let mut evs = 0;
             let logs = crate::test_capture::capture_logs(|| {
                 evs = decode_line(xai_line(json!({
                     "sessionUpdate": tag,
                     "child_session_id": "c", "subagent_id": "s",
-                    "model_id": "m", "new_model_id": "m2",
                     "event_name": "session_end", "runs": [],
                 })))
                 .len();
             });
             evs > 0 || logs.contains(crate::source::drift::TARGET)
         };
-        for tag in DECODED_XAI_TAGS {
+        for tag in [
+            XAI_SUBAGENT_SPAWNED,
+            XAI_SUBAGENT_FINISHED,
+            XAI_TURN_COMPLETED,
+            XAI_HOOK_EXECUTION,
+        ] {
             assert!(reaches(tag), "{tag} must reach a real arm");
         }
         assert!(
             !reaches("checkpoint_saved"),
             "an unread tag reaches neither"
-        );
-
-        // The auto-switch arm reads `new_model_id`, not `model_changed`'s
-        // `model_id` — a payload carrying only the WRONG field must not emit.
-        let only = |field: &str| {
-            decode_line(xai_line(
-                json!({"sessionUpdate": XAI_MODEL_AUTO_SWITCHED, field: "m2"}),
-            ))
-        };
-        assert!(
-            matches!(
-                only("new_model_id").as_slice(),
-                [AgentEvent::ModelInfo { model: Some(_), .. }]
-            ),
-            "new_model_id alone must emit ModelInfo"
-        );
-        assert!(
-            only("model_id").is_empty(),
-            "model_id alone must NOT satisfy the auto-switch arm"
         );
     }
 
@@ -1495,9 +1321,9 @@ mod tests {
         }
     }
 
-    /// `child_session_id` is required on every subagent update
-    /// (`xai-grok-shell/src/extensions/notification.rs`), so it alone keys the
-    /// child: a line without it is not one grok writes.
+    /// `child_session_id` is required on every subagent update, so it alone keys
+    /// the child (`crates/codegen/xai-grok-shell/src/extensions/notification.rs:679,753`
+    /// at `37949780c1`): a line without it is not one grok writes.
     #[test]
     fn a_subagent_update_keys_its_child_by_child_session_id_alone() {
         for tag in ["subagent_spawned", "subagent_finished"] {
@@ -1522,20 +1348,6 @@ mod tests {
             matches!(&evs[..], [AgentEvent::SessionEnd { agent_id, as_child: true }]
                 if *agent_id == AgentId::from_parts(SOURCE_NAME, "0197fa31-child"))
         );
-    }
-
-    #[test]
-    fn model_changed_line_is_a_model_and_effort_observation() {
-        let evs = decode_line(xai_line(json!({
-            "sessionUpdate": "model_changed",
-            "model_id": "grok-4-code",
-            "reasoning_effort": "high"
-        })));
-        assert!(
-            matches!(&evs[..], [AgentEvent::ModelInfo { model: Some(m), effort: Some(e), .. }]
-                if m == "grok-4-code" && e == "high")
-        );
-        assert!(decode_line(xai_line(json!({"sessionUpdate": "model_changed"}))).is_empty());
     }
 
     #[test]
@@ -1586,7 +1398,7 @@ mod tests {
 
     /// Nothing on grok's TRANSCRIPT axis breadcrumbs — not a new method, not a
     /// new ACP tag, not a per-token chunk. A name we never read is noise on both
-    /// sides; the ones we DO read are drift-watched (`just drift-watch`).
+    /// sides.
     #[test]
     fn no_transcript_line_breadcrumbs_however_new_its_method_or_tag() {
         for v in [

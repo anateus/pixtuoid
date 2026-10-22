@@ -194,6 +194,8 @@ fn each_bridge_round_coalesces_both_transports_onto_one_id() {
         "approval-recorded",
         "denial-recorded",
         "bridge-run-recorded",
+        "permission-hermetic",
+        "tool-run-hermetic",
     ] {
         let dir = super::captures::sources_root().join(format!("omp/fixtures/{scenario}"));
         let transcript = super::captures::transcripts_in(&dir)
@@ -253,7 +255,7 @@ fn each_bridge_round_coalesces_both_transports_onto_one_id() {
             hook_events[hook_tail].clone(),
             Transport::Hook,
         );
-        if scenario != "bridge-run-recorded" {
+        if !matches!(scenario, "bridge-run-recorded" | "tool-run-hermetic") {
             // One gated bash call per round; the cross-transport twins and the
             // approval resume must fold into ONE count.
             let count = scene
@@ -271,8 +273,8 @@ fn each_bridge_round_coalesces_both_transports_onto_one_id() {
 /// the previous slot leaves without waiting for the stale sweep.
 #[test]
 fn a_recorded_switch_ends_the_previous_session_and_starts_the_current() {
-    let evs = events("switch-recorded");
-    let raw: Vec<serde_json::Value> = lines("switch-recorded")
+    let evs = events("new-session-hermetic");
+    let raw: Vec<serde_json::Value> = lines("new-session-hermetic")
         .iter()
         .map(|l| serde_json::from_str(l).expect("valid json"))
         .collect();

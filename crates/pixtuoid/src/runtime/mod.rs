@@ -34,8 +34,6 @@ pub(crate) const FALLBACK_DESKS: usize = 16;
 #[derive(Debug)]
 pub(crate) struct RunConfig {
     pub(crate) socket: Option<PathBuf>,
-    pub(crate) projects_root: Option<PathBuf>,
-    pub(crate) codex_sessions_root: Option<PathBuf>,
     pub(crate) desk_cap: Option<usize>,
     pub(crate) headless: bool,
     pub(crate) config_path: PathBuf,
@@ -55,8 +53,8 @@ pub(crate) struct RunConfig {
     /// Resolved `[audio]` settings — muted defaults TRUE (the lazy spawn waits for the
     /// first `m`), volume pre-clamped by `config::resolve_audio`. Headless ignores it.
     pub(crate) audio: crate::config::AudioConfig,
-    /// Resolved by `config::resolve_graphics`. Headless and `floating` ignore it.
-    pub(crate) graphics: crate::GraphicsMode,
+    /// `--protocol` over `config::resolve_look`'s mode. Headless and `floating` ignore it.
+    pub(crate) look: crate::graphics::LookChoice,
     /// Resolved by `config::resolve_motion`; `auto` is what the TUI's graphics
     /// plan affords, and Full in the floating window.
     pub(crate) motion: crate::config::MotionMode,

@@ -602,7 +602,6 @@ pub(crate) struct KeyCtx<'a, H: Host> {
     pub(crate) config_path: &'a std::path::Path,
     pub(crate) connected: &'a crate::runtime::ConnectedSources,
     pub(crate) snapshot: &'a pixtuoid_core::state::SceneState,
-    pub(crate) focus_roots: &'a (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
     pub(crate) now: SystemTime,
     /// Injected because the real `crate::audio::respawn` opens an output device, so a
     /// test firing an audio arm would grab the machine's sound hardware.
@@ -684,7 +683,7 @@ pub(crate) fn apply_key_action<H: Host>(action: KeyAction, cx: &mut KeyCtx<'_, H
                 .dashboard_focus()
                 .and_then(|id| cx.snapshot.agents.get(&id))
             {
-                crate::focus::focus_slot(slot, cx.focus_roots);
+                crate::focus::focus_slot(slot);
             }
         }
         KeyAction::ToggleConnection => {
@@ -1448,12 +1447,12 @@ mod dispatch_tests {
         let cfg = tmp.path().join("config.toml");
         let connected = crate::runtime::ConnectedSources::default();
 
-        let res = connect_source(&cfg, &connected, "antigravity", "Antigravity");
+        let res = connect_source(&cfg, &connected, "copilot", "Copilot CLI");
         assert!(res.contains("connected"), "result: {res}");
-        assert!(connected.is_connected("antigravity"), "gate opened");
+        assert!(connected.is_connected("copilot"), "gate opened");
         let written = std::fs::read_to_string(&cfg).unwrap();
         assert!(
-            written.contains("antigravity") && written.contains("true"),
+            written.contains("copilot") && written.contains("true"),
             "the flag was persisted: {written}"
         );
     }
@@ -1462,16 +1461,15 @@ mod dispatch_tests {
     fn disconnect_source_persists_then_closes_the_gate() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg = tmp.path().join("config.toml");
-        let connected = crate::runtime::ConnectedSources::new(
-            std::iter::once("antigravity".to_string()).collect(),
-        );
+        let connected =
+            crate::runtime::ConnectedSources::new(std::iter::once("copilot".to_string()).collect());
 
-        let res = disconnect_source(&cfg, &connected, "antigravity", "Antigravity");
+        let res = disconnect_source(&cfg, &connected, "copilot", "Copilot CLI");
         assert!(res.contains("disconnected"), "result: {res}");
-        assert!(!connected.is_connected("antigravity"), "gate closed");
+        assert!(!connected.is_connected("copilot"), "gate closed");
         let written = std::fs::read_to_string(&cfg).unwrap();
         assert!(
-            !written.contains("antigravity"),
+            !written.contains("copilot"),
             "the flag was dropped: {written}"
         );
     }
@@ -1486,10 +1484,10 @@ mod dispatch_tests {
         let cfg = blocker.join("config.toml");
         let connected = crate::runtime::ConnectedSources::default();
 
-        let res = connect_source(&cfg, &connected, "antigravity", "Antigravity");
+        let res = connect_source(&cfg, &connected, "copilot", "Copilot CLI");
         assert!(res.contains("failed"), "must report the failure: {res}");
         assert!(
-            !connected.is_connected("antigravity"),
+            !connected.is_connected("copilot"),
             "a failed persist must NOT open the gate (else restart re-evicts)"
         );
     }
@@ -1500,18 +1498,17 @@ mod dispatch_tests {
     fn a_failed_disconnect_leaves_the_gate_on_the_fact() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cfg = tmp.path().join("config.toml");
-        std::fs::write(&cfg, "[sources]\nantigravity = true\n").unwrap();
-        let connected = crate::runtime::ConnectedSources::new(
-            std::iter::once("antigravity".to_string()).collect(),
-        );
+        std::fs::write(&cfg, "[sources]\ncopilot = true\n").unwrap();
+        let connected =
+            crate::runtime::ConnectedSources::new(std::iter::once("copilot".to_string()).collect());
         // A held lock refuses the rewrite (`lock_config` fails on contention)
         // while the flag still reads back.
         let held = crate::install::io::lock_config(&cfg).unwrap();
-        let res = disconnect_source(&cfg, &connected, "antigravity", "Antigravity");
+        let res = disconnect_source(&cfg, &connected, "copilot", "Copilot CLI");
         drop(held);
         assert!(res.contains("disconnect failed"), "result: {res}");
         assert!(
-            connected.is_connected("antigravity"),
+            connected.is_connected("copilot"),
             "still flagged on disk, so still connected"
         );
     }

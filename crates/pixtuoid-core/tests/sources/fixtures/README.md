@@ -8,7 +8,6 @@ scenarios; `just capture-fixture <source> <scenario> <cmd...>` the rest, profile
 
 ```text
 just capture-fixture kimi tool-run kimi -p '{prompt}'
-just capture-fixture openclaw lifecycle scripts/lib/capture-openclaw-lifecycle.sh '{prompt}'
 ```
 
 A hand-written fixture pins whatever its author believed the wire looked like, and that belief is what the fixture then teaches every later reader.
@@ -24,9 +23,9 @@ redacted cwd and an invented one look alike. `origin` is one of:
 
 | origin | required | means |
 | --- | --- | --- |
-| `recorded` | `cli`, `version`, `captured`, `command` | real wire bytes — a real CLI's against a scripted model where `aimock` and `script` name it — stripped of every subtree no decoder reads — unless `deidentified.method` is `none`, a reviewed per-capture exemption with its reason for a test that reads raw bytes the decoder drops; the recorder writes this file itself |
-| `composed` | `note` | hand-written, and the note says how you can tell |
-| `unknown` | `note` | predates the rule; nobody recorded where it came from |
+| `recorded` | `cli`, `version`, `captured`, `command` | Real wire bytes, a real CLI's against a scripted model where `aimock` and `script` name it, stripped of every subtree no decoder reads unless `deidentified` exempts them; the recorder writes this file itself. |
+| `composed` | `note` | Hand-written, and the note says how you can tell. |
+| `unknown` | `note` | Predates the rule; nobody recorded where it came from. |
 
 **The recorder blanks what no decoder reads before the bytes land**, and
 `deidentified` in the provenance says how many subtrees went. A plugin roster, a
@@ -46,15 +45,13 @@ premise the decoder drops on purpose — a test reads it off the raw bytes, whic
 no probe can see — declares `"deidentified": {"method": "none", "why": …}` and
 both paths leave it alone; the gate refuses the exemption without its reason.
 
-The table above is not the schema — [`provenance.schema.json`](provenance.schema.json)
-is, and both readers (this table and
-`every_capture_declares_a_valid_origin_with_its_required_fields`) read it. They
-each carried their own copy until #929, and had drifted apart.
+The table above is not the schema — [`Provenance`](../../../src/harness/provenance.rs)
+is: a record it does not parse fails every test that walks the captures, and
+`the_fixtures_readme_states_each_origin` pins this table to it.
 
-`every_capture_declares_a_valid_origin_with_its_required_fields` enforces the schema, and its
-`NO_WIRE_EVIDENCE_YET` list — the hook-only sources with no recorded scenario at
-all — only shrinks: recording one forces its entry out, and a new hook-only CLI
-cannot join by default.
+`captures.rs`'s `NO_WIRE_EVIDENCE_YET` list — the hook-only sources with no
+recorded scenario at all — only shrinks: recording one forces its entry out, and
+a new hook-only CLI cannot join by default.
 
 **The recorder is `pixtuoid-core/examples/capture_fixture.rs`** — Rust rather
 than the shell script it replaces, for the reasons under "Why the recorder is a
@@ -81,17 +78,17 @@ there (omp's bridge rounds), else to the conformance root — where a new
 directory would be auto-scanned by `conformance.rs` with no committed bytes
 beside it for the `.new` no-clobber rule to protect.
 
-**Re-recording an existing scenario needs a hand** unless the tier records it:
-`just hermetic --record` replaces a fixture's bytes whole, and git holds the diff.
-`just capture-fixture` never overwrites committed bytes: it writes `<name>.new`
-beside them to be diffed, not trusted, and since only `*.jsonl` and
-`provenance.json` are read, one you do not promote costs a billed turn and changes
-nothing. Diff the pair, then `mv` the `.new` over the old one or delete it.
+**Re-recording an existing scenario needs a hand** unless the tier records it. The tier keeps a
+fixture whose record, its `dropped` among its fields, equals the run's but for `captured`, and
+whose bytes match the run's up to the ids an `ID_FAMILIES` row (`harness::captures`) names; else
+`just hermetic --record` replaces both whole. `just capture-fixture` never overwrites committed
+bytes: it writes `<name>.new` beside them to diff, not trust; only `*.jsonl` and
+`provenance.json` are read, so one you do not `mv` over the old changes nothing.
 
-**A capture can only be recorded on Unix.** The recorder listens on a
-`UnixListener`; the Windows shim speaks a named pipe, so there is no Windows arm
-and `just capture-fixture` exits 2 there. Windows wire evidence therefore cannot
-be re-recorded on demand — which is why `copilot/tool-run`, the one fixture
+**A capture is recorded only on Unix.** The corpus pins Unix realpaths and cwds,
+so on Windows the recorder writes only a raw `--out` capture and
+refuses to record or promote. Windows wire evidence therefore cannot be
+re-recorded on demand — which is why `copilot/tool-run`, the one fixture
 carrying a real Windows `cwd`, stays `unknown` rather than being replaced.
 
 Only ONE edit is allowed after the recorder's own strip: redact PII the strip
@@ -151,18 +148,17 @@ tests/sources/fixtures/<source>/<scenario>/
 ```
 
 A scenario ships the transports its source actually has: both files
-(CC/Codex), transcript-only (antigravity — no hooks), or hook-payloads-only
+(CC/Codex), transcript-only (copilot — no hooks), or hook-payloads-only
 (reasonix — hook-only, no watchable JSONL).
 
-**A transcript whose id comes from its PARENT DIR must keep that dir.** grok and
-copilot are the two (`path.parent()` in their `*_id_from_path`); everything else
-keys on the filename. Flattened, the session id becomes the SCENARIO NAME, and
+**A transcript whose id comes from its PARENT DIR must keep that dir.**
+Flattened, the session id becomes the SCENARIO NAME, and
 the hook-vs-JSONL coalesce assertion then compares a real id against a directory
 name — `grok/permission-flow` passed for months only because its hooks were
 composed to declare `sessionId: "permission-flow"`. So a recorded grok scenario
-nests: `<scenario>/<session-uuid>/updates.jsonl`. The recorder decides this by
-asking the registry's own `path_filter_for` whether the basename repeats across
-sessions, and the harness recurses to find it.
+nests: `<scenario>/<session-uuid>/updates.jsonl`. The recorder keeps the fewest
+parent dirs that leave the registry's own `id_deriver_for` id unchanged, and the
+harness recurses to find it.
 
 (This tree is **conformance-scanned ONLY** — `conformance.rs` asserts every dir
 here is a registered source. Single-owner fixtures read by one module — decode's
@@ -181,25 +177,15 @@ The harness, for each fixture dir:
 `{{TRANSCRIPT_PATH}}` in a hook payload's `transcript_path` is replaced at
 runtime with the fixture's transcript file path (for a hook-only scenario: the
 scenario dir's relative path), so a CC hook (which coalesces on
-`transcript_path`) lines up with its JSONL file. Codex carries it too — to
-prove Codex *ignores* it and still coalesces on `session_id`.
+`transcript_path`) lines up with its JSONL file.
 
-**Adding a CLI:** drop a new `fixtures/<source>/<scenario>/` dir — the decoder
-comes from the source's `SourceDescriptor` row in `source/registry.rs` (a
-hook-only row, `transcript: None`, ships only `hook-payloads.jsonl` instead
-of a transcript). Run `cargo insta review` to accept the generated snapshot.
-No harness edit, no other test code.
+**Adding a CLI:** [the test steps](../../AGENTS.md#adding-a-new-agent-cli--the-test-steps).
 
 ## Where a scenario's own story lives
 
-Each scenario declares itself in its `provenance.json` `note` — that is the
-single place, and it sits beside the bytes it describes. This section used to
-carry a per-scenario catalogue plus one blanket claim that everything here was
-"derived from real sessions, then sanitized"; both are retired. The blanket
-claim was the thing the provenance rule replaced (it could not distinguish a
-capture from a composition, which is the whole problem), and the catalogue
-described five scenarios that no longer exist — a list of directories rots the
-moment one is re-recorded under a better name.
+Each scenario declares itself in its `provenance.json` `note`, the single
+place, beside the bytes it describes: a catalogue of directories here would rot
+the moment one is re-recorded under a better name.
 
 Two scenarios carry a fact BEYOND their own decode, so they are named here where
 someone changing the tree will see it:

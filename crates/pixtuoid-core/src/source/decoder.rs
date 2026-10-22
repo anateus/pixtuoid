@@ -114,6 +114,11 @@ impl DecodeError {
 /// foreign, identity-bearing cwd).
 pub(crate) type CwdExtractor = fn(&Value) -> Option<PathBuf>;
 
+/// The first-sight parent-extractor fn pointer: ONE parsed transcript line → the
+/// parent's session key it names, for a transcript whose flat path names none
+/// (`detect_parent_id` reads a nested one), on or before its cwd's line.
+pub(crate) type ParentExtractor = fn(&Value) -> Option<String>;
+
 /// Derives the opaque session-id string a transcript PATH keys its agent on —
 /// what the JSONL watcher's first-sight `SessionStart` carries, and therefore
 /// what a hook event must agree with or one session renders as two sprites.
@@ -277,7 +282,7 @@ pub(crate) fn rfc3339_to_epoch_secs(s: &str) -> Option<u64> {
 /// (startup/resume/clear/compact), so reading it would namespace the agent under
 /// "startup" and split it from the claude-code-keyed tool/JSONL/SessionEnd events:
 /// an un-reapable ghost.
-fn hook_source(obj: &serde_json::Map<String, Value>) -> &str {
+pub(crate) fn hook_source(obj: &serde_json::Map<String, Value>) -> &str {
     obj.get("_pixtuoid_source")
         .and_then(|s| s.as_str())
         .unwrap_or(crate::source::claude_code::SOURCE_NAME)
@@ -313,17 +318,17 @@ fn decodes_to_nothing(
 
 /// A source's OWN hook arms, run before the shared field requirements so an alien
 /// envelope (Reasonix: camelCase, `event` discriminator, no `session_id` at all) or
-/// a subject-changing event (SubagentStart/Stop, whose AgentId is the CHILD's)
+/// a subject-changing event (a subagent's, whose AgentId is the CHILD's)
 /// decodes in its own module. An `Extend` decoder that declines (`Ok(None)`) falls
 /// through to the shared CC-shaped arms; a `ClaimsAll` decoder cannot.
 fn source_owned_arms(
     desc: Option<&'static crate::source::registry::SourceDescriptor>,
     v: &Value,
 ) -> DecodeResult<Option<Vec<AgentEvent>>> {
-    use crate::source::registry::HookCustom;
-    match desc.and_then(|d| d.hook()).and_then(|h| h.custom) {
-        Some(HookCustom::ClaimsAll(decode)) => decode(v).map(Some),
-        Some(HookCustom::Extend(decode)) => decode(v),
+    use crate::source::registry::HookDecoding;
+    match desc.and_then(|d| d.hook()) {
+        Some(HookDecoding::ClaimsAll(decode)) => decode(v).map(Some),
+        Some(HookDecoding::Shared { extend, .. }) => extend(v),
         None => Ok(None),
     }
 }
@@ -345,45 +350,6 @@ fn hook_session_id(
             DecodeError::missing_in(source, event, "session_id")
         })
         .map(str::to_string)
-}
-
-/// The per-session key is registry DATA (`HookDecoding::id_key`), never a name
-/// match. Codex MUST use `session_id`, since its `transcript_path` is
-/// `string | null` and keying on the path would split hook and JSONL into two
-/// sprites; CC keys on it because that UUID equals its transcript filename stem, so
-/// a subagent→parent link survives a git-worktree cwd-split.
-fn hook_agent_id(
-    desc: Option<&'static crate::source::registry::SourceDescriptor>,
-    obj: &serde_json::Map<String, Value>,
-    source: &str,
-    session_id: &str,
-) -> AgentId {
-    use crate::source::registry::IdKey;
-    // Normalized: fold `\`→`/` + lowercase on Windows, so the hook key and the JSONL
-    // watcher key hash to the same AgentId.
-    let normalized_transcript_path: String;
-    let id_key = match desc
-        .and_then(|d| d.hook())
-        .map_or(IdKey::TranscriptPathThenSessionId, |h| h.id_key)
-    {
-        // A UUID, deliberately NOT normalized — case folding could collide two
-        // variants that differ only in case.
-        IdKey::SessionId => session_id,
-        IdKey::TranscriptPathThenSessionId => {
-            match obj
-                .get("transcript_path")
-                .and_then(|s| s.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                Some(tp) => {
-                    normalized_transcript_path = normalize_path_key(tp);
-                    &normalized_transcript_path
-                }
-                None => session_id,
-            }
-        }
-    };
-    AgentId::from_parts(source, id_key)
 }
 
 /// The identity context the tool/permission arms attach ahead of their activity
@@ -423,6 +389,10 @@ fn hook_effort(agent_id: AgentId, obj: &serde_json::Map<String, Value>) -> Optio
         })
 }
 
+/// Where the shim stamps an installed command's `--hook-event`, for a CLI whose
+/// payload names no event.
+pub const EVENT_STAMP: &str = "_pixtuoid_event";
+
 /// Decode one hook payload into the event sequence the reducer applies.
 ///
 /// The tool/permission arms (PreToolUse / PostToolUse / Notification /
@@ -452,10 +422,10 @@ pub fn decode_hook_payload(v: Value) -> DecodeResult<Vec<AgentEvent>> {
 
 /// The shared CC-shaped arms, for every source whose row has no claiming decoder.
 /// `UserPromptSubmit` ALSO emits `SessionStart` (idempotent in the reducer) because
-/// Codex's tool hooks fire only for shell/apply_patch/MCP — ~25 other handlers fire
-/// nothing (openai/codex#20204) — and hook firing is version-unstable: a
+/// Codex's tool hooks fire for only some handlers — ~25 others fire nothing
+/// (openai/codex#20204) — and hook firing is version-unstable: a
 /// `matcher="*"` group is silently dropped, some builds emit none (openai/codex#21639).
-fn shared_hook_arms(
+pub(crate) fn shared_hook_arms(
     obj: &serde_json::Map<String, Value>,
     source: &str,
     desc: Option<&'static crate::source::registry::SourceDescriptor>,
@@ -468,13 +438,12 @@ fn shared_hook_arms(
             DecodeError::missing(source, "hook_event_name")
         })?;
     let session_id = hook_session_id(obj, source, event)?;
-    let agent_id = hook_agent_id(desc, obj, source, &session_id);
-    let tool_id_key = desc
-        .and_then(|d| d.hook())
-        .map_or(crate::source::registry::ToolIdKey::ToolUse, |h| {
-            h.tool_id_key
-        })
-        .wire_name();
+    let agent_id = AgentId::from_parts(source, &session_id);
+    let tool_id_key = match desc.and_then(|d| d.hook()) {
+        Some(crate::source::registry::HookDecoding::Shared { tool_id_key, .. }) => *tool_id_key,
+        _ => crate::source::registry::ToolIdKey::ToolUse,
+    }
+    .wire_name();
 
     match event {
         "SessionStart" => {
@@ -592,6 +561,42 @@ fn shared_hook_arms(
     }
 }
 
+/// The hook field naming the subagent that fired an event.
+pub(crate) const SUBAGENT_ID: &str = "agent_id";
+
+/// An event a subagent fired, which names it in `agent_id` beside its root's
+/// `session_id`, decoded as the subagent's own session: `session` maps the
+/// wire's `agent_id` to that session's id, and a start it decodes to is
+/// parented on the root. An event naming no subagent declines (`Ok(None)`).
+pub(crate) fn subagent_fired(
+    obj: &serde_json::Map<String, Value>,
+    source: &str,
+    session: fn(&str) -> String,
+) -> DecodeResult<Option<Vec<AgentEvent>>> {
+    let Some(agent) = obj
+        .get(SUBAGENT_ID)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let desc = crate::source::registry::descriptor_for(source);
+    let root = obj
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|root| AgentId::from_parts(source, root));
+    let mut own = obj.clone();
+    own.insert("session_id".into(), Value::from(session(agent)));
+    let mut evs = shared_hook_arms(&own, source, desc)?;
+    for e in &mut evs {
+        if let AgentEvent::SessionStart { parent_id, .. } = e {
+            *parent_id = parent_id.or(root);
+        }
+    }
+    Ok(Some(evs))
+}
+
 /// The dispatch tool's current NAME, renamed from `Task` in CC v2.1.63 with no
 /// announcement. `Workflow` (CC's fleet dispatcher) is DELIBERATELY not a second
 /// entry: its children fire no per-agent tool_use, so one months-long `active_tasks`
@@ -599,18 +604,12 @@ fn shared_hook_arms(
 /// worse desk starvation than the gap. Fleet lifecycle rides the Subagent hooks.
 const DISPATCH_TOOL: &str = "Agent";
 
-#[cfg(any(test, feature = "upstream"))]
-/// The subagent-dispatch tool NAME we still recognise, which CC's docs watch
-/// reads. A FALLBACK, not the detector: dispatch is found semantically by
-/// `subagent_type` presence, so a rename degrades to a breadcrumb rather than a
-/// miss.
-pub(crate) const DECODED_DISPATCH_NAMES: &[&str] = &[DISPATCH_TOOL];
-
 /// The detail for one tool call. The subagent dispatch is detected SEMANTICALLY, by
 /// the PRESENCE of a `subagent_type` input field — presence, not value, so a renamed
 /// tool emitting `subagent_type: null` is still caught AND still breadcrumbs the
-/// drift. The reducer keys subagent-leak suppression (`active_tasks`) and Task-drain
-/// completion on `is_task()`, so a missed dispatch silently disables both.
+/// drift. The reducer keys Delegating and an unnamed child's suppression
+/// (`active_tasks`) and Task-drain completion on `is_task()`, so a missed dispatch
+/// silently disables them.
 pub(crate) fn make_tool_detail(source: &str, tool_name: &str, input: Option<&Value>) -> ToolDetail {
     let has_subagent_type = input.and_then(|v| v.get("subagent_type")).is_some();
     let known_name = tool_name == DISPATCH_TOOL;
@@ -895,17 +894,15 @@ mod tests {
     }
     use serde_json::json;
 
-    /// The exported name IS the one the fallback matches, and it is only a
-    /// FALLBACK: `subagent_type` presence detects the dispatch on its own, so a
-    /// tool outside the set still becomes a Task when it carries the field.
+    /// The dispatch name is only a FALLBACK: `subagent_type` presence detects the
+    /// dispatch on its own, so a tool outside the name still becomes a Task when
+    /// it carries the field.
     #[test]
-    fn the_dispatch_name_set_is_exactly_what_the_fallback_matches() {
-        for name in DECODED_DISPATCH_NAMES {
-            assert!(matches!(
-                make_tool_detail("claude-code", name, None),
-                ToolDetail::Task
-            ));
-        }
+    fn the_dispatch_name_is_a_fallback_to_subagent_type_presence() {
+        assert!(matches!(
+            make_tool_detail("claude-code", DISPATCH_TOOL, None),
+            ToolDetail::Task
+        ));
         assert!(!matches!(
             make_tool_detail("claude-code", "Bash", None),
             ToolDetail::Task
@@ -977,43 +974,6 @@ mod tests {
                 assert_eq!(agent_id, AgentId::from_parts("codex", "codex-sess-1"));
                 assert_eq!(cwd, std::path::PathBuf::from("/Users/me/work/myrepo"));
             }
-            other => panic!("expected SessionStart, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn transcript_path_key_strategy_prefers_a_non_empty_path() {
-        let ev = decode_single(json!({
-            "hook_event_name": "SessionStart",
-            "session_id": "ag-sess-1",
-            "_pixtuoid_source": "antigravity",
-            "transcript_path": "/tmp/ag/brain/x.json",
-            "cwd": "/repo"
-        }));
-        match ev {
-            AgentEvent::SessionStart { agent_id, .. } => assert_eq!(
-                agent_id,
-                AgentId::from_parts(
-                    "antigravity",
-                    &crate::id::normalize_path_key("/tmp/ag/brain/x.json")
-                ),
-                "a non-empty transcript_path is the key, not session_id"
-            ),
-            other => panic!("expected SessionStart, got {other:?}"),
-        }
-        let ev = decode_single(json!({
-            "hook_event_name": "SessionStart",
-            "session_id": "ag-sess-1",
-            "_pixtuoid_source": "antigravity",
-            "transcript_path": "",
-            "cwd": "/repo"
-        }));
-        match ev {
-            AgentEvent::SessionStart { agent_id, .. } => assert_eq!(
-                agent_id,
-                AgentId::from_parts("antigravity", "ag-sess-1"),
-                "an EMPTY transcript_path falls back to session_id"
-            ),
             other => panic!("expected SessionStart, got {other:?}"),
         }
     }
@@ -1263,10 +1223,9 @@ mod tests {
                 "session_id": "s",
                 "agent_id": "child",
                 "cwd": "/repo",
-                // antigravity's row has no custom fn
-                "_pixtuoid_source": "antigravity"
+                "_pixtuoid_source": "some-future-cli"
             }));
-            assert!(ev.is_err(), "antigravity-attributed {event} must bail");
+            assert!(ev.is_err(), "an unregistered source's {event} must bail");
         }
     }
 

@@ -102,14 +102,15 @@ pub struct Target {
     /// primary is then the plugin file that carries them (a hooks file, or a
     /// manifest with the hooks inside), which this registers with the CLI.
     pub host: Option<&'static HostRegistration>,
-    /// The upstream declarations the artifacts this target installs depend on.
-    #[cfg(feature = "upstream")]
-    pub upstream: &'static [pixtuoid_core::source::upstream::Watch],
-    /// The hook names the installed artifact subscribes to: a vanish watch
-    /// carries each (`every_registered_hook_is_watched`), and a profiled CLI's
-    /// hermetic scenarios fire or owe each (`every_hook_a_profiled_cli_registers_is_fired_or_owed`).
+    /// The hook names the installed artifact subscribes to: a profiled CLI's
+    /// hermetic scenarios fire or owe each it forwards
+    /// (`every_hook_a_profiled_cli_forwards_is_fired_or_owed`).
     #[cfg(test)]
     pub(crate) registers: fn() -> Vec<&'static str>,
+    /// Those the artifact consumes itself and never forwards, so no capture
+    /// holds them.
+    #[cfg(test)]
+    pub(crate) consumes: &'static [&'static str],
 }
 
 /// Whose the primary file is: the user's, with pixtuoid's entries merged in, or
@@ -250,14 +251,6 @@ pub enum Unregistered {
     Unreachable,
 }
 
-#[cfg(feature = "upstream")]
-pub(crate) const UNFIRED_HOOK: &str =
-    "we register a hook it never fires, so the decoder is never reached (no sprite)";
-
-/// A docs page can lag the CLI, so its vanish is a likely rename, not a proven one.
-#[cfg(feature = "upstream")]
-pub(crate) const UNDOCUMENTED_HOOK: &str = "likely renamed: we register a hook it no longer fires, so the decoder is never reached (no sprite)";
-
 pub(crate) const CLAUDE: Target = Target {
     name: "claude",
     core_source: pixtuoid_core::source::claude_code::SOURCE_NAME,
@@ -282,8 +275,8 @@ pub(crate) const CLAUDE: Target = Target {
     presence_probe: crate::install::claude::detect_installed,
     post_install_hint: None,
     host: Some(&crate::install::claude::HOST),
-    #[cfg(feature = "upstream")]
-    upstream: crate::install::claude::UPSTREAM,
+    #[cfg(test)]
+    consumes: &[],
     #[cfg(test)]
     registers: || crate::install::claude::EVENTS.to_vec(),
 };
@@ -310,8 +303,8 @@ pub(crate) const CODEX: Target = Target {
         "restart Codex and trust pixtuoid's hooks at its \"Hooks need review\" prompt",
     ),
     host: Some(&crate::install::codex::HOST),
-    #[cfg(feature = "upstream")]
-    upstream: crate::install::codex::UPSTREAM,
+    #[cfg(test)]
+    consumes: &[],
     #[cfg(test)]
     registers: || crate::install::codex::CODEX_EVENTS.to_vec(),
 };
@@ -334,8 +327,8 @@ pub(crate) const REASONIX: Target = Target {
     presence_probe: crate::install::reasonix::detect_installed,
     post_install_hint: None,
     host: Some(&crate::install::reasonix::HOST),
-    #[cfg(feature = "upstream")]
-    upstream: crate::install::reasonix::UPSTREAM,
+    #[cfg(test)]
+    consumes: &[],
     #[cfg(test)]
     registers: || crate::install::reasonix::REASONIX_EVENTS.to_vec(),
 };
@@ -356,8 +349,8 @@ pub(crate) const CODEWHALE: Target = Target {
     presence_probe: crate::install::codewhale::detect_installed,
     post_install_hint: None,
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: crate::install::codewhale::UPSTREAM,
+    #[cfg(test)]
+    consumes: &[],
     #[cfg(test)]
     registers: || {
         crate::install::codewhale::CODEWHALE_EVENTS
@@ -391,8 +384,8 @@ pub(crate) const OPENCODE: Target = Target {
     presence_probe: crate::install::opencode::detect_installed,
     post_install_hint: None,
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: &[],
+    #[cfg(test)]
+    consumes: &[],
     #[cfg(test)]
     registers: crate::install::opencode::plugin_events,
 };
@@ -413,8 +406,8 @@ pub(crate) const GROK: Target = Target {
     presence_probe: crate::install::grok::detect_installed,
     post_install_hint: None,
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: crate::install::grok::UPSTREAM,
+    #[cfg(test)]
+    consumes: &[],
     #[cfg(test)]
     registers: || crate::install::grok::GROK_EVENTS.to_vec(),
 };
@@ -435,8 +428,8 @@ pub(crate) const CURSOR: Target = Target {
     presence_probe: crate::install::cursor::detect_installed,
     post_install_hint: None,
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: crate::install::cursor::UPSTREAM,
+    #[cfg(test)]
+    consumes: &[],
     #[cfg(test)]
     registers: || crate::install::cursor::CURSOR_EVENTS.to_vec(),
 };
@@ -458,8 +451,8 @@ pub(crate) const HERMES: Target = Target {
     presence_probe: crate::install::hermes::detect_installed,
     post_install_hint: None,
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: crate::install::hermes::UPSTREAM,
+    #[cfg(test)]
+    consumes: &[],
     #[cfg(test)]
     registers: || crate::install::hermes::HERMES_EVENTS.to_vec(),
 };
@@ -484,8 +477,6 @@ pub(crate) const OPENCLAW: Target = Target {
     // hot-load the plugin — the lobster appears on its next restart.
     post_install_hint: Some("restart the gateway to load it (openclaw gateway restart)"),
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: crate::install::openclaw::UPSTREAM,
     #[cfg(test)]
     registers: || {
         [
@@ -494,6 +485,8 @@ pub(crate) const OPENCLAW: Target = Target {
         ]
         .concat()
     },
+    #[cfg(test)]
+    consumes: crate::install::openclaw::OPENCLAW_VERDICT_EVENTS,
 };
 
 pub(crate) const KIMI: Target = Target {
@@ -514,8 +507,8 @@ pub(crate) const KIMI: Target = Target {
     presence_probe: crate::install::kimi::detect_installed,
     post_install_hint: None,
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: crate::install::kimi::UPSTREAM,
+    #[cfg(test)]
+    consumes: &[],
     #[cfg(test)]
     registers: || crate::install::kimi::KIMI_EVENTS.to_vec(),
 };
@@ -541,8 +534,8 @@ pub(crate) const DSH: Target = Target {
         "running dsh sessions (except the web profile) must restart to load the plugin",
     ),
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: crate::install::dsh::UPSTREAM,
+    #[cfg(test)]
+    consumes: &[],
     #[cfg(test)]
     registers: crate::install::dsh::plugin_events,
 };
@@ -568,8 +561,8 @@ pub(crate) const OMP: Target = Target {
     // Extensions load once at startup (`discoverAndLoadExtensions`).
     post_install_hint: Some("already-running omp sessions must restart to load the bridge"),
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: crate::install::omp::UPSTREAM,
+    #[cfg(test)]
+    consumes: &[],
     #[cfg(test)]
     registers: || {
         crate::install::forward_set(crate::install::omp::EXTENSION_TEMPLATE)
@@ -578,9 +571,47 @@ pub(crate) const OMP: Target = Target {
     },
 };
 
+pub(crate) const ANTIGRAVITY: Target = Target {
+    name: "antigravity",
+    core_source: pixtuoid_core::source::antigravity::SOURCE_NAME,
+    display_name: "Antigravity CLI",
+    default_config_path: crate::install::antigravity::default_config_path,
+    hook_command: crate::install::antigravity::hook_command,
+    primary: Primary::Config {
+        merge_install: crate::install::antigravity::merge_install,
+        merge_uninstall: crate::install::antigravity::merge_uninstall,
+        verify_schema: crate::install::antigravity::verify_schema,
+        beside: None,
+    },
+    binary_strategy: BinaryStrategy::EmbedAbsolute,
+    presence_probe: crate::install::antigravity::detect_installed,
+    post_install_hint: None,
+    host: None,
+    #[cfg(test)]
+    consumes: &[],
+    #[cfg(test)]
+    registers: || {
+        crate::install::antigravity::AG_EVENTS
+            .iter()
+            .map(|&(name, _)| name)
+            .collect()
+    },
+};
+
 pub(crate) const TARGETS: &[&Target] = &[
-    &CLAUDE, &CODEX, &REASONIX, &CODEWHALE, &OPENCODE, &CURSOR, &HERMES, &OPENCLAW, &GROK, &KIMI,
-    &OMP, &DSH,
+    &CLAUDE,
+    &CODEX,
+    &REASONIX,
+    &CODEWHALE,
+    &OPENCODE,
+    &CURSOR,
+    &HERMES,
+    &OPENCLAW,
+    &GROK,
+    &KIMI,
+    &OMP,
+    &DSH,
+    &ANTIGRAVITY,
 ];
 
 // No prod caller: prod joins on the source id via `by_source`. Kept for the
@@ -669,11 +700,19 @@ mod tests {
     }
 
     #[test]
-    fn every_hook_a_profiled_cli_registers_is_fired_or_owed() {
+    fn every_hook_a_profiled_cli_forwards_is_fired_or_owed() {
         use std::collections::BTreeSet;
         for p in pixtuoid_core::harness::hermetic::PROFILES {
-            let t = by_source(p.source).expect("a profiled CLI has an install target");
-            let registered: BTreeSet<&str> = (t.registers)().into_iter().collect();
+            // A CLI with no install target forwards no hook (copilot).
+            let forwarded: BTreeSet<&str> = by_source(p.source)
+                .map(|t| {
+                    let mut hooks = (t.registers)();
+                    hooks.retain(|h| !t.consumes.contains(h));
+                    hooks
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
             let accounted: BTreeSet<&str> = p
                 .scenarios
                 .iter()
@@ -681,9 +720,9 @@ mod tests {
                 .chain(p.not_yet.iter().copied())
                 .collect();
             assert_eq!(
-                registered, accounted,
-                "{}: a registered hook no scenario fires belongs in not_yet; \
-                 an expected or not_yet hook the install never registers is stale",
+                forwarded, accounted,
+                "{}: a forwarded hook no scenario fires belongs in not_yet; \
+                 an expected or not_yet hook the install never forwards is stale",
                 p.source
             );
         }

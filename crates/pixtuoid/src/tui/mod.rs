@@ -384,8 +384,6 @@ pub(crate) struct TuiSession {
     pub drift: crate::doctor::DriftSeen,
     /// The persisted mute/volume, handed whole to `AudioController::new`.
     pub audio_cfg: crate::config::AudioConfig,
-    /// Focus-jump pid point-query roots: (CC projects root, Codex sessions root).
-    pub focus_roots: (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
     pub first_run: bool,
 }
 
@@ -507,7 +505,6 @@ pub(crate) async fn run_tui(session: TuiSession) -> Result<Option<QuitSignal>> {
         connected,
         log,
         drift,
-        focus_roots,
         first_run,
         audio_cfg,
     } = session;
@@ -537,10 +534,7 @@ pub(crate) async fn run_tui(session: TuiSession) -> Result<Option<QuitSignal>> {
         log,
         drift,
         connected: &connected.snapshot(),
-        cutaway: crate::version::CutawayTip {
-            off: plan.graphics_off(),
-            drawable: crate::graphics::names_a_cutaway_terminal(),
-        },
+        terminal_cutaway: matches!(plan, crate::graphics::Plan::Cutaway { .. }),
     });
     renderer.warm(&scene_rx.borrow().clone(), &pack, ui.now());
     let mut cap_sweep = FloorCapacitySweep::new();
@@ -588,7 +582,6 @@ pub(crate) async fn run_tui(session: TuiSession) -> Result<Option<QuitSignal>> {
                                 config_path: &config_path,
                                 connected: &connected,
                                 snapshot: &snapshot,
-                                focus_roots: &focus_roots,
                                 now,
                                 respawn: crate::audio::respawn,
                                 installed: crate::sources::detect,
@@ -606,7 +599,7 @@ pub(crate) async fn run_tui(session: TuiSession) -> Result<Option<QuitSignal>> {
                         &mut ui,
                         &mut renderer,
                         &scene_rx,
-                        |slot| crate::focus::focus_slot(slot, &focus_roots),
+                        crate::focus::focus_slot,
                         now,
                     ),
                     _ => {}
@@ -1161,7 +1154,6 @@ mod apply_key_action_tests {
         audio_ctl: crate::audio::AudioController,
         connected: crate::runtime::ConnectedSources,
         snapshot: pixtuoid_core::state::SceneState,
-        focus_roots: (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
         installed: fn() -> Vec<&'static str>,
         _tmp: tempfile::TempDir,
         config_path: std::path::PathBuf,
@@ -1199,7 +1191,6 @@ mod apply_key_action_tests {
                 ),
                 connected: crate::runtime::ConnectedSources::new(HashSet::new()),
                 snapshot: pixtuoid_core::state::SceneState::uniform(4),
-                focus_roots: (None, None),
                 installed: Vec::new,
                 _tmp: tmp,
                 config_path,
@@ -1237,7 +1228,6 @@ mod apply_key_action_tests {
                     config_path: &self.config_path,
                     connected: &self.connected,
                     snapshot: &self.snapshot,
-                    focus_roots: &self.focus_roots,
                     now: SystemTime::UNIX_EPOCH,
                     respawn: no_respawn,
                     installed: self.installed,
@@ -1263,22 +1253,22 @@ mod apply_key_action_tests {
 
     #[test]
     fn skipping_onboarding_writes_nothing() {
-        let mut h = Harness::onboarding(&["antigravity"]);
+        let mut h = Harness::onboarding(&["copilot"]);
         assert!(h.ui.onboarding_open());
         h.apply(KeyAction::OnboardingSkip);
         assert!(!h.ui.onboarding_open());
         assert!(!h.config_path.exists(), "skip must not touch the config");
-        assert!(!h.connected.is_connected("antigravity"));
+        assert!(!h.connected.is_connected("copilot"));
     }
 
     #[test]
     fn confirming_onboarding_connects_the_checked_rows_and_opens_their_gate() {
-        let mut h = Harness::onboarding(&["antigravity"]);
+        let mut h = Harness::onboarding(&["copilot"]);
         h.apply(KeyAction::OnboardingConfirm);
         assert!(!h.ui.onboarding_open());
-        assert!(h.connected.is_connected("antigravity"));
+        assert!(h.connected.is_connected("copilot"));
         let cfg = crate::config::load(&h.config_path, &mut Vec::new());
-        assert_eq!(cfg.sources, [("antigravity".to_string(), true)].into());
+        assert_eq!(cfg.sources, [("copilot".to_string(), true)].into());
     }
 
     /// `v` reopens the popup with the notices due against the LIVE connections:

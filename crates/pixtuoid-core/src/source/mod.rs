@@ -31,8 +31,8 @@ pub enum Transport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ToolDetail {
-    /// A subagent dispatch. The reducer suppresses hook-sourced Activity
-    /// events for the parent until the matching `ActivityEnd` arrives.
+    /// A subagent dispatch: the parent shows Delegating until its
+    /// `ActivityEnd`.
     Task,
     /// Any other tool.
     Generic {
@@ -137,10 +137,10 @@ pub enum AgentEvent {
         /// True ONLY when this end's SUBJECT is a CHILD agent ending *as a
         /// child*. Source-trait CONTRACT: only subagent-END decoders may stamp
         /// `true`; every other constructor stamps `false` on a root end. The
-        /// reducer's child ledger keys on the stamp — it remembers the child's
-        /// applied parent and starts the ended-recently window that blocks a
-        /// late/reordered parented re-registration, so parentless root
-        /// resurrects stay untouched by construction.
+        /// reducer's lifecycle record keys on the stamp: `true`, or any end of a
+        /// child it already knows, starts the child's gate on a late transcript
+        /// re-registration, and any other `false` from a hook makes only a hook
+        /// start revive the root for the straggler window.
         as_child: bool,
     },
     /// Emitted by a watcher once per liveness-probe refresh for EVERY session
@@ -268,6 +268,26 @@ impl AgentEvent {
             AgentEvent::Usage { agent_id, .. } => *agent_id,
         }
     }
+
+    /// Whether this event shows its session working now: the creation
+    /// polarity's evidence for a slot no start announced. A start carries its
+    /// own authority, and an end, a model, usage or title line shows nothing,
+    /// nor does [`ProofOfLife`](Self::ProofOfLife), which vouches a visible
+    /// slot past the sweeps and must never create one.
+    pub(crate) fn shows_activity(&self) -> bool {
+        match self {
+            AgentEvent::ActivityStart { .. }
+            | AgentEvent::ActivityEnd { .. }
+            | AgentEvent::Waiting { .. } => true,
+            AgentEvent::SessionStart { .. }
+            | AgentEvent::Rename { .. }
+            | AgentEvent::SessionEnd { .. }
+            | AgentEvent::ProofOfLife { .. }
+            | AgentEvent::Identity { .. }
+            | AgentEvent::ModelInfo { .. }
+            | AgentEvent::Usage { .. } => false,
+        }
+    }
 }
 
 /// The PRIMARY on-disk root a source resolves, through the SAME
@@ -310,8 +330,8 @@ pub fn cc_pid_for_session(projects_root: &std::path::Path, session_id: &str) -> 
 }
 
 /// The CC sessions-registry dir the pid queries consult — the SAME
-/// standard-layout gate the probe applies (a `--projects-root /tmp/fixture`
-/// replay yields `None`). Exposed so `doctor` can report the focus channel's
+/// standard-layout gate the probe applies (a root pointed elsewhere yields
+/// `None`). Exposed so `doctor` can report the focus channel's
 /// on-disk state without re-deriving the sibling layout.
 #[cfg(feature = "native")]
 pub fn cc_registry_dir(projects_root: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -427,10 +447,6 @@ pub mod reasonix;
 // accept descriptor/caps field changes without a breaking-version bump.
 #[doc(hidden)]
 pub mod registry;
-// `doc(hidden)` as `registry` is: read only by pixtuoid's `drift_watch`.
-#[cfg(any(test, feature = "upstream"))]
-#[doc(hidden)]
-pub mod upstream;
 
 #[cfg(all(test, unix, feature = "native"))]
 mod focus_pid_tests {
@@ -468,7 +484,7 @@ mod focus_pid_tests {
             "miss: unknown session resolves nothing"
         );
         // A NON-standard projects root (file_name != "projects") derives no
-        // registry — the custom --projects-root replay case resolves nothing.
+        // registry, so it resolves nothing.
         assert_eq!(cc_pid_for_session(home.path(), "focus-sess"), None);
     }
 
@@ -486,8 +502,8 @@ mod focus_pid_tests {
             Some(home.path().join("sessions")),
             "the standard layout derives the SIBLING sessions dir"
         );
-        // A custom --projects-root replay (file_name != "projects") derives
-        // nothing, so those runs keep the pure-mtime gate.
+        // A root pointed elsewhere (file_name != "projects") derives nothing,
+        // so it keeps the pure-mtime gate.
         assert_eq!(cc_registry_dir(&home.path().join("fixture")), None);
     }
 

@@ -10,10 +10,6 @@ use crate::source::decoder::{
 
 use crate::AgentId;
 use crate::source::AgentEvent;
-#[cfg(any(test, feature = "upstream"))]
-use crate::source::decoder::DECODED_DISPATCH_NAMES;
-#[cfg(any(test, feature = "upstream"))]
-use crate::source::upstream::{At, Doc, Finding, Read, Watch, When};
 
 #[cfg(feature = "native")]
 mod native;
@@ -21,6 +17,10 @@ mod native;
 pub use native::{ClaudeCodeSource, cc_watcher, live_cc_session_ids};
 
 /// The Claude Code source's registry name (its `SourceDescriptor.name`).
+///
+/// homebrew-core contract: the id the formula's `test do` connects, which fails
+/// with no agent CLI installed, so a rename owes a test update there right after
+/// the release that ships it (CONTRIBUTING.md#releasing).
 pub const SOURCE_NAME: &str = "claude-code";
 
 /// The label the attachment decoder synthesizes for the `ultra_effort_exit`
@@ -35,86 +35,6 @@ const ATTACHMENT_ULTRA_ENTER: &str = "ultra_effort_enter";
 const ATTACHMENT_ULTRATHINK: &str = "ultrathink_effort";
 const ATTACHMENT_ULTRA_EXIT: &str = "ultra_effort_exit";
 
-/// The `attachment` types the effort decoder synthesizes a label for. Pinned to
-/// its arms by `every_exported_set_is_exactly_its_dispatch_arms`.
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const DECODED_EFFORT_ATTACHMENTS: &[&str] = &[
-    ATTACHMENT_ULTRA_ENTER,
-    ATTACHMENT_ULTRATHINK,
-    ATTACHMENT_ULTRA_EXIT,
-];
-
-/// The installer's hook-set watch reads it too.
-#[cfg(any(test, feature = "upstream"))]
-pub const HOOKS_PAGE: Doc = Doc {
-    at: At::Url("https://code.claude.com/docs/en/hooks.md"),
-    anchor: r"(?m)^# Hooks reference",
-    owns: "the hooks-reference page",
-};
-
-/// CC is a closed binary, so its documentation is the only watchable surface.
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const UPSTREAM: &[Watch] = &[
-    Watch {
-        id: "claude_code.dispatch_names",
-        ours: || DECODED_DISPATCH_NAMES.to_vec(),
-        docs: &[Doc {
-            at: At::Url("https://code.claude.com/docs/en/tools-reference.md"),
-            anchor: r"(?m)^# Tools reference",
-            owns: "the tools-reference page",
-        }],
-        read: Read::Each {
-            pattern: "`{name}`",
-        },
-        when: When::Vanishes,
-        finding: Finding::Review(
-            "the subagent tool was renamed: dispatch is still found by `subagent_type`, but \
-             the by-name fallback is stale",
-        ),
-        siblings: None,
-    },
-    Watch {
-        id: "claude_code.burn_tier_surfaces",
-        ours: || vec!["CLAUDE_EFFORT", "receive a `model` field"],
-        docs: &[HOOKS_PAGE],
-        read: Read::Each {
-            pattern: r"\b{name}\b",
-        },
-        when: When::Vanishes,
-        finding: Finding::Review(
-            "the burn-tier hook decode reads what it documents (the effort level, \
-             SessionStart's optional model): re-verify it",
-        ),
-        siblings: None,
-    },
-    Watch {
-        id: "claude_code.lifecycle_surfaces",
-        // `session_end` in snake_case: the `SessionEnd` hook is all over the page.
-        ours: || vec!["session_end", ".claude/sessions/", "procStart"],
-        docs: &[HOOKS_PAGE],
-        read: Read::Each { pattern: "{name}" },
-        when: When::Appears,
-        finding: Finding::Review(
-            "a durable end record or the session registry may have landed: adopt it for \
-             the JSONL transport, and give the liveness probe's first-sight bypass an \
-             ended-check, which it skips only because none exists",
-        ),
-        siblings: None,
-    },
-    Watch {
-        id: "claude_code.effort_attachments",
-        ours: || DECODED_EFFORT_ATTACHMENTS.to_vec(),
-        docs: &[HOOKS_PAGE],
-        read: Read::Each { pattern: "{name}" },
-        when: When::Appears,
-        finding: Finding::Review(
-            "an attachment the decoder labels from guesswork is now documented: re-verify \
-             the label it synthesizes",
-        ),
-        siblings: None,
-    },
-];
-
 /// CC's session/agent id = the transcript filename stem, which is
 /// cwd-independent (the cwd-derived project-dir is the *parent* dir, not the
 /// stem): `<uuid>.jsonl` → `<uuid>` for a root, `agent-<id>.jsonl` →
@@ -127,11 +47,14 @@ pub fn cc_id_from_path(path: &Path) -> String {
         .to_string()
 }
 
-/// CC's source-specific hook arms — `SubagentStart`/`SubagentStop`, which change
-/// the event's SUBJECT to the child's AgentId; the shared session-keyed arms cannot,
-/// and every other CC hook event falls through (`Ok(None)`). Needed despite JSONL
-/// registration: a Workflow-tool fleet's subagents carry no `Agent` tool_use and no
-/// end marker, so without `SubagentStop` they hold desks until the stale sweep.
+/// CC's source-specific hook arms, which change the event's SUBJECT to a
+/// subagent's AgentId where the shared session-keyed arms cannot:
+/// `SubagentStart`/`SubagentStop`, and any other event a subagent fires, which
+/// names it in `agent_id` beside the ROOT's `session_id` (hooks.md: the
+/// `agent_id` and `agent_type` "that identify the subagent"). A main-thread event
+/// falls through (`Ok(None)`). Needed despite JSONL registration: a
+/// Workflow-tool fleet's subagents carry no `Agent` tool_use and no end marker,
+/// so without `SubagentStop` they hold desks until the stale sweep.
 pub(crate) fn decode_cc_hook_custom(v: &Value) -> Result<Option<Vec<AgentEvent>>> {
     let Some(obj) = v.as_object() else {
         return Ok(None); // shared path reports the malformed payload
@@ -141,7 +64,7 @@ pub(crate) fn decode_cc_hook_custom(v: &Value) -> Result<Option<Vec<AgentEvent>>
         .and_then(|s| s.as_str())
         .unwrap_or("");
     if event != "SubagentStart" && event != "SubagentStop" {
-        return Ok(None);
+        return crate::source::decoder::subagent_fired(obj, SOURCE_NAME, subagent_session);
     }
     // Registry contract: claim our two events FULLY (Err on malformed), never
     // fall through — an empty id mints a phantom that never coalesces.
@@ -151,17 +74,13 @@ pub(crate) fn decode_cc_hook_custom(v: &Value) -> Result<Option<Vec<AgentEvent>>
         .filter(|s| !s.is_empty())
         .ok_or_else(|| DecodeError::missing_in(SOURCE_NAME, event, "session_id"))?;
     let wire_agent_id = obj
-        .get("agent_id")
+        .get(crate::source::decoder::SUBAGENT_ID)
         .and_then(|s| s.as_str())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| DecodeError::missing_in(SOURCE_NAME, event, "agent_id"))?;
-    // The wire's `agent_id` is BARE hex while the watcher's id space is
-    // `agent-<id>`; the CC docs' example shows one already prefixed.
-    let prefixed = if wire_agent_id.starts_with("agent-") {
-        wire_agent_id.to_string()
-    } else {
-        format!("agent-{wire_agent_id}")
-    };
+        .ok_or_else(|| {
+            DecodeError::missing_in(SOURCE_NAME, event, crate::source::decoder::SUBAGENT_ID)
+        })?;
+    let prefixed = subagent_session(wire_agent_id);
     if event == "SubagentStart" {
         let cwd = obj.get("cwd").and_then(|s| s.as_str()).unwrap_or("").into();
         Ok(Some(vec![AgentEvent::SessionStart {
@@ -199,6 +118,17 @@ pub(crate) fn decode_cc_hook_custom(v: &Value) -> Result<Option<Vec<AgentEvent>>
     }
 }
 
+/// A subagent's session id from the wire's `agent_id`: BARE hex, while the
+/// watcher's id space is `agent-<id>`; the CC docs' example shows one already
+/// prefixed.
+fn subagent_session(wire_agent_id: &str) -> String {
+    if wire_agent_id.starts_with("agent-") {
+        wire_agent_id.to_string()
+    } else {
+        format!("agent-{wire_agent_id}")
+    }
+}
+
 /// Resolve `CLAUDE_CONFIG_DIR`. Upstream (read out of the 2.1.226 binary) is
 /// `(env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude")).normalize("NFC")` —
 /// nothing else layers on, no XDG / `%APPDATA%` / profile / legacy dir. The two
@@ -214,21 +144,23 @@ const ASSISTANT: &str = "assistant";
 const USER: &str = "user";
 
 /// The CC transcript types whose `message` payload this module decodes. CC's
-/// TRANSCRIPT has no fetchable schema, so it gets no CI drift-watch (its hooks
-/// do) and the runtime breadcrumb is the sole defense — but only these two names
-/// can break rendering, so only they may raise one. Pinned to the decode arms
+/// TRANSCRIPT has no fetchable schema: the nightly's latest-release census and
+/// this breadcrumb guard it, but only these two names can break rendering, so
+/// only they may raise one. Pinned to the decode arms
 /// by `the_decoded_set_is_exactly_what_the_arms_match`.
 const DECODED_TYPES: &[&str] = &[ASSISTANT, USER];
 
-/// Does this line carry a turn's payload? `message.role` + `message.content` is
-/// what a renamed [`DECODED_TYPES`] member would still arrive with, so it
-/// separates a rename from a merely-new sidecar type WITHOUT mirroring CC's
-/// vocabulary — the mirror is what put a drift alarm in front of every user the
-/// day CC added `history-suppression` (#935).
-fn carries_turn_payload(obj: &serde_json::Map<String, Value>) -> bool {
-    obj.get("message")
-        .and_then(Value::as_object)
-        .is_some_and(|m| m.contains_key("role") && m.contains_key("content"))
+/// Is this line a turn's record? A timestamped `message.role` +
+/// `message.content` is what a renamed [`DECODED_TYPES`] member would still
+/// arrive with, so it separates a rename from a merely-new sidecar type WITHOUT
+/// mirroring CC's vocabulary (#935); `api-request-blob` stores a request's
+/// message untimestamped (#1694).
+fn is_turn_record(obj: &serde_json::Map<String, Value>) -> bool {
+    obj.contains_key("timestamp")
+        && obj
+            .get("message")
+            .and_then(Value::as_object)
+            .is_some_and(|m| m.contains_key("role") && m.contains_key("content"))
 }
 
 /// The `attributionAgent` label, namespace-stripped and capped. `None` for an
@@ -279,7 +211,7 @@ fn fresh_spend(message: &serde_json::Map<String, Value>) -> u64 {
 }
 
 /// Decode one CC JSONL transcript line into 0..N AgentEvents, keyed on the
-/// filename STEM — the hook decoder's `IdKey::SessionId` and the watcher's
+/// filename STEM — the hook decoder's `session_id` and the watcher's
 /// deriver key the same way, so every CC keying site coalesces onto one sprite.
 /// There is deliberately NO user-content arm: content is user-controllable and a
 /// message QUOTING the slash-command wrapper would false-positive, so lifecycle
@@ -303,7 +235,7 @@ pub fn decode_cc_line(transcript_path: &str, source: &str, v: Value) -> Result<V
         if message.is_none() {
             crate::source::drift::missing_field(source, ty, "message");
         }
-    } else if !ty.is_empty() && carries_turn_payload(obj) {
+    } else if !ty.is_empty() && is_turn_record(obj) {
         crate::source::drift::unknown_event(source, ty);
     }
 
@@ -397,7 +329,7 @@ pub fn decode_cc_line(transcript_path: &str, source: &str, v: Value) -> Result<V
 
 /// The CC transcript types whose lines are AGENT TURN activity — membership by
 /// TURN-AUTHORSHIP, not by whether we decode the type. Anything else is session
-/// metadata unless it carries the turn payload (see `cc_activity_recency`): a
+/// metadata unless it is a turn record (see `cc_activity_recency`): a
 /// STARTING session writes `bridge-session` / `pr-link` runs into an OTHER,
 /// long-dead transcript, bumping the mtime first-sight trusted as liveness.
 const ACTIVITY_TYPES: &[&str] = &[
@@ -421,13 +353,13 @@ pub(crate) fn admits_transcript(path: &Path) -> bool {
 
 /// Whether one tail line is a turn: `None` when it classifies as NOTHING — a
 /// non-object, or an object with no `type` — which is not evidence the recent
-/// bytes were metadata. An UNNAMED type still counts as a turn when it carries
-/// the turn payload; the day CC renames one, reading it as "not a turn" would
+/// bytes were metadata. An UNNAMED type still counts as a turn when it is a
+/// turn record; the day CC renames one, reading it as "not a turn" would
 /// gate every live session at once.
 fn classifies_as_turn(v: &Value) -> Option<bool> {
     let obj = v.as_object()?;
     let ty = obj.get("type").and_then(|t| t.as_str())?;
-    Some(ACTIVITY_TYPES.contains(&ty) || carries_turn_payload(obj))
+    Some(ACTIVITY_TYPES.contains(&ty) || is_turn_record(obj))
 }
 
 /// When this transcript's SESSION last wrote, read from its tail — the honest
@@ -528,6 +460,51 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A subagent's tool hook names it in `agent_id` (hooks.md;
+    /// `claude/fixtures/subagent-hermetic`): every event it decodes to lands on
+    /// the subagent, Identity's session too, whatever `session_id` says.
+    #[test]
+    fn a_subagents_tool_hook_lands_on_the_subagent() {
+        let sid = "5717f13f-3c42-4a73-bfa5-3cd14932f155";
+        let child = AgentId::from_parts(SOURCE_NAME, "agent-a234ddfa51533488f");
+        let root = AgentId::from_parts(SOURCE_NAME, sid);
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "Notification",
+            "PermissionRequest",
+        ] {
+            let payload = |agent_id: Option<&str>| {
+                let mut v = json!({
+                    "hook_event_name": event, "session_id": sid, "cwd": "/repo",
+                    "transcript_path": format!("/h/.claude/projects/-repo/{sid}.jsonl"),
+                    "agent_type": "general-purpose", "tool_name": "Read", "tool_use_id": "toolu_1",
+                    "tool_input": {"file_path": "/repo/NOTE.txt"}, "message": "m",
+                    "_pixtuoid_source": SOURCE_NAME,
+                });
+                if let Some(a) = agent_id {
+                    v["agent_id"] = json!(a);
+                }
+                crate::source::decoder::decode_hook_payload(v).expect("decodes")
+            };
+            let evs = payload(Some("a234ddfa51533488f"));
+            assert!(!evs.is_empty(), "{event}");
+            assert!(
+                evs.iter().all(|e| e.agent_id() == child),
+                "{event}: {evs:?}"
+            );
+            assert!(
+                evs.iter()
+                    .any(|e| matches!(e, AgentEvent::Identity { session_id, .. }
+                    if session_id == "agent-a234ddfa51533488f")),
+                "{event}: the Identity must name the subagent's session: {evs:?}"
+            );
+            for main_thread in [payload(None), payload(Some(""))] {
+                assert!(main_thread.iter().all(|e| e.agent_id() == root), "{event}");
+            }
+        }
+    }
+
     /// The half that still has to alarm: a RENAMED turn type. It is recognised
     /// by the payload we decode, not by absence from a list, so nothing has to
     /// track CC's vocabulary for this to fire.
@@ -536,6 +513,7 @@ mod tests {
         let out = crate::test_capture::capture_logs(|| {
             let line = json!({
                 "type": "assistant-v2",
+                "timestamp": "2026-10-17T00:00:00Z",
                 "message": {"role": "assistant", "content": [], "model": "m"},
             });
             let _ = decode_cc_line("/p/s.jsonl", SOURCE_NAME, line);
@@ -561,6 +539,7 @@ mod tests {
             for ty in DECODED_TYPES {
                 let line = json!({
                     "type": ty,
+                    "timestamp": "2026-10-17T00:00:00Z",
                     "message": {"role": "assistant", "content": [block(ty)]},
                 });
                 assert!(
@@ -1119,9 +1098,13 @@ mod tests {
                 // corpus-sampled and abridged).
                 json!({"type": "atis-latch", "atis": "", "sessionId": "s"}),
                 json!({"type": "cost-state", "totalCostUSD": 0.5, "sessionId": "s"}),
+                // #1694's: a request message stored by hash since CC 2.1.300,
+                // message-shaped but untimestamped.
+                json!({"type": "api-request-blob", "hash": "h", "sessionId": "s",
+                       "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}}),
                 // TYPELESS but payload-carrying: the `!ty.is_empty()` guard, or
                 // the breadcrumb names nothing at all.
-                json!({"message": {"role": "assistant", "content": []}}),
+                json!({"timestamp": "t", "message": {"role": "assistant", "content": []}}),
                 json!({"type": "mode", "mode": "acceptEdits"}),
                 json!({"type": "last-prompt", "prompt": "hi"}),
                 json!({"type": "worktree-state"}),

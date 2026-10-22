@@ -9,7 +9,7 @@ members  = [
 ]
 
 [workspace.package]
-version      = "0.19.0"
+version      = "0.20.0"
 edition      = "2024"
 rust-version = "1.98"
 license      = "MIT"
@@ -86,11 +86,6 @@ debug = false
 # wider than any codegen-level float difference.
 opt-level = 2
 
-[profile.dev.package.pixtuoid-lofi]
-# The bank's synthesis tests render every music lane through it, the
-# workspace's other compute-bound tests.
-opt-level = 2
-
 # Opt-in full debuginfo for an actual debugger session:
 # `cargo build --profile debugging`.
 [profile.debugging]
@@ -122,7 +117,7 @@ thiserror          = "2"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 notify             = "8"
-pixtuoid-lofi      = "0.1"
+pixtuoid-lofi      = "0.2"
 ratatui            = "0.30"
 crossterm          = "0.29"
 # Terminal display-column width — the authority ratatui itself uses, so wide
@@ -130,8 +125,7 @@ crossterm          = "0.29"
 unicode-width      = "0.2"
 # Grapheme clusters, the unit ratatui's buffer writes a cell for.
 unicode-segmentation = "1"
-# Tests, and the drift watch's Rust readers (pixtuoid's `upstream` feature),
-# parse the source, so comments and strings never count.
+# Tests and the hermetic tier's literal census parse the source, so comments and strings never count.
 syn                = { version = "3", default-features = false, features = ["full", "parsing", "visit"] }
 proc-macro2        = { version = "1", default-features = false }
 clap               = { version = "4", features = ["derive"] }
@@ -147,30 +141,28 @@ strum              = { version = "0.28", default-features = false, features = ["
 # A map keyed by every variant of an enum: a pack's pieces, each present.
 enum-map           = "3.1"
 # A Vec of at least one element: an animation's frames.
-vec1               = "1.12"
+vec1               = { version = "1.12", features = ["serde"] }
 semver             = "1"
 # 0.61 to match the major tokio already pulls (via mio) on Windows — a second
 # windows-sys major would double-compile the bindings.
 windows-sys        = "0.61"
 criterion          = { package = "codspeed-criterion-compat", version = "5", default-features = false, features = ["cargo_bench_support"] }
 insta              = "1"
+schemars           = "1"
 snapbox            = "1"
 proptest           = "1"
 tempfile           = "3"
+# Dev-only: a path's canonical form without std's Windows `\\?\` prefix.
+dunce              = "1"
 # Dev-only: every test that sets or unsets an env var goes through it, behind
 # one process-wide lock.
 temp-env           = "0.3"
-# The drift watch's patterns and its release-tarball check (pixtuoid's
-# `upstream` feature). regex is already built through criterion. sha2 is new to
-# the build but already locked, and a platform hasher would need a seam of its
-# own to keep the sums check testable.
+# Dev-only: the hermetic tier's `tui_drive` runs a CLI's TUI under a pty
+# (ConPTY on Windows) and reads the screen it renders.
+portable-pty       = "0.9"
+vt100              = "0.17"
+# regex is already built through criterion; sha2 checks the hermetic tier's
+# release downloads, where a platform hasher would need a seam of its own to
+# keep the sums check testable.
 regex              = "1"
-sha2               = "0.10"
-# Its readers parse the source they read, as `syn` does for the Rust: TS
-# through oxc, Markdown through pulldown-cmark, both new to the build.
-oxc_allocator      = "0.153"
-oxc_ast            = "0.153"
-oxc_ast_visit      = "0.153"
-oxc_parser         = "0.153"
-oxc_span           = "0.153"
-pulldown-cmark     = { version = "0.13", default-features = false }
+sha2               = { version = "0.11", default-features = false }

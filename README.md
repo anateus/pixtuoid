@@ -89,7 +89,7 @@ Then:
 | <img src="docs/images/pix-icons/tree.svg" alt="" width="20" height="20"> | **Agent tree dashboard** | Tab opens a collapsible tree of every floor's agents — each badged with the CLI it runs, color-tinted by what it's doing, with tool-call counts |
 | <img src="docs/images/pix-icons/pets.svg" alt="" width="20" height="20"> | **Office pets** | A cat or dog (one per floor) roams desks, pantry, sofas; sleeps near idle agents. Click to pet — pixel-art hearts float up |
 | <img src="docs/images/pix-icons/vibes.svg" alt="" width="20" height="20"> | **Office vibes** | The sun and moon cross the skyline as the day goes by, weather rolls past the windows — rain, storm, snow, fog, overcast, windy, smog — and each theme gives the office a whole new look |
-| <img src="docs/images/pix-icons/note.svg" alt="" width="20" height="20"> | **Lofi soundtrack** | A lofi soundtrack synthesized entirely in code — no audio files shipped. Day and night tracks follow the office's clock and weather, typing sounds swell with activity, and the door chime, printer and vending machine play as coworkers come and go. `m` mutes, `+`/`-` volume |
+| <img src="docs/images/pix-icons/note.svg" alt="" width="20" height="20"> | **Lofi soundtrack** | A lofi soundtrack synthesized entirely in code — no audio files shipped. An endless run of songs follows the office's clock, weather and busyness, typing sounds swell with activity, and the door chime, printer and vending machine play as coworkers come and go. `m` mutes, `+`/`-` volume |
 | <img src="docs/images/pix-icons/window.svg" alt="" width="20" height="20"> | **Floating desktop window** | `pixtuoid floating` opens the office in a frameless, always-on-top window — on your desktop, not just in your terminal |
 <!-- features:end -->
 
@@ -134,7 +134,7 @@ at **[/config](https://pixtuoid.dev/config)**.
 
 ## How It Works
 
-Agent CLIs emit events two ways — a hook shim (a bounded fire-and-forget write to a Unix socket, or a named pipe on Windows, that can never block your agent) and JSONL transcript watching. Both feed one channel; a reducer folds events into office state; the renderer draws it as half-block pixel art, with zero terminal deps in the core.
+Agent CLIs emit events two ways — a hook shim (a bounded fire-and-forget write to a Unix socket, or a named pipe on Windows, that can never block your agent) and JSONL transcript watching. Both feed one channel; a reducer folds events into office state; the renderer draws it as pixel art — terminal images (kitty, SIXEL, iTerm2) where the terminal draws them, else half-block cells — with zero terminal deps in the core.
 
 **[Full architecture with diagrams →](https://pixtuoid.dev/architecture)** · single source: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 

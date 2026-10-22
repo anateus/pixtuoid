@@ -3,7 +3,7 @@
 //! scope tree over `parent_id` lives in [`super::scope`].
 //!
 //! **Scope:** these fns mutate ONE `AgentSlot` only. The cross-slot correlation
-//! state — `active_tasks` (subagent-leak suppression), `gated_before_waiting`
+//! state — `active_tasks` (Tasks in flight), `gated_before_waiting`
 //! (permission), the hook-wins dedup — stays in the reducer: it spans slots and
 //! is not the FSM. The reducer decides *whether* and *which* transition fires;
 //! these fns decide *how* the slot changes.
@@ -48,10 +48,10 @@ pub(crate) fn enter_active(
     slot.pending_idle_at = None;
 }
 
-/// Enter the `Active("Delegating")` state — a parent dispatched a Task, or a
-/// suppressed child event resumed a parent that was Waiting on the subagent's
-/// gate. Deliberately does NOT stamp `last_event_at`: both callers already
-/// refreshed lineage.
+/// Enter the `Active("Delegating")` state — a parent dispatched a Task, its
+/// own tool ended while one is in flight, or an unnamed child's dropped event
+/// resumed it from the child's gate. Deliberately does NOT stamp
+/// `last_event_at`: every caller already refreshed lineage.
 pub(crate) fn enter_delegating(
     slot: &mut AgentSlot,
     tool_use_id: Option<Arc<str>>,
@@ -114,8 +114,8 @@ pub(crate) fn mark_exiting(slot: &mut AgentSlot, now: SystemTime) {
 
 /// Resurrect an EXITING slot back to a live `Idle` state — a SessionStart
 /// landed on a slot mid-walkout (Reasonix `/new` fires SessionEnd+SessionStart
-/// on the same cwd-keyed id). The reducer gates this to root agents so a late
-/// duplicate can't un-exit a cascaded subagent.
+/// on the same cwd-keyed id). The reducer gates this to a root, or a child
+/// whose linked parent lives, so a late duplicate can't un-exit a cascaded one.
 pub(crate) fn resurrect_in_place(slot: &mut AgentSlot, now: SystemTime) {
     accumulate_active_ms(slot, now);
     slot.exiting_at = None;
@@ -124,10 +124,9 @@ pub(crate) fn resurrect_in_place(slot: &mut AgentSlot, now: SystemTime) {
     slot.state_started_at = now;
 }
 
-/// Apply a display rename (idempotent — a same-text rename keeps the existing
-/// label AND its provenance) and refresh liveness.
+/// Apply a display rename the label yields to, and refresh liveness.
 pub(crate) fn rename(slot: &mut AgentSlot, label: crate::state::SlotLabel, now: SystemTime) {
-    if *slot.label != *label {
+    if slot.label.yields_to(&label) {
         slot.label = label;
     }
     slot.last_event_at = now;
@@ -297,5 +296,14 @@ mod tests {
         rename(&mut s, "code-explorer".into(), t0 + Duration::from_secs(2));
         assert_eq!(&*s.label, "code-explorer");
         assert_eq!(s.last_event_at, t0 + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_rename_to_a_placeholders_own_text_makes_it_a_real_name() {
+        let t0 = SystemTime::now();
+        let mut s = active(t0);
+        s.label = crate::state::SlotLabel::ordinal_ghost("cc#1");
+        rename(&mut s, "cc#1".into(), t0);
+        assert!(!s.label.is_upgradable());
     }
 }

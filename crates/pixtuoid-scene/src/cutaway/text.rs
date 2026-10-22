@@ -2,8 +2,9 @@
 //! art pixel, never anti-aliased, in the cells [`display::text`](crate::display::text)
 //! lays it out by.
 //!
-//! Box-drawing lines and block elements are [`ruled`]; Fusion Pixel 8px and
-//! Noto Emoji supply the other glyphs (`scripts/gen-fonts.py`). A symbol is an icon
+//! Box-drawing lines and block elements are [`ruled`], and every character
+//! Fusion Pixel 8px draws as a terminal's cells comes from it
+//! (`scripts/gen-fonts.py`); a symbol is an icon, not a glyph
 //! ([`paint_icon`]). It is [`grid`](super::grid)'s world face.
 
 use pixtuoid_core::sprite::{Rgb, RgbBuffer};
@@ -17,32 +18,32 @@ use crate::display::text::{
 pub(crate) type Rows = [u8; LINE_H as usize];
 pub(crate) const LEFTMOST_PIXEL: u8 = 1 << (u8::BITS - 1);
 
-/// Fusion Pixel 8px and Noto Emoji, written by `scripts/gen-fonts.py` (its format);
+/// Fusion Pixel 8px, written by `scripts/gen-fonts.py` (its format);
 /// license and sources in `fonts/`.
 #[cfg(feature = "cutaway-assets")]
 static FUSION: &[u8] = include_bytes!("../../fonts/world.bin");
 #[cfg(not(feature = "cutaway-assets"))]
 static FUSION: &[u8] = &[];
 
-/// Generated code points, ascending, and their glyphs; `None` when the face
+/// Fusion Pixel's code points, ascending, and their glyphs; `None` when it
 /// was generated for another [`LINE_H`].
-fn fusion_font() -> Option<(&'static [[u8; 4]], &'static [Rows])> {
+fn fusion_font() -> Option<(&'static [[u8; 2]], &'static [Rows])> {
     let (&[rows, n_lo, n_hi], rest) = FUSION.split_first_chunk::<3>()?;
     if u16::from(rows) != LINE_H {
         return None;
     }
     let n = usize::from(u16::from_le_bytes([n_lo, n_hi]));
-    let (points, glyphs) = rest.split_at_checked(n * size_of::<u32>())?;
+    let (points, glyphs) = rest.split_at_checked(n * size_of::<u16>())?;
     Some((points.as_chunks().0, glyphs.as_chunks().0))
 }
 
-/// `c`'s generated glyph, if the face draws one in the cells a terminal
+/// `c`'s glyph in Fusion Pixel, if it draws one in the cells a terminal
 /// gives it.
 fn fusion(c: char) -> Option<Rows> {
     let (points, glyphs) = fusion_font()?;
-    let point = u32::from(c);
+    let point = u16::try_from(u32::from(c)).ok()?;
     let i = points
-        .binary_search_by_key(&point, |b| u32::from_le_bytes(*b))
+        .binary_search_by_key(&point, |b| u16::from_le_bytes(*b))
         .ok()?;
     glyphs.get(i).copied()
 }
@@ -576,7 +577,7 @@ mod tests {
     fn every_fusion_glyph_fits_its_characters_cells() {
         let (points, glyphs) = fusion_font().expect("the header matches LINE_H");
         assert_eq!(points.len(), glyphs.len());
-        let points: Vec<u32> = points.iter().map(|&b| u32::from_le_bytes(b)).collect();
+        let points: Vec<u16> = points.iter().map(|&b| u16::from_le_bytes(b)).collect();
         assert!(
             points.is_sorted_by(|a, b| a < b),
             "binary search needs them ascending"
@@ -585,7 +586,7 @@ mod tests {
             .iter()
             .zip(glyphs)
             .filter_map(|(&point, rows)| {
-                let c = char::from_u32(point)?;
+                let c = char::from_u32(u32::from(point))?;
                 let n = cells(c.encode_utf8(&mut [0; 4]));
                 (!fits(rows, n)).then_some((c, n))
             })

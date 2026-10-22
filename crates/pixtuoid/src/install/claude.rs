@@ -7,23 +7,15 @@ use serde_json::{Value, json};
 use crate::install::host_plugin::{self, NAME};
 use crate::install::io;
 use crate::install::merge;
-#[cfg(feature = "upstream")]
-use crate::install::target::UNDOCUMENTED_HOOK;
 use crate::install::target::{HostRegistration, LegacyConfig, Unregistered};
 use crate::install::verify::ShimRef;
-#[cfg(feature = "upstream")]
-use pixtuoid_core::source::claude_code::HOOKS_PAGE;
-#[cfg(feature = "upstream")]
-use pixtuoid_core::source::upstream::{At, Doc, Finding, Read, Watch, When};
 
 pub(crate) const EVENTS: &[&str] = &[
     "SessionStart",
     "PreToolUse",
     "PostToolUse",
     "Notification",
-    // A tool gate arrives as `PermissionRequest`; the only `Notification` a
-    // gated run fires is the idle "Claude is waiting for your input" (captured
-    // in fixtures/claude-code/permission-recorded). The decoder has read this
+    // A tool gate arrives as `PermissionRequest`. The decoder has read this
     // event since Codex needed it — unregistered, the bytes never came.
     "PermissionRequest",
     // The ONLY end signal a Workflow-fleet subagent gets: no per-agent Agent
@@ -37,86 +29,6 @@ pub(crate) const EVENTS: &[&str] = &[
 const ENABLED_PLUGINS: &str = "enabledPlugins";
 /// The `claude plugin` subcommand that installs one.
 const INSTALL: &str = "install";
-
-#[cfg(feature = "upstream")]
-const fn page(page: &'static str, anchor: &'static str, owns: &'static str) -> Doc {
-    Doc {
-        at: At::Url(page),
-        anchor,
-        owns,
-    }
-}
-
-#[cfg(feature = "upstream")]
-const INSTALL_PAGE: &[Doc] = &[page(
-    "https://code.claude.com/docs/en/plugins/install.md",
-    r"(?m)^# Install and manage plugins",
-    "the plugin-install page",
-)];
-
-#[cfg(feature = "upstream")]
-pub(crate) const UPSTREAM: &[Watch] = &[
-    Watch {
-        id: "claude.hook_events",
-        ours: || EVENTS.to_vec(),
-        docs: &[HOOKS_PAGE],
-        read: Read::MdTable {
-            header: "Event",
-            under: "Hook lifecycle",
-        },
-        when: When::Vanishes,
-        finding: Finding::Breaking(UNDOCUMENTED_HOOK),
-        siblings: None,
-    },
-    host_plugin::premise(
-        "claude.plugin_hooks_shape",
-        || vec!["same shape as the `hooks` object in `settings.json`"],
-        &[page(
-            "https://code.claude.com/docs/en/plugins/components.md",
-            r"(?m)^# Add components to a plugin",
-            "the plugin-components page",
-        )],
-        r"{name}\.",
-        "the shape `register` writes `hooks/hooks.json` in may have changed",
-    ),
-    host_plugin::premise(
-        "claude.plugin_enabled_key",
-        || vec![ENABLED_PLUGINS],
-        INSTALL_PAGE,
-        r"The entry goes in `{name}` in `~/\.claude/settings\.json`\.",
-        "where `is_registered` reads a user-scope install may have changed",
-    ),
-    host_plugin::premise(
-        "claude.plugin_install_command",
-        || vec![INSTALL],
-        INSTALL_PAGE,
-        "Run `claude plugin {name}` in your shell to install a plugin without starting a Claude Code \
-         session",
-        "the shell install command `register` runs may have changed",
-    ),
-    host_plugin::premise(
-        "claude.marketplace_removal",
-        || {
-            vec![
-                "When you remove a marketplace, Claude Code uninstalls every plugin you installed from it",
-            ]
-        },
-        INSTALL_PAGE,
-        r"{name}\b",
-        "whether removing the marketplace still uninstalls the plugin `unregister` relies on may have changed",
-    ),
-    host_plugin::premise(
-        "claude.plugin_in_place_load",
-        || vec!["the plugin loads in place from its path inside the marketplace folder"],
-        &[page(
-            "https://code.claude.com/docs/en/plugins/loading.md",
-            r"(?m)^# Plugin loading reference",
-            "the plugin-loading page",
-        )],
-        r"{name}\b",
-        "whether a local-path marketplace loads in place, so a rewrite needs no reinstall, may have changed",
-    ),
-];
 
 /// Claude Code loads the hooks through its plugin system
 /// (code.claude.com/docs/en/plugins): a local marketplace whose one plugin loads
@@ -273,8 +185,8 @@ fn marketplace_listed(json_out: &str) -> Result<bool> {
 /// the binary is off-PATH — and is single-quoted, since CC runs shell-form
 /// commands through a shell.
 ///
-/// Windows: exec form requires the absolute PE path (shell-form goes through
-/// cmd.exe/PowerShell — unportable, PATHEXT-dependent). The orchestrator hard-errors if
+/// Windows: exec form requires the absolute PE path (shell form goes through Git
+/// Bash, or PowerShell without it, per the hooks reference). The orchestrator hard-errors if
 /// resolution failed, so `resolved` is guaranteed absolute here.
 pub(crate) fn hook_command(resolved: &Path, explicit: bool) -> Result<String> {
     #[cfg(not(windows))]
@@ -301,12 +213,21 @@ pub(crate) fn hook_command(resolved: &Path, explicit: bool) -> Result<String> {
     }
 }
 
-/// The inner hook object of a hooks.json entry. `exec_form` adds the empty `args` key
-/// that makes CC spawn the PE directly instead of through a shell; `matcher` lives
-/// on the OUTER entry, not here.
+/// The inner hook object of a hooks.json entry; `matcher` lives on the OUTER entry,
+/// not here. `exec_form` adds `args`, with which "`command` is resolved as an
+/// executable and spawned directly with `args` as the argument vector, with no shell
+/// involved" (code.claude.com/docs/en/hooks.md, Command hook fields), so the source
+/// rides the shim's `--source` flag where no env prefix can.
 pub(crate) fn hook_entry(cmd: &str, exec_form: bool) -> Value {
     if exec_form {
-        json!({ "type": "command", "command": cmd, "args": [] })
+        json!({
+            "type": "command",
+            "command": cmd,
+            "args": [
+                crate::install::hook_cmd::SOURCE_FLAG.trim(),
+                pixtuoid_core::source::claude_code::SOURCE_NAME,
+            ],
+        })
     } else {
         json!({ "type": "command", "command": cmd })
     }
@@ -328,9 +249,9 @@ fn claude_shim_ref(command: &str) -> ShimRef {
             other => other,
         }
     }
-    // NOT that parser: CC's Windows entry is exec form (`args: []`), a bare
-    // absolute path with neither quoting nor `--source`, so it would fall to
-    // that parser's last-whitespace-token arm and truncate `C:\Program Files\…`.
+    // NOT that parser: CC's Windows entry is exec form, its `command` a bare
+    // absolute path with no quoting and its `--source` in `args`, so it would fall
+    // to that parser's last-whitespace-token arm and truncate `C:\Program Files\…`.
     #[cfg(windows)]
     {
         ShimRef::Absolute(PathBuf::from(command.trim()))
@@ -501,8 +422,8 @@ mod tests {
         );
         assert_eq!(
             entry["args"],
-            json!([]),
-            "exec form must carry args:[] for shell-free spawn"
+            json!(["--source", "claude-code"]),
+            "exec form spawns shell-free, so the source rides args"
         );
     }
 

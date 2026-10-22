@@ -214,18 +214,16 @@ json-schemas:
     check-jsonschema --check-metaschema "${schemas[@]}"
     echo "${#schemas[@]} JSON Schemas validated"
 
-# Offline link + anchor check (lychee) over the repo's OWN markdown: every
-# relative cross-link between the nested AGENTS.md guides + docs/ must
-# resolve, and `#anchor` fragments must exist. Directory-walk mode respects
-# .gitignore (vendored node_modules etc. auto-skipped); `--offline` = no network,
-# so it's deterministic + flake-free. External-URL decay is deliberately NOT
-# gated here (it's flaky on the PR path).
+# Link + anchor check (lychee) over the tree's markdown, hidden dirs included
+# (lychee skips them by default) and .gitignore respected: every relative link
+# must resolve and every `#anchor` exist. `--offline`, so external-URL decay is
+# not gated (it's flaky on the PR path).
 [doc('Offline link + anchor check (lychee) over the repo markdown — no network, .gitignore-aware')]
 [group('rust')]
 links:
     # Source CSS uses Vite package specifiers; its module graph belongs to the
     # site build, while this gate owns documentation links and anchors.
-    lychee --offline --include-fragments --extensions md .
+    lychee --offline --include-fragments --extensions md --hidden .
 
 # Clippy across the workspace, warnings denied.
 [group('rust')]
@@ -304,8 +302,7 @@ lint:
     run ci-obs  just ci-observability     & pids+=($!)
     run schemas just json-schemas         & pids+=($!)
     run links   just links               & pids+=($!)
-    run tuidrive just tuidrive-selftest   & pids+=($!)
-    run e2escrub just e2e-scrub-selftest  & pids+=($!)
+    run hookscrub just hook-scrub-selftest  & pids+=($!)
     run starhist just star-history-selftest & pids+=($!)
     run bmcbtn  just bmc-button-selftest  & pids+=($!)
     run fixpii  just fixture-pii          & pids+=($!)
@@ -341,7 +338,7 @@ bench-pacing:
 
 # Local only, never CI: a shared runner's wall clock is too noisy for a frame
 # budget. `--live` runs in this terminal, the only run a real parser sees.
-[doc('The fluency gate: the release binary through a transition into a storm (or dusk); fail when frames shown past their interval pass 10 ms a second')]
+[doc('The fluency gate: the release binary through a transition into a storm (or dusk); fail when frames shown past their interval pass HITCH_RATE_MS_PER_S in scripts/pace-check.py')]
 [group('rust')]
 pace-check *args:
     cargo build --release -p pixtuoid --bins --example pacing
@@ -359,8 +356,6 @@ hack:
     cargo hack --feature-powerset --no-dev-deps clippy --workspace -- -D warnings
     cargo clippy -p pixtuoid-scene --no-default-features --all-targets -- -D warnings
     just test -p pixtuoid-scene --no-default-features
-    # The powerset builds no example or test, and the drift watch's compile only under `upstream`.
-    cargo clippy -p pixtuoid --no-default-features --features upstream --lib --tests --example drift_watch -- -D warnings
 
 # Same toolchain gotcha as `api-surface` and `gen-wasm`, and it bites HARDER
 # here because the compiler's own advice is wrong: a Homebrew cargo ahead of the
@@ -557,22 +552,10 @@ _doc-targets:
         grep -qx "$target" <<<"$installed" || rustup target add "$target"
     done
 
-[doc('Coverage + JUnit XML — ci-tests.yml runs it on every tier with its matrix `features` as args, the full one uploading it (needs llvm-cov + nextest)')]
+[doc('Coverage + JUnit XML — ci-tests.yml runs it on every tier, the full one uploading it (needs llvm-cov + nextest)')]
 [group('rust')]
 coverage *args:
     TZ={{ TEST_TZ }} cargo llvm-cov nextest --workspace --codecov --output-path codecov.json --profile ci "$@"
-
-# Runs the suite under nextest and FAILS on a
-# pending (un-accepted `.snap.new`) OR unreferenced (orphan `.snap` — e.g. a
-# deleted test's leftover) snapshot. This is the gap `just test` misses:
-# a CHANGED snapshot already fails its own assertion, but an ORPHAN one rots
-# silently. CI-only in practice (a second full test run, like coverage) —
-# NOT in preflight; run it after adding/removing an insta-snapshot test. Needs
-# cargo-insta + cargo-nextest.
-[doc('Snapshot hygiene (cargo-insta): fail on pending OR orphan snapshots — CI-only')]
-[group('rust')]
-snapshots:
-    TZ={{ TEST_TZ }} cargo insta test --check --unreferenced=reject --test-runner nextest --workspace
 
 # Injects bugs into the CHANGED lines and checks the tests catch them — the
 # "do your assertions have TEETH?" dimension that
@@ -625,7 +608,6 @@ mutants *args:
 # re-recorded yet were composed by hand. One BILLED model turn per run.
 # `{prompt}` expands to the shared scenario prompt; a custom one is a quoted arg.
 #   just capture-fixture cursor tool-run cursor-agent -p --trust '{prompt}'
-#   just capture-fixture kimi permission-flow "$SHELL"   # drive the TUI yourself
 [doc('Record a conformance fixture from a real CLI run (BILLED — one model turn)')]
 [group('rust')]
 capture-fixture source scenario *cmd:
@@ -654,7 +636,7 @@ corpus-all:
     rc=0
     n=0
     uncovered=()
-    while IFS=$'\t' read -r id _ kind _; do
+    while IFS=$'\t' read -r id kind; do
         [ "$kind" = transcript ] || continue
         n=$((n + 1))
         echo "── $id"
@@ -707,53 +689,38 @@ fuzz source dir:
     cargo build --release --example decoder_fuzz -p pixtuoid-core
     find "$dir" -name '*.jsonl' -print0 | xargs -0 cat | ./target/release/examples/decoder_fuzz "$source"
 
-# Hermetic OpenClaw daemon live-e2e: drives the REAL shim with crafted gateway
-# envelopes on an isolated socket and asserts the lobster's
-# idle/busy/degraded/down via the headless `daemons=` line. Zero gateway, zero
-# model calls. Same on-demand local tier as `fuzz` — it needs a release build
-# and an ExitWatch backend (macOS kqueue / Linux pidfd), so it is not a CI gate.
-[doc('Hermetic OpenClaw daemon live-e2e (needs `just build --release`)')]
-[group('rust')]
-openclaw-e2e:
-    scripts/lib/tier-openclaw-hermetic.sh
-
 # N REAL `openclaw gateway run` processes, each in its own throwaway
 # OPENCLAW_HOME on its own port, feeding one headless pixtuoid: one
 # `openclaw@<port>` row per gateway, instance-local death, and OpenClaw's OWN
 # `plugins list` confirming our plugin loads. Zero model calls, zero account
-# footprint, but it needs a real `openclaw` on PATH — same on-demand local tier
-# as `openclaw-e2e`. Ports are forwarded (default: the script's `PORTS`).
+# footprint, but it needs a real `openclaw` on PATH. Ports are forwarded
+# (default: the script's `PORTS`).
 [doc('Multi-gateway live-e2e against the REAL openclaw CLI (needs `just build --release`)')]
 [group('rust')]
 openclaw-multi-e2e *ports:
     scripts/lib/tier-openclaw-multi.sh "$@"
 
-# The EXPENSIVE one: a real `openclaw gateway run` PLUS one real model turn on
-# the claude-cli backend, proving the gateway's lobster and its backend's `cc·`
-# desk sprite coexist live. Real account footprint (your gateway's channels
-# connect) and it bills a turn, so no CI job runs it: a change to the headless
-# `agents=`/`daemons=` line it greps breaks it silently until it is run by hand.
-[doc('OpenClaw + claude-cli backend live-e2e — REAL gateway AND one BILLED model turn')]
-[group('rust')]
-openclaw-backend-e2e:
-    scripts/lib/tier-openclaw-backend.sh
-
-# The broadest tier: launches each installed agent CLI non-interactively and
-# asserts ITS badge renders. One real model turn PER CLI, on each provider's own
-# account — the only proof a real CLI's real output reaches a real sprite.
-[doc('Live multi-source e2e — every installed agent CLI, one BILLED turn each')]
-[group('rust')]
-live-sources *ids:
-    scripts/lib/tier-live-sources.sh "$@"
-
 # Two builds: one would unify the examples' `harness` feature into the binary
 # under test.
+[doc('Build what `just hermetic` runs, and run no CLI')]
+[group('rust')]
+hermetic-build:
+    cargo build --release -q -p pixtuoid -p pixtuoid-hook
+    cargo build --release -q -p pixtuoid-core --example hermetic --example capture_fixture --example bump --example tui_drive
+
 [doc('Run each profiled agent CLI against a scripted model (aimock) and judge what pixtuoid made of it')]
 [group('rust')]
-hermetic *args:
-    cargo build --release -q -p pixtuoid -p pixtuoid-hook
-    cargo build --release -q -p pixtuoid-core --example hermetic --example capture_fixture
-    target/release/examples/hermetic "$@"
+hermetic *args: hermetic-build
+    cargo run --release -q -p pixtuoid-core --example hermetic -- "$@"
+
+# The nightly's bump leg: snapshots rewritten for the re-recorded fixtures,
+# then judged as CI judges them.
+[doc('Re-record a source at a release, moving its pin, and write the bump as a patch')]
+[group('rust')]
+hermetic-bump source release out: (hermetic "--cli" release "--record" source)
+    TZ={{ TEST_TZ }} INSTA_UPDATE=always INSTA_FORCE_PASS=1 cargo test -q -p pixtuoid-core --test sources
+    TZ={{ TEST_TZ }} cargo test -q -p pixtuoid-core --test sources
+    cargo run --release -q -p pixtuoid-core --example bump -- patch "$1" "$3"
 
 # Compile the workspace; extra args are forwarded:
 #   just build                                # debug
@@ -796,7 +763,7 @@ site-demos:
 site-dev: site-demos
     npm --prefix site run dev
 
-# Agent-facing dev-server lifecycle (Astro 7 `--background`): the daemon has no
+# Agent-facing dev-server lifecycle (Astro's `--background`): the daemon has no
 # stdin/TTY tie, so it survives the launching shell — the foreground `astro dev`
 # quits on stdin EOF, which killed agent-driven servers between commands.
 # Readiness = the DEV-ONLY /_astro/status health endpoint (preview 404s it);
@@ -882,11 +849,10 @@ gen-banner-check:
     python3 scripts/gen-banner.py --check docs/images/banner
 
 # Not in `gen`: it downloads its pinned fonts.
-[doc("Regenerate the scene's pixel faces + their licenses (crates/pixtuoid-scene/fonts/) from scripts/gen-fonts.py")]
+[doc("Regenerate the scene's Fusion Pixel faces + their licenses (crates/pixtuoid-scene/fonts/) from scripts/gen-fonts.py")]
 [group('gen')]
 gen-fonts:
-    test -x .venv/bin/python3 || { echo "needs a Python 3.14 venv with requirements-dev.txt (see scripts/gen-fonts.py)"; exit 1; }
-    .venv/bin/python3 scripts/gen-fonts.py
+    python3 scripts/gen-fonts.py
 
 [doc('Sync README install/features/tools sections from site/src/*.json')]
 [group('gen')]
@@ -1016,9 +982,9 @@ gen-icons-check:
 
 # scripts/gen-media.py's docstring says what `--check` compares. The README's
 # media only: the site's demos are rendered in CI and never committed. On a PR
-# a drift here is evidence for the generated-art lens, not a gate (ci-tests.yml's
-# smoke job); main's land through media-regen.yml.
-# Requires the .venv + node; it builds the examples it renders with.
+# a drift here is evidence for REVIEW.md's Render and look, not a gate; main's
+# land through media-regen.yml.
+# Requires the .venv; it builds the examples it renders with.
 [doc("Diff the README's committed media against what gen-media renders")]
 [group('gen')]
 gen-media-check:
@@ -1126,7 +1092,7 @@ preflight mode="":
     mode="$1"
     case "$mode" in
     "") just lint && just clippy ;;
-    full) just lint && just clippy && just hack && just test --features pixtuoid/upstream ;;
+    full) just lint && just clippy && just hack && just test ;;
     *) echo "usage: just preflight [full]" >&2; exit 2 ;;
     esac
 
@@ -1210,11 +1176,12 @@ wasm-check-selftest:
     just gen-wasm-check >/dev/null
     echo "wasm-check-selftest: OK (reds on a broken measurement, greens on a real one)"
 
-# The pixel comparator is the primitive under `gen-check` and the smoke job; an
-# always-green comparator reports success for any render at all. Its own recipe
-# because it needs only Pillow, while `gen-check` needs the toolchain its header
-# lists: a developer who cannot run that gate should still be able to run this.
-[doc('Self-test the pixel comparator that gen-check and smoke ride on')]
+# The pixel comparator is the primitive under `gen-check` and
+# `gen-media-check`; an always-green comparator reports success for any render
+# at all. Its own recipe because it needs only Pillow, while `gen-check` needs
+# every generator's toolchain: a developer who cannot run that gate should still
+# be able to run this.
+[doc('Self-test the pixel comparator that gen-check and gen-media-check ride on')]
 [group('meta')]
 compare-selftest:
     #!/usr/bin/env sh
@@ -1224,31 +1191,10 @@ compare-selftest:
     if [ -x .venv/bin/python3 ]; then py=.venv/bin/python3; else py=python3; fi
     "$py" scripts/compare-screenshots.py --selftest
 
-# Default features off: the watch plays no audio, so the runner needs no ALSA.
-[doc('Check every name the sources read and the installers register against upstream (network)')]
+[doc("Self-test the git env scrub of the pre-push hook")]
 [group('meta')]
-drift-watch:
-    cargo run -q -p pixtuoid --no-default-features --features upstream --example drift_watch
-
-# The pty driver's pure halves — the ANSI stripper, the composer comparison, the
-# gate/menu wording. Each fails silently, at the price of a BILLED turn: a broken
-# stripper just stops matching, and the capture comes back empty blaming the
-# CLI.
-[doc("Self-test the TUI capture driver's pure logic")]
-[group('meta')]
-tuidrive-selftest:
-    python3 scripts/lib/tuidrive.py --selftest
-
-# The git env scrub, both copies: `e2e_init_repo` and the pre-push hook. A git
-# hook exports GIT_DIR/GIT_INDEX_FILE into every child and those OUTRANK
-# `git -C <dir>`, so an unscrubbed helper COMMITS to the developer's real repo
-# while printing nothing. The suite runs the unscrubbed form first and proves
-# it leaks, so a scrub that stopped scrubbing cannot pass. Hermetic: one
-# mktemp -d, no network, no real repo.
-[doc("Self-test the git env scrub — the e2e helper and the pre-push hook")]
-[group('meta')]
-e2e-scrub-selftest:
-    bash scripts/lib/e2e-common-selftest.sh
+hook-scrub-selftest:
+    bash scripts/lib/hook-scrub-selftest.sh
 
 # The README star chart's renderer — bitmap font, axes, paging. (Its copied
 # office colours are pinned from Rust: scene's `tests/readme_chart_palette.rs`.)

@@ -9,17 +9,8 @@
 //! in ONE project and cwd-keying would merge them (the Cursor lesson).
 //!
 //! The envelope reuses CC's `hook_event_name` field NAME but with snake_case VALUES
-//! alien to the shared CC-shaped arms, so per the `HookDecoding::custom` contract the
-//! decoder claims EVERY event (`.map(Some)`, never `Ok(None)`).
-//!
-//! `extra.tool_call_id` IS on the wire — capture-verified on BOTH tool events, and
-//! they pair — and dropped anyway. The original reason (no permission event to
-//! resolve) died when `pre_approval_request` was registered: there IS one now, and
-//! it carries a pairing id. What survives is that with no subagent event to drain
-//! and no second transport to dedup against, a hermes `Waiting` is cleared by the
-//! tuid-less hook escape in `wait_resolved_by` — every hermes event is Hook
-//! transport — so a per-call id would only re-derive the answer that path already
-//! gives. Pinned by `pre_tool_call_is_activity_start_with_no_tool_id`.
+//! alien to the shared CC-shaped arms, so the decoder is `HookDecoding::ClaimsAll`:
+//! it claims EVERY event.
 //!
 //! `subagent_stop` is deliberately absent from `HERMES_EVENTS`: the SHELL-hook payload
 //! carries a parent id but NO child session/agent id, so a decode could only end a
@@ -38,13 +29,6 @@ use crate::source::{AgentEvent, ToolDetail};
 
 /// The Hermes CLI source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "hermes";
-
-/// The repository its drift watches read.
-#[cfg(any(test, feature = "upstream"))]
-pub const REPO: crate::source::upstream::Repo = crate::source::upstream::Repo {
-    name: "NousResearch/hermes-agent",
-    release: crate::source::upstream::Release::GithubLatest,
-};
 
 /// The Hermes home dir (`config.yaml` lives directly in it), mirroring hermes's
 /// own `hermes_constants._hermes_home_from_env` (2026.8.3): `HERMES_HOME`
@@ -142,6 +126,16 @@ pub(crate) fn decode_hermes_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
             (!cwd.is_empty()).then(|| cwd.into()),
         )
     };
+    // A call's start, its approval wait and its end each carry it
+    // (`_CallIds` at `model_tools.py:643`, `tools/approval_context.py:67` at v0.22.2),
+    // so a wait names the call whose end clears it.
+    let tool_use_id = || {
+        obj.get("extra")
+            .and_then(|e| e.get("tool_call_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
 
     let decoded: Result<Vec<AgentEvent>> = match event {
         "on_session_start" => Ok(vec![AgentEvent::SessionStart {
@@ -163,7 +157,7 @@ pub(crate) fn decode_hermes_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
                 identity(),
                 AgentEvent::ActivityStart {
                     agent_id,
-                    tool_use_id: None,
+                    tool_use_id: tool_use_id(),
                     detail: Some(hermes_tool_detail(tool, obj.get("tool_input"))),
                 },
             ])
@@ -172,13 +166,13 @@ pub(crate) fn decode_hermes_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
             identity(),
             AgentEvent::ActivityEnd {
                 agent_id,
-                tool_use_id: None,
+                tool_use_id: tool_use_id(),
             },
         ]),
         // Observer-only for a SHELL hook: `_BLOCKING_EVENTS` in upstream's
         // `agent/shell_hooks.py` is `{pre_tool_call}` alone, so our silent exit-0
         // cannot stall the decision. `tool_name` is null here and the WHY rides
-        // `extra.description` — capture-verified, `approval-recorded`.
+        // `extra.description` — capture-verified, `permission-hermetic`.
         "pre_approval_request" => {
             let reason = obj
                 .get("extra")
@@ -192,7 +186,7 @@ pub(crate) fn decode_hermes_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
                 AgentEvent::Waiting {
                     agent_id,
                     reason,
-                    tool_use_id: None,
+                    tool_use_id: tool_use_id(),
                 },
             ])
         }
@@ -211,8 +205,7 @@ pub(crate) fn decode_hermes_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
         // ("True when the turn produced a final response"), and turn_finalizer's
         // comment adds that "run_conversation() is called once per user message
         // in multi-turn sessions". Mapping it to SessionEnd walked the agent out of
-        // the office at every turn: `approval-recorded` is ONE session with TWO of
-        // these and a tool call 5.9 s after the first, past the 4.5 s exit grace.
+        // the office at every turn.
         //
         // An ACTIVITY arm, so it takes that class's Identity with it: for a
         // tool-less chat turn this is the ONLY event the session emits, and a
@@ -268,8 +261,8 @@ mod tests {
 
     #[test]
     fn session_start_reports_the_model_from_extra() {
-        // The shape from fixtures/hermes/tool-run: hermes nests it one level down,
-        // and only the session events carry it.
+        // The shape from fixtures/hermes/tool-run-hermetic: hermes nests it one
+        // level down, and only the session events carry it.
         let evs = decode_all(json!({
             "hook_event_name": "on_session_start", "session_id": "s1", "cwd": "/repo",
             "extra": {"model": "gpt-4o-mini"}
@@ -332,24 +325,34 @@ mod tests {
     }
 
     #[test]
-    fn pre_tool_call_is_activity_start_with_no_tool_id() {
-        let ev = decode(json!({
-            "hook_event_name": "pre_tool_call",
-            "session_id": "s", "cwd": "/repo",
-            "tool_name": "terminal", "tool_input": {"command": "echo hello"},
-            "extra": {"task_id": "t", "tool_call_id": "c"}
-        }));
-        match ev {
+    fn a_call_its_wait_and_its_end_name_one_tool_id() {
+        let call = |event: &str| {
+            decode(json!({
+                "hook_event_name": event,
+                "session_id": "s", "cwd": "/repo",
+                "tool_name": "terminal", "tool_input": {"command": "echo hello"},
+                "extra": {"task_id": "t", "tool_call_id": "c", "description": "why"}
+            }))
+        };
+        match call("pre_tool_call") {
             AgentEvent::ActivityStart {
                 tool_use_id,
                 detail,
                 ..
             } => {
-                assert_eq!(tool_use_id, None);
+                assert_eq!(tool_use_id.as_deref(), Some("c"));
                 assert_eq!(detail.unwrap().display(), "terminal: echo hello");
             }
             other => panic!("expected ActivityStart, got {other:?}"),
         }
+        assert!(matches!(
+            call("pre_approval_request"),
+            AgentEvent::Waiting { tool_use_id: Some(t), .. } if t == "c"
+        ));
+        assert!(matches!(
+            call("post_tool_call"),
+            AgentEvent::ActivityEnd { tool_use_id: Some(t), .. } if t == "c"
+        ));
     }
 
     #[test]
@@ -387,10 +390,8 @@ mod tests {
         );
     }
 
-    /// The shape `hermes/tool-run` could never show, because a one-shot capture
-    /// ends its only turn and its session together. `approval-recorded` is the
-    /// multi-turn capture that falsifies it: one session_id, one pid, TWO
-    /// `on_session_end`, and work after the first.
+    /// The shape no capture shows: a recorded run ends its only turn and its
+    /// session together.
     #[test]
     fn a_second_turn_in_one_session_does_not_end_the_session() {
         let sid = "sess-multi";

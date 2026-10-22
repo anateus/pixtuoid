@@ -35,9 +35,8 @@ static FAKE: Target = Target {
     presence_probe: || false,
     post_install_hint: None,
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: &[],
     registers: Vec::new,
+    consumes: &[],
 };
 
 // A fn-pointer `default_config_path` can't capture a TempDir, so FAKE2/FAKE_DIR
@@ -78,9 +77,8 @@ static FAKE2: Target = Target {
     presence_probe: || false,
     post_install_hint: None,
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: &[],
     registers: Vec::new,
+    consumes: &[],
 };
 
 // FAKE_DIR's config path is created as a DIRECTORY, so read_config errors.
@@ -110,9 +108,8 @@ static FAKE_DIR: Target = Target {
     presence_probe: || false,
     post_install_hint: None,
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: &[],
     registers: Vec::new,
+    consumes: &[],
 };
 
 // FAKE_NO_HOME's default_config_path Errs — the no-home-dir arm.
@@ -142,9 +139,8 @@ static FAKE_NO_HOME: Target = Target {
     presence_probe: || false,
     post_install_hint: None,
     host: None,
-    #[cfg(feature = "upstream")]
-    upstream: &[],
     registers: Vec::new,
+    consumes: &[],
 };
 
 /// The files a target owns beside its config, `None` for every other target.
@@ -2659,6 +2655,40 @@ fn converge_stamps_a_pre_stamp_claude_hooks_file() {
         io::read_config(&cfg).unwrap(),
         crate::install::claude::render_hooks(&stamped).unwrap()
     );
+}
+
+/// A Windows hooks.json from before the source rode `args` spawned the shim with an
+/// empty argv, so CC's payloads arrived unstamped; a launch rewrites it.
+#[cfg(windows)]
+#[test]
+fn converge_stamps_a_pre_source_windows_claude_hooks_file() {
+    use crate::install::claude::EVENTS;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfg = tmp.path().join("hooks.json");
+    let shim = r"C:\tools\pixtuoid-hook.exe";
+    let unstamped = serde_json::json!({
+        "matcher": ".*",
+        "hooks": [{ "type": "command", "command": shim, "args": [] }],
+    });
+    std::fs::write(
+        &cfg,
+        crate::install::host_plugin::render_hooks(EVENTS, &unstamped).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        converge(&CLAUDE_FILE, Some(cfg.clone())).unwrap().rewritten,
+        std::slice::from_ref(&cfg)
+    );
+    let doc: serde_json::Value = serde_json::from_str(&io::read_config(&cfg).unwrap()).unwrap();
+    for ev in EVENTS {
+        let entry = &doc["hooks"][*ev][0]["hooks"][0];
+        assert_eq!(entry["command"], serde_json::json!(shim));
+        assert_eq!(
+            entry["args"],
+            serde_json::json!(["--source", "claude-code"])
+        );
+    }
 }
 
 /// A beside entry that no longer gives back a shim (truncated, hand-edited) is HARD:

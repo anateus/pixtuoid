@@ -25,12 +25,10 @@ use std::path::PathBuf;
 use serde_json::{Map, Value};
 
 use crate::AgentId;
-use crate::source::AgentEvent;
 use crate::source::decoder::{
     DecodeError, DecodeResult as Result, MAX_DECODED_FIELD_CHARS, ellipsize, generic_tool_display,
 };
-#[cfg(any(test, feature = "upstream"))]
-use crate::source::upstream::{Doc, Finding, Read, Release, Repo, Watch, When};
+use crate::source::{AgentEvent, ToolDetail};
 
 /// The opencode CLI source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "opencode";
@@ -46,11 +44,16 @@ const TOOL_SUCCESS: &str = "session.tool.success";
 const TOOL_FAILED: &str = "session.tool.failed";
 const PERMISSION_ASKED: &str = "permission.asked";
 
+/// The subagent dispatch tool (`packages/core/src/tool/plugin/subagent.ts:17`
+/// at v2.0.32).
+const DISPATCH_TOOL: &str = "subagent";
+
 /// The event types this decoder turns into events. Pinned to the arms below
 /// by `every_exported_set_is_exactly_its_dispatch_arms`, and to the plugin's
 /// `FORWARD` set by `the_plugin_forwards_exactly_what_the_decoder_reads`.
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const DECODED_EVENTS: &[&str] = &[
+#[cfg(any(test, feature = "harness"))]
+#[doc(hidden)]
+pub const DECODED_EVENTS: &[&str] = &[
     SESSION_CREATED,
     SESSION_DELETED,
     EXECUTION_STARTED,
@@ -67,7 +70,8 @@ pub(crate) const DECODED_EVENTS: &[&str] = &[
 /// `every_decoded_data_field_is_read`. The plugin's `allowlisted` copies these
 /// and nothing more, pinned by
 /// `the_plugin_copies_exactly_the_fields_the_decoder_reads`.
-#[cfg(any(test, feature = "upstream"))]
+#[cfg(any(test, feature = "harness"))]
+#[doc(hidden)]
 pub const DECODED_DATA_FIELDS: &[&str] = &[
     "sessionID",
     "parentID",
@@ -79,52 +83,9 @@ pub const DECODED_DATA_FIELDS: &[&str] = &[
     "source.id",
 ];
 
-/// Session events are declared in `session-event.ts`'s inventory, permission
-/// events in `permission.ts`'s, so the union is the document.
-#[cfg(any(test, feature = "upstream"))]
-const EVENT_DECLARATIONS: &[Doc] = &[
-    REPO.doc(
-        "packages/schema/src/session-event.ts",
-        r"(?m)^export const Definitions = Event\.inventory\(",
-        "the session `Definitions` inventory",
-    ),
-    REPO.doc(
-        "packages/schema/src/permission.ts",
-        r"(?m)^export const Event = \{",
-        "the permission `Event` inventory",
-    ),
-];
-
-/// Its GitHub `releases/latest` is still the v1 line; v2 installs from npm
-/// (`services/www/src/docs/content/index.mdx:16`, v2.0.27).
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const REPO: Repo = Repo {
-    name: "anomalyco/opencode",
-    release: Release::Npm {
-        package: "@opencode/cli",
-        tag_prefix: "v",
-    },
-};
-
-#[cfg(any(test, feature = "upstream"))]
-pub(crate) const UPSTREAM: &[Watch] = &[Watch {
-    id: "opencode.hook_events",
-    ours: || DECODED_EVENTS.to_vec(),
-    docs: EVENT_DECLARATIONS,
-    // The declaration form: a bare quoted name also matches prose and tests.
-    read: Read::Each {
-        pattern: r#"type: "{name}""#,
-    },
-    when: When::Vanishes,
-    finding: Finding::Breaking(
-        "the plugin subscribes to an event opencode never fires (no sprite)",
-    ),
-    siblings: None,
-}];
-
 /// Decode one opencode plugin envelope (already identified by
 /// `_pixtuoid_source == "opencode"`). An unmapped `type` is a benign skip: the
-/// forward filter lives in the plugin, and drift is `UPSTREAM`'s to catch.
+/// forward filter lives in the plugin.
 ///
 /// # Errors
 ///
@@ -250,7 +211,7 @@ fn ended(
 }
 
 /// The tool's `id` is the call id its `success`/`failed` pair on. The input
-/// rides a later event, so the detail is the tool's name alone.
+/// rides a later event, so the detail is the tool's name alone, or a Task.
 fn tool_started(data: &Map<String, Value>, at: Option<&str>) -> Result<Vec<AgentEvent>> {
     let (agent_id, session_id) = session(data, TOOL_STARTED)?;
     let name = field(data, "name").unwrap_or_else(|| {
@@ -262,13 +223,11 @@ fn tool_started(data: &Map<String, Value>, at: Option<&str>) -> Result<Vec<Agent
         AgentEvent::ActivityStart {
             agent_id,
             tool_use_id: field(data, "id").map(str::to_owned),
-            // Even `subagent` is no `Task`: `background: true`, or the user's
-            // ctrl+b mid-run, returns the call while the child still runs
-            // (`packages/core/src/tool/plugin/subagent.ts:229-243`,
-            // `packages/core/src/session.ts:442-455`), and a Task's end would
-            // walk the live child out. The child is its own session, parented
-            // by `parentID`.
-            detail: Some(generic_tool_display(name, None)),
+            detail: Some(if name == DISPATCH_TOOL {
+                ToolDetail::Task
+            } else {
+                generic_tool_display(name, None)
+            }),
         },
     ])
 }
@@ -296,7 +255,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::source::ToolDetail;
 
     fn decode_all(v: Value) -> Vec<AgentEvent> {
         decode_oc_hook_payload(&v).expect("decodes")
