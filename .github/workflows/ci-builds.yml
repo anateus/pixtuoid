@@ -43,12 +43,7 @@ jobs:
       - uses: ./.github/actions/setup-cargo-just
         with:
           components: clippy
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: cargo-hack
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: cargo-nextest
+          tools: cargo-hack cargo-nextest
       - run: just hack
 
   windows-check:
@@ -89,7 +84,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-alsa
-      - uses: ./.github/actions/setup-just
+      - uses: ./.github/actions/setup-tools
       # Before rust-cache, which keys on every installed toolchain, so a
       # HAWK_RUST bump starts a new cache instead of hitting the old one.
       - run: just _hawk-toolchain

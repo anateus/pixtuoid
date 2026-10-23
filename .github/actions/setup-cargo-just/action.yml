@@ -1,5 +1,5 @@
 name: 'Setup Cargo & Just'
-description: 'Sets up Rust toolchain, rust-cache, and just'
+description: 'Sets up the Rust toolchain, rust-cache, and just plus the given mise.toml tools'
 
 inputs:
   components:
@@ -16,6 +16,10 @@ inputs:
     default: 'true'
   shared-key:
     description: 'Swatinem/rust-cache shared-key; empty keys the cache by job'
+    required: false
+    default: ''
+  tools:
+    description: 'Space-separated mise.toml [tools] keys to install beside just'
     required: false
     default: ''
 
@@ -39,4 +43,6 @@ runs:
         # main's full-tier entries out.
         save-if: ${{ github.ref == 'refs/heads/main' }}
 
-    - uses: ./.github/actions/setup-just
+    - uses: ./.github/actions/setup-tools
+      with:
+        tools: ${{ inputs.tools }}

@@ -29,6 +29,30 @@ yq -o=json '.' .mergify.yml | jq -e --arg c "-head ~= ^$release_prefix" \
     '(.queue_rules | length > 0) and all(.queue_rules[]; any(.queue_conditions[]; . == $c))' >/dev/null ||
     fail ".mergify.yml has a queue that admits release-plz's ${release_prefix}* PRs"
 
+# A `tools:` word that is no mise.toml key is dropped by MISE_ENABLE_TOOLS and
+# installs nothing, so the job runs whatever the runner has, or fails late. A computed value would escape that
+# check, and setup-tools writes it to GITHUB_ENV, so only setup-cargo-just's
+# own forwarding of its input may carry an expression.
+mise_keys="$(yq -p toml -o=json '.tools | keys | .[]' mise.toml | jq -r '.')" || fail "mise.toml has no [tools]"
+tools_words=""
+for f in .github/workflows/*.yml .github/actions/*/action.y*ml; do
+    values="$(yq -o=json '.' "$f" | jq -r '.. | objects | select((.uses // "") | test("/setup-(tools|cargo-just)$")) | (.with.tools // empty)')" ||
+        fail "cannot read the tools: values of $f"
+    while IFS= read -r value; do
+        [[ -n "$value" ]] || continue
+        # shellcheck disable=SC2016  # the literal GitHub expression syntax
+        if [[ "$value" == *'${{'* ]]; then
+            [[ "$f" == .github/actions/setup-cargo-just/action.yml && "$value" == '${{ inputs.tools }}' ]] ||
+                fail "$f passes a computed tools: $value"
+            continue
+        fi
+        tools_words+="${value// /$'\n'}"$'\n'
+    done <<<"$values"
+done
+[[ -n "$tools_words" ]] || fail "no setup-tools/setup-cargo-just caller passes tools"
+unknown_tools="$(comm -23 <(sort -u <<<"$tools_words") <(sort <<<"$mise_keys"))"
+[[ -z "$unknown_tools" ]] || fail "tools: words that are no mise.toml [tools] key: $unknown_tools"
+
 # ── wait-ci-gate.yml: both release paths wait for their own commit's ci-gate ──
 wait_workflow=.github/workflows/wait-ci-gate.yml
 wait_step="Wait for ci-gate on this commit"
