@@ -5,7 +5,7 @@
 //! join onto — so `USERPROFILE` must win on Windows, or the watcher watches a
 //! path no session ever writes to. On Unix, `HOME` stays authoritative.
 //!
-//! Every env filter here is TRIM-based — empty or whitespace-only counts as
+//! Every path env filter here is TRIM-based — empty or whitespace-only counts as
 //! unset, so `XDG_CONFIG_HOME="   "` can't be unset for the app config but set
 //! for the CLI config-dir resolution.
 
@@ -37,9 +37,14 @@ pub fn path_env_trimmed(name: &str) -> Option<PathBuf> {
     }
 }
 
-/// A TEXT-valued env var (a location is [`path_env`]; `env::var` is banned by `clippy.toml`).
+/// A TEXT-valued env var, `None` when unset, EMPTY or not UTF-8 — never trimmed,
+/// as `NO_COLOR`'s "present and not an empty string" needs (a location is
+/// [`path_env`]; `env::var` is banned by `clippy.toml`).
 pub fn text_env(name: &str) -> Option<String> {
-    std::env::var_os(name)?.into_string().ok()
+    std::env::var_os(name)
+        .filter(|v| !v.is_empty())?
+        .into_string()
+        .ok()
 }
 /// Whitespace test that never rejects a non-UTF-8 value: the lossy form is used
 /// ONLY for the emptiness question, never as the value, and its replacement
@@ -255,10 +260,21 @@ mod tests {
             #[expect(clippy::disallowed_methods, reason = "self-test of clippy.toml's ban")]
             let dropped = std::env::var(K).is_err();
             assert!(dropped, "precondition: env::var is what DROPS this value");
-            assert_eq!(text_env(K), None, "text_env keeps env::var's semantics");
+            assert_eq!(text_env(K), None, "text_env drops it, as env::var does");
             assert_eq!(path_env(K), Some(PathBuf::from(&bad)));
             assert_eq!(path_env_trimmed(K), Some(PathBuf::from(&bad)));
         });
+    }
+
+    #[test]
+    fn text_env_reads_an_empty_value_as_unset_and_never_trims() {
+        const K: &str = "PIXTUOID_TEXT_ENV_TEST";
+        temp_env::with_var(K, Some(""), || assert_eq!(text_env(K), None));
+        for kept in [" ", " x "] {
+            temp_env::with_var(K, Some(kept), || {
+                assert_eq!(text_env(K).as_deref(), Some(kept));
+            });
+        }
     }
 
     #[test]

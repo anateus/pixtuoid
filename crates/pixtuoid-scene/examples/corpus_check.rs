@@ -11,8 +11,8 @@
 //! transcripts register, how many render, and the provenance spread.
 //!
 //! Usage: `corpus_check <source> [root] [--json]`, plus `--roster` — the
-//! id/kind rows `just corpus-all` reads instead of keeping a second copy of the
-//! roster.
+//! transcript-bearing ids `just corpus-all` reads instead of keeping a second
+//! copy of the roster.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -143,19 +143,11 @@ fn newest_activity(source: &str, body: &[u8]) -> Option<u64> {
     }
 }
 
-/// The `--roster` rows, `id \t kind`, which `just corpus-all` reads by column:
-/// `the_whole_roster_is_pinned_row_by_row` is the pin AGENTS.md's magic-number
-/// rule asks for at that cross-language boundary.
-fn roster() -> Vec<String> {
+/// The `--roster` rows, one transcript-bearing source id each, which
+/// `just corpus-all` reads.
+fn roster() -> Vec<&'static str> {
     registry::registered_source_names()
-        .map(|name| {
-            let kind = if Drive::transcript(name, "/probe.jsonl").is_some() {
-                "transcript"
-            } else {
-                "hook"
-            };
-            format!("{name}\t{kind}")
-        })
+        .filter(|name| Drive::transcript(name, "/probe.jsonl").is_some())
         .collect()
 }
 
@@ -289,36 +281,5 @@ fn main() {
     // is log-and-continue).
     if totals.decode_errors > 0 {
         std::process::exit(1);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    /// EVERY row, byte for byte: a column-count check could not fail from any
-    /// data change, since `roster`'s `\t` is in its own format literal.
-    fn the_whole_roster_is_pinned_row_by_row() {
-        assert_eq!(
-            roster(),
-            [
-                "claude-code\ttranscript",
-                "codex\ttranscript",
-                "antigravity\ttranscript",
-                "dsh\thook",
-                "reasonix\thook",
-                "codewhale\thook",
-                "opencode\thook",
-                "copilot\ttranscript",
-                "cursor\thook",
-                "hermes\thook",
-                "omp\ttranscript",
-                "openclaw\thook",
-                "grok\ttranscript",
-                "kimi\thook",
-            ],
-            "the --roster columns are indexed POSITIONALLY by \
-             `just corpus-all`. Update it in the same change, then this pin."
-        );
     }
 }

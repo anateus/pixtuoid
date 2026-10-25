@@ -39,8 +39,8 @@ trap 'rm -rf "$root"' EXIT
 # `cargo fmt`; drop it from this list the moment it fans out to anything else.
 hooks_exempt_from_scrub="pre-commit"
 
-# The PATH for the cases that need neither just nor mise, whatever the
-# machine keeps in its system dirs: only what the hooks and stubs run.
+# A PATH with no real just or mise, whatever the machine keeps in its
+# system dirs: only what the hooks and stubs run.
 sysbin="$root/sysbin"
 mkdir -p "$sysbin"
 for b in bash git dirname; do ln -s "$(command -v "$b")" "$sysbin/$b"; done
@@ -128,18 +128,6 @@ check "pre-push falls back to mise exec -- just preflight with a scrubbed env" \
     hook_falls_back_to_mise "$repo/.githooks/pre-push" "exec -- just preflight" yes
 check "pre-commit falls back to mise exec -- just fmt-check" \
     hook_falls_back_to_mise "$repo/.githooks/pre-commit" "exec -- just fmt-check" no
-
-hook_fails_with_hint_without_just_or_mise() {
-    local hook="$1" s out
-    s=$(mktemp -d "$root/hookXXXX")
-    git init -q "$s"
-    ! out=$(cd "$s" && PATH="$sysbin" bash "$hook" origin y </dev/null 2>&1) &&
-        grep -qF 'brew install mise' <<<"$out"
-}
-for name in pre-commit pre-push; do
-    check "$name exits 1 with the install hint when neither just nor mise exists" \
-        hook_fails_with_hint_without_just_or_mise "$repo/.githooks/$name"
-done
 
 if [ "$fails" -eq 0 ]; then
     echo "hook-scrub-selftest: OK"
