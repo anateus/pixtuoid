@@ -57,7 +57,7 @@ flowchart TB
 
   subgraph core["pixtuoid-core (headless)"]
     L["HookRouter<br/>(shared socket: Unix / named pipe)"]
-    D["decode_hook_payload"]
+    D["decode_hook_object"]
     J["JsonlWatcher · walk_jsonl"]
     R["Reducer::apply<br/>(Transport-tagged)"]
     AP["apply_presence<br/>(AgentId-free · bypasses Reducer)"]
@@ -93,7 +93,7 @@ flowchart TB
 **Walking the pipeline:**
 
 1. **Ingest.** A hook event rides the shim (enriched, watchdog-bounded, exit
-   0) to `HookSocketListener`, where `decode_hook_payload` turns it into
+   0) to `HookSocketListener`, where `decode_hook_object` turns it into
    `AgentEvent`s. In parallel, `JsonlWatcher` tails each agent's transcript
    (a first-sight gate keeps historical sessions from resurrecting) and
    decodes lines via that source's own decoder.

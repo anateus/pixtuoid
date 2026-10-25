@@ -2894,7 +2894,7 @@ async fn session_exit_parks_truncated_transcript_so_a_straggler_walk_cannot_resu
             .any(|(_, e)| matches!(e, AgentEvent::SessionStart { .. }))
     );
 
-    std::fs::write(&path, "{\"type\":\"assistant\"}\n").unwrap();
+    std::fs::write(&path, "{\"type\":\"tool_use\"}\n{\"type\":\"tool_use\"}").unwrap();
     let new_len = std::fs::metadata(&path).unwrap().len();
     assert!(
         *cursors.lock().await.get(&path).unwrap() > new_len,
@@ -2913,26 +2913,24 @@ async fn session_exit_parks_truncated_transcript_so_a_straggler_walk_cannot_resu
         live: &live,
     };
     let id = default_id_from_path(&path);
-    emit_session_exit(&id, t_decoders(), &ctx).await;
+    let decoders = SourceDecoders {
+        decode_line: t_decode_lifecycle,
+        ..t_decoders()
+    };
+    emit_session_exit(&id, decoders, &ctx).await;
     drop(tx);
     let exit_events = drain_events(&mut rx);
     assert!(
         matches!(
-            exit_events.last(),
-            Some((Transport::Jsonl, AgentEvent::SessionEnd { .. }))
+            exit_events.as_slice(),
+            [(Transport::Jsonl, AgentEvent::SessionEnd { .. })]
         ),
-        "the terminator must be emitted (last), got {exit_events:?}"
-    );
-    assert!(
-        !exit_events
-            .iter()
-            .any(|(_, e)| matches!(e, AgentEvent::SessionStart { .. })),
-        "the exit drain must not register anything, got {exit_events:?}"
+        "the exit drain must emit only the terminator — no stale replay, no registration — got {exit_events:?}"
     );
     assert_eq!(
         cursors.lock().await.get(&path).copied(),
         Some(new_len),
-        "a truncated transcript must be PARKED at the new EOF, not reset to 0"
+        "a truncated transcript must be PARKED at the new EOF, past its unterminated tail"
     );
     assert!(
         !seen.lock().await.contains_key(&path),
@@ -2980,7 +2978,7 @@ async fn child_end_unclaim_parks_truncated_transcript_before_the_end() {
             .any(|(_, e)| matches!(e, AgentEvent::SessionStart { .. }))
     );
 
-    std::fs::write(&path, "{\"type\":\"assistant\"}\n").unwrap();
+    std::fs::write(&path, "{\"type\":\"tool_use\"}\n{\"type\":\"tool_use\"}").unwrap();
     let new_len = std::fs::metadata(&path).unwrap().len();
     assert!(
         *cursors.lock().await.get(&path).unwrap() > new_len,
@@ -3002,16 +3000,20 @@ async fn child_end_unclaim_parks_truncated_transcript_before_the_end() {
         window,
         live: &live,
     };
-    drain_child_end_unclaims(Some(&unclaims), t_decoders(), &ctx).await;
+    let decoders = SourceDecoders {
+        decode_line: t_decode_lifecycle,
+        ..t_decoders()
+    };
+    drain_child_end_unclaims(Some(&unclaims), decoders, &ctx).await;
     let events = drain_events(&mut rx);
     assert!(
         events.is_empty(),
-        "the un-claim emits NOTHING, truncated or not — got {events:?}"
+        "the un-claim emits NOTHING — no stale replay of the rewrite — got {events:?}"
     );
     assert_eq!(
         cursors.lock().await.get(&path).copied(),
         Some(new_len),
-        "a truncated rollout must be PARKED at the new EOF before the end"
+        "a truncated rollout must be PARKED at the new EOF, past its unterminated tail"
     );
     assert_eq!(
         seen.lock().await.get(&path),
@@ -3266,10 +3268,10 @@ async fn walk_jsonl_on_a_missing_path_is_a_silent_no_op() {
 }
 
 #[tokio::test]
-async fn walk_jsonl_resets_cursor_to_zero_when_known_file_truncated_below_cursor() {
+async fn walk_jsonl_rereads_from_zero_when_known_file_truncated_below_cursor() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resync.jsonl");
-    tokio::fs::write(&path, "{\"type\":\"assistant\"}\n")
+    tokio::fs::write(&path, "{\"type\":\"tool_use\"}\n")
         .await
         .unwrap();
     let file_len = tokio::fs::metadata(&path).await.unwrap().len();
@@ -3283,15 +3285,25 @@ async fn walk_jsonl_resets_cursor_to_zero_when_known_file_truncated_below_cursor
     let cursors = Arc::new(Mutex::new(HashMap::from([(path.clone(), 999u64)])));
     let seen = Arc::new(Mutex::new(HashMap::from([(path.clone(), Sight::Claimed)])));
 
-    let events = walk_once(&path, Duration::from_secs(3600), t_ended, &cursors, &seen).await;
+    let events = walk_once_with(
+        &path,
+        Duration::from_secs(3600),
+        t_decode_lifecycle,
+        t_ended,
+        &cursors,
+        &seen,
+    )
+    .await;
     assert!(
-        events.is_empty(),
-        "the truncation resync emits nothing this pass, got {events:?}"
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, AgentEvent::ActivityStart { .. })),
+        "the rewritten line must be decoded this pass, got {events:?}"
     );
     assert_eq!(
         cursors.lock().await.get(&path).copied(),
-        Some(0),
-        "the normal-walk truncation arm must RESET the cursor to 0 (not park at EOF)"
+        Some(file_len),
+        "the re-read advances the cursor to EOF"
     );
 }
 

@@ -8,7 +8,7 @@
 //! Whether the resulting scene would PAINT is the render layer's question,
 //! asked one crate up; this half stops at the state the painter reads.
 //!
-//! Three things here are load-bearing rather than incidental:
+//! Two things here are load-bearing rather than incidental:
 //!
 //! 1. **Registration comes from the WATCHER, not the decoder.** A JSONL event
 //!    for an unknown id is a documented no-op, so a transcript driven with no
@@ -17,11 +17,7 @@
 //!    reads, so the seed can't drift from production.
 //! 2. **Transport is load-bearing** (the reducer's hook-wins dedup keys on it),
 //!    so it is not a free parameter.
-//! 3. **A decoder panic is a contract violation, everywhere.** The watcher and
-//!    hook listener log-and-continue on malformed input; a panic takes the
-//!    whole watcher down. Every line therefore runs under `catch_unwind`.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -81,17 +77,13 @@ pub struct LineFailure {
     pub(crate) line: usize,
     /// `type="…" keys=[…]` — structure only.
     pub(crate) shape: String,
-    /// The decoder's own error; `None` for a panic.
-    pub(crate) message: Option<String>,
+    /// The decoder's own error.
+    pub(crate) message: String,
 }
 
 impl std::fmt::Display for LineFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "line {}: {}", self.line, self.shape)?;
-        if let Some(m) = &self.message {
-            write!(f, ": {m}")?;
-        }
-        Ok(())
+        write!(f, "line {}: {}: {}", self.line, self.shape, self.message)
     }
 }
 
@@ -114,8 +106,6 @@ pub struct Driven {
     /// Lines whose decoder returned `Err`. ALWAYS a defect on bytes the source
     /// itself wrote: the contract is log-and-continue, never a hard error.
     pub decode_errors: Vec<LineFailure>,
-    /// Lines whose decoder PANICKED — the never-panic contract violated.
-    pub panics: Vec<LineFailure>,
     /// Each slot's lifecycle classes, as each was first reached: the one record
     /// [`Self::reached`] unions.
     pub reaches: Vec<(AgentId, Reach)>,
@@ -148,11 +138,11 @@ impl Driven {
     }
 
     /// Assert bytes WE control drove cleanly. Not for unbounded bytes (the
-    /// corpus shell reports the same three counts instead).
+    /// corpus shell reports the same counts instead).
     ///
     /// # Panics
     ///
-    /// If a line was not valid JSON, the decoder returned `Err`, or the decoder panicked.
+    /// If a line was not valid JSON or the decoder returned `Err`.
     pub fn assert_clean(&self, what: &str) {
         assert_eq!(
             self.unparseable, 0,
@@ -163,11 +153,6 @@ impl Driven {
             self.decode_errors.is_empty(),
             "{what}: decode error(s): {:?}",
             self.decode_errors
-        );
-        assert!(
-            self.panics.is_empty(),
-            "{what}: the decoder PANICKED (never-panic contract): {:?}",
-            self.panics
         );
     }
 }
@@ -303,7 +288,7 @@ impl Drive {
     }
 
     /// Drive `lines` end to end: blank lines skipped, every other line parsed,
-    /// decoded under `catch_unwind`, and the decoded stream folded through a
+    /// decoded, and the decoded stream folded through a
     /// real `Reducer`.
     pub fn lines<I, S>(&self, lines: I) -> Driven
     where
@@ -317,7 +302,6 @@ impl Drive {
             lines: 0,
             unparseable: 0,
             decode_errors: Vec::new(),
-            panics: Vec::new(),
             reaches: Vec::new(),
             breadcrumbs: Vec::new(),
         };
@@ -362,17 +346,12 @@ impl Drive {
             // `v` moves into the decoder: keeping a copy for the failure shape
             // would clone whole transcript bodies on the corpus path, and a
             // failure is rare enough to re-parse for.
-            match catch_unwind(AssertUnwindSafe(|| self.decode_one(v))) {
-                Ok(Ok(evs)) => d.events.extend(evs),
-                Ok(Err(e)) => d.decode_errors.push(LineFailure {
+            match self.decode_one(v) {
+                Ok(evs) => d.events.extend(evs),
+                Err(e) => d.decode_errors.push(LineFailure {
                     line: d.lines,
                     shape: shape_of(line),
-                    message: Some(e.to_string()),
-                }),
-                Err(_) => d.panics.push(LineFailure {
-                    line: d.lines,
-                    shape: shape_of(line),
-                    message: None,
+                    message: e.to_string(),
                 }),
             }
         }
@@ -600,8 +579,8 @@ mod tests {
         assert!(Drive::transcript("not-a-source", "/x.jsonl").is_none());
     }
 
-    /// A `Drive` over a STAND-IN decoder: no real decoder rejects or panics on
-    /// any corpus bytes, so neither failure lane below has a real fixture.
+    /// A `Drive` over a STAND-IN decoder: no real decoder rejects any corpus
+    /// bytes, so the error lane below has no real fixture.
     fn drive_with(decode: LineDecoder) -> Drive {
         Drive {
             transport: Transport::Jsonl,
@@ -635,8 +614,8 @@ mod tests {
         assert_eq!(d.decode_errors.len(), 1);
         assert_eq!(d.decode_errors[0].line, 1);
         assert_eq!(
-            d.decode_errors[0].message.as_deref(),
-            Some("unsupported fixture event: event")
+            d.decode_errors[0].message,
+            "unsupported fixture event: event"
         );
         let shape = &d.decode_errors[0].shape;
         assert!(
@@ -645,7 +624,6 @@ mod tests {
         );
         assert!(shape.contains("type=\"assistant\""), "got {shape}");
         assert!(shape.contains("secret"), "got {shape}");
-        assert!(d.panics.is_empty(), "a decode error is not a panic");
     }
 
     #[test]
@@ -701,53 +679,6 @@ mod tests {
             !rendered.contains("do not print me"),
             "Display must not echo the line's values, got {rendered}"
         );
-
-        fn boom(
-            _p: &str,
-            _s: &str,
-            _v: Value,
-        ) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
-            panic!("decoder blew up")
-        }
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let d = drive_with(boom).lines([PROSE_LINE]);
-        std::panic::set_hook(prev);
-        let rendered = d.panics[0].to_string();
-        assert!(!rendered.contains("blew up"), "got {rendered}");
-        assert!(
-            rendered.ends_with(']'),
-            "shape is the whole line, got {rendered}"
-        );
-    }
-
-    #[test]
-    fn a_panicking_decoder_is_caught_and_recorded_by_shape() {
-        fn boom(
-            _p: &str,
-            _s: &str,
-            _v: Value,
-        ) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
-            panic!("decoder blew up")
-        }
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let d = drive_with(boom).lines([PROSE_LINE]);
-        std::panic::set_hook(prev);
-
-        assert_eq!(d.panics.len(), 1, "the panic must be captured, not unwound");
-        assert_eq!(d.panics[0].line, 1);
-        assert!(
-            d.panics[0].shape.contains("type=\"assistant\""),
-            "got {}",
-            d.panics[0].shape
-        );
-        assert!(
-            !d.panics[0].shape.contains("do not print me"),
-            "got {}",
-            d.panics[0].shape
-        );
-        assert!(d.decode_errors.is_empty(), "a panic is not a decode error");
     }
 
     #[test]
