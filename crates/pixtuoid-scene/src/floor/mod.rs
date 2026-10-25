@@ -352,8 +352,6 @@ pub struct PetInputs<'a> {
 pub struct FloorInputs<'a> {
     /// The scene to render (the full live scene, or a projected single-floor one).
     pub scene: &'a SceneState,
-    /// The sprite pack.
-    pub pack: &'a OfficeArt,
     /// This frame's time — a parameter; the engine never reads the clock (wasm).
     pub now: SystemTime,
     /// This floor's index, altitude, and layout seed.
@@ -633,7 +631,7 @@ impl FloorSession {
     pub fn step(&mut self, world: FloorInputs<'_>, size: Size) -> Option<SteppedFloor> {
         self.evict_missing(world.scene);
         step_floor(
-            &mut self.view.floor.ctx,
+            &mut self.view.floor,
             &mut self.office.coffee,
             &mut self.office.chitchat,
             world,
@@ -644,18 +642,20 @@ impl FloorSession {
 
 /// [`FloorSession::step`] minus eviction, which a projected `world.scene` would turn on other floors.
 pub(crate) fn step_floor(
-    fctx: &mut FloorCtx,
+    floor: &mut PerFloor,
     coffee: &mut CoffeeState,
     chitchat: &mut HashMap<VenueKey, ActiveChitchat>,
     world: FloorInputs<'_>,
     size: Size,
 ) -> Option<SteppedFloor> {
+    let PerFloor { ctx: fctx, raster } = floor;
     let layout = fctx.frame_layout(size.w, size.h, world.floor.floor_seed)?;
     let door_anim_max_ms = fctx.door_anim_max_ms;
     let frame = sim_step(
         &mut fctx.sim_stores(chitchat),
         SimInputs {
             world,
+            pack: raster.pack(),
             layout: &layout,
             coffee: coffee.map(),
             door_anim_max_ms,
@@ -951,8 +951,7 @@ impl NeonState {
         Self::STUTTER_FLASHES_MS
             .iter()
             .map(|&(start, end)| end - start)
-            .min()
-            .unwrap_or(0)
+            .fold(u64::MAX, u64::min)
     }
 
     /// Advance to `mood` on `timing`; returns this frame's light. A count change

@@ -9,7 +9,7 @@ use crate::cutaway::wall::paint_wall;
 use crate::display::pen::test_density;
 use crate::floor::{FloorInputs, PetInputs};
 use crate::layout::CHARACTER_SPRITE_W;
-use crate::layout::{Point, Size, sort_row_at};
+use crate::layout::{HomeDesk, Point, Size, sort_row_at};
 use crate::pack::desk_art_top;
 use crate::physics::LegProgress;
 use crate::pose;
@@ -574,11 +574,11 @@ fn a_person_from_a_faithful_variant_renders_as_their_upscaled_base() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &bundled,
                 now: now0 + std::time::Duration::from_millis(250),
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &bundled,
             layout: &layout,
             coffee: &coffee,
             door_anim_max_ms: 0,
@@ -815,11 +815,11 @@ fn a_desk_variant_lands_where_the_base_does_and_draws_its_own_front() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &bundled,
                 now: now0 + std::time::Duration::from_secs(40),
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &bundled,
             layout: &layout,
             coffee: &coffee,
             door_anim_max_ms: 0,
@@ -919,8 +919,10 @@ fn a_lit_desk_variant_lands_its_screen_where_the_base_does() {
     use std::time::Duration;
     const DENSITY: u16 = 2;
     let (mut scene, layout, id, now0, bundled) = sim_rig();
-    let north = (0..layout.home_desks.len())
-        .find(|&i| layout.desk_facing(FloorLocalDeskIndex(i)) == Facing::North)
+    let north = layout
+        .home_desks
+        .iter()
+        .position(|d| d.facing == Facing::North)
         .expect("the office has a back-turned desk");
     let slot = scene.agents.get_mut(&id).expect("the rig's agent");
     slot.desk_index = GlobalDeskIndex(north);
@@ -939,11 +941,11 @@ fn a_lit_desk_variant_lands_its_screen_where_the_base_does() {
                 SimInputs {
                     world: FloorInputs {
                         scene: &scene,
-                        pack: &bundled,
                         now: now0 + Duration::from_millis(100 * n),
                         floor: crate::floor::FloorMeta::ground(),
                         pets: PetInputs::default(),
                     },
+                    pack: &bundled,
                     layout: &layout,
                     coffee: &coffee,
                     door_anim_max_ms: 0,
@@ -962,11 +964,11 @@ fn a_lit_desk_variant_lands_its_screen_where_the_base_does() {
         SimInputs {
             world: FloorInputs {
                 scene: &SceneState::uniform(16),
-                pack: &bundled,
                 now: now0,
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &bundled,
             layout: &layout,
             coffee: &coffee,
             door_anim_max_ms: 0,
@@ -1423,9 +1425,9 @@ fn settle_seat_recognizes_the_home_desk() {
     use crate::layout::{Furniture, desk_walk_anchor_facing};
     let l = SceneLayout::compute(192, 158, Some(TEST_DEFAULT_DESKS)).expect("fits");
     let desk = *l.home_desks.first().expect("at least one home desk");
-    let chair = desk_walk_anchor_facing(desk, l.desk_facing_at(desk));
+    let chair = desk_walk_anchor_facing(desk.at, desk.facing);
     // Pinning `Front` unconditionally would assert the pre-facing world.
-    let want = Seat::at_desk(desk, l.desk_facing_at(desk));
+    let want = Seat::at_desk(desk.at, desk.facing);
     assert_eq!(
         settle_seat(chair, &l),
         Some(want),
@@ -1439,14 +1441,14 @@ fn settle_seat_recognizes_the_home_desk() {
     // `seated_foot_cell` is facing-BLIND — it takes a kind and a position, so its
     // desk arm can only answer for the viewer-facing seat.
     assert_eq!(
-        crate::layout::seated_foot_cell(Furniture::Desk, desk),
+        crate::layout::seated_foot_cell(Furniture::Desk, desk.at),
         Some(crate::layout::desk_walk_anchor_facing(
-            desk,
+            desk.at,
             crate::layout::Facing::South
         ))
     );
     assert_eq!(
-        settle_seat(desk, &l),
+        settle_seat(desk.at, &l),
         None,
         "the desk corner is not the chair"
     );
@@ -1904,7 +1906,8 @@ fn a_seat_ties_its_sitter_and_hides_them_only_from_behind() {
         for f in &fixtures {
             if let FixtureKind::DeskChair(i) = f.kind {
                 chairs += 1;
-                let row = Seat::at_desk(layout.home_desks[i.0], layout.desk_facing(i)).sort_row();
+                let desk = layout.home_desks[i.0];
+                let row = Seat::at_desk(desk.at, desk.facing).sort_row();
                 assert_eq!(
                     f.depth,
                     Depth::Sorted {
@@ -2680,11 +2683,11 @@ fn sim_step_keeps_the_sign_lit_through_a_gap_in_a_room_that_once_dimmed() {
                     SimInputs {
                         world: FloorInputs {
                             scene,
-                            pack: &pack,
                             now,
                             floor: crate::floor::FloorMeta::ground(),
                             pets: PetInputs::default(),
                         },
+                        pack: &pack,
                         layout: &layout,
                         coffee: &coffee,
                         door_anim_max_ms: 0,
@@ -2731,11 +2734,11 @@ fn seat_desk_is_set_exactly_when_the_sim_seats_someone_at_a_desk() {
             SimInputs {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now: now0 + Duration::from_millis(ms),
                     floor: crate::floor::FloorMeta::ground(),
                     pets: PetInputs::default(),
                 },
+                pack: &pack,
                 layout: &layout,
                 coffee: &coffee,
                 door_anim_max_ms: 0,
@@ -2795,11 +2798,11 @@ fn sim_step_decides_each_desks_props_from_its_occupant() {
             SimInputs {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: crate::floor::FloorMeta::ground(),
                     pets: PetInputs::default(),
                 },
+                pack: &pack,
                 layout: &layout,
                 coffee: &coffee,
                 door_anim_max_ms: 0,
@@ -2819,7 +2822,7 @@ fn sim_step_decides_each_desks_props_from_its_occupant() {
     for (i, props) in fresh.iter().enumerate() {
         assert_eq!(
             props.scanline,
-            crate::sim::scanline_col(layout.home_desks[i].x, Motion::Full.beat(now0)),
+            crate::sim::scanline_col(layout.home_desks[i].at.x, Motion::Full.beat(now0)),
             "desk {i}'s scanline is its own column's"
         );
         if i != desk {
@@ -2855,11 +2858,11 @@ fn sim_step_roams_the_pet_and_holds_a_petted_one_where_it_stands() {
             SimInputs {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now: now0,
                     floor,
                     pets,
                 },
+                pack: &pack,
                 layout: &layout,
                 coffee: &coffee,
                 door_anim_max_ms: 0,
@@ -3002,11 +3005,11 @@ fn sim_step_walks_a_mascot_in_for_each_gateway_present() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &pack,
                 now: now0 + Duration::from_secs(6),
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &pack,
             layout: &layout,
             coffee: &coffee,
             door_anim_max_ms: 0,
@@ -3044,11 +3047,11 @@ fn a_mascot_hovers_sized_by_its_frame() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &pack,
                 now,
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &pack,
             layout: &layout,
             coffee: &HashMap::new(),
             door_anim_max_ms: 0,
@@ -3099,11 +3102,11 @@ fn sim_step_fits_every_mascot_frame_on_the_canvas() {
             SimInputs {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now: now0 + Duration::from_secs(s),
                     floor: crate::floor::FloorMeta::ground(),
                     pets: PetInputs::default(),
                 },
+                pack: &pack,
                 layout: &layout,
                 coffee: &coffee,
                 door_anim_max_ms: 0,
@@ -3146,11 +3149,11 @@ fn sim_step_advances_walks_without_painting() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &pack,
                 now: now0 + Duration::from_millis(50),
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &pack,
             layout: &layout,
             coffee: &coffee,
             door_anim_max_ms: 0,
@@ -3161,11 +3164,11 @@ fn sim_step_advances_walks_without_painting() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &pack,
                 now: now0 + Duration::from_millis(250),
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &pack,
             layout: &layout,
             coffee: &coffee,
             door_anim_max_ms: 0,
@@ -3202,9 +3205,7 @@ fn a_waiting_agent_stays_seated_and_gets_its_bubble_whichever_way_the_desk_faces
     let (mut scene, layout, id, now0, pack) = sim_rig();
     let coffee = HashMap::new();
     let mut seen = std::collections::BTreeSet::new();
-    for (i, &desk) in layout.home_desks.iter().enumerate() {
-        let _ = desk;
-        let facing = layout.desk_facing(pixtuoid_core::state::FloorLocalDeskIndex(i));
+    for (i, &HomeDesk { facing, .. }) in layout.home_desks.iter().enumerate() {
         let slot = scene.agents.get_mut(&id).expect("the rig's agent");
         slot.desk_index = GlobalDeskIndex(i);
         slot.state = ActivityState::Waiting {
@@ -3220,11 +3221,11 @@ fn a_waiting_agent_stays_seated_and_gets_its_bubble_whichever_way_the_desk_faces
             SimInputs {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: crate::floor::FloorMeta::ground(),
                     pets: PetInputs::default(),
                 },
+                pack: &pack,
                 layout: &layout,
                 coffee: &coffee,
                 door_anim_max_ms: 0,
@@ -3287,11 +3288,11 @@ fn the_hover_list_omits_the_undrawn_and_follows_sort_drawables() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &pack,
                 now,
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &pack,
             layout: &layout,
             coffee: &HashMap::new(),
             door_anim_max_ms: 0,
@@ -3680,11 +3681,11 @@ fn each_mascot_hovers_as_its_own_instance() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &pack,
                 now,
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &pack,
             layout: &layout,
             coffee: &HashMap::new(),
             door_anim_max_ms: 0,
@@ -3724,11 +3725,11 @@ fn paint_frame_is_pure_and_byte_identical() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &pack,
                 now,
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &pack,
             layout: &layout,
             coffee: &coffee,
             door_anim_max_ms: 0,
@@ -4257,11 +4258,11 @@ fn sim_reports_occupied_waypoints_and_enqueue_marks_them_busy() {
             SimInputs {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: crate::floor::FloorMeta::ground(),
                     pets: PetInputs::default(),
                 },
+                pack: &pack,
                 layout: &layout,
                 coffee: &coffee,
                 door_anim_max_ms: 0,
@@ -4354,11 +4355,11 @@ fn no_two_agents_ever_occupy_the_same_exclusive_waypoint() {
             SimInputs {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: crate::floor::FloorMeta::ground(),
                     pets: PetInputs::default(),
                 },
+                pack: &pack,
                 layout: &layout,
                 coffee: &coffee,
                 door_anim_max_ms: 0,
@@ -4418,11 +4419,11 @@ fn a_placement_is_seated_exactly_when_its_figure_sits_on_furniture() {
             SimInputs {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: crate::floor::FloorMeta::ground(),
                     pets: PetInputs::default(),
                 },
+                pack: &pack,
                 layout: &layout,
                 coffee: &coffee,
                 door_anim_max_ms: 0,
@@ -4485,11 +4486,11 @@ fn an_active_agent_releases_the_seat_it_snapped_back_from() {
             SimInputs {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: crate::floor::FloorMeta::ground(),
                     pets: PetInputs::default(),
                 },
+                pack: &pack,
                 layout: &layout,
                 coffee: &coffee,
                 door_anim_max_ms: 0,
@@ -4524,11 +4525,11 @@ fn an_active_agent_releases_the_seat_it_snapped_back_from() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &pack,
                 now,
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &pack,
             layout: &layout,
             coffee: &coffee,
             door_anim_max_ms: 0,
@@ -4608,11 +4609,11 @@ fn one_meeting_sofa_still_seats_three_agents_at_once() {
             SimInputs {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: crate::floor::FloorMeta::ground(),
                     pets: PetInputs::default(),
                 },
+                pack: &pack,
                 layout: &layout,
                 coffee: &coffee,
                 door_anim_max_ms: 0,
@@ -4668,11 +4669,11 @@ fn a_meeting_chair_sitter_is_drawn_on_the_seat_not_5px_high() {
                 SimInputs {
                     world: FloorInputs {
                         scene: &scene,
-                        pack: &pack,
                         now,
                         floor: crate::floor::FloorMeta::ground(),
                         pets: PetInputs::default(),
                     },
+                    pack: &pack,
                     layout: &layout,
                     coffee: &coffee,
                     door_anim_max_ms: 0,
@@ -4697,7 +4698,7 @@ fn a_meeting_chair_sitter_is_drawn_on_the_seat_not_5px_high() {
             w.pos,
             layout.pantry_counter_size(),
             &layout.walkable,
-            desk,
+            desk.at,
             w.facing,
             &layout.reachable,
         );
@@ -4817,7 +4818,6 @@ fn a_roaming_creature_is_never_sliced_by_the_canvas_edge() {
                 SimInputs {
                     world: FloorInputs {
                         scene: &scene,
-                        pack: &pack,
                         now,
                         floor,
                         pets: PetInputs {
@@ -4825,6 +4825,7 @@ fn a_roaming_creature_is_never_sliced_by_the_canvas_edge() {
                             petting: None,
                         },
                     },
+                    pack: &pack,
                     layout: &layout,
                     coffee: &HashMap::new(),
                     door_anim_max_ms: 0,
@@ -4979,11 +4980,11 @@ fn a_wandering_character_is_never_sliced_by_the_canvas_edge() {
                 SimInputs {
                     world: FloorInputs {
                         scene: &scene,
-                        pack: &pack,
                         now,
                         floor: crate::floor::FloorMeta::ground(),
                         pets: PetInputs::default(),
                     },
+                    pack: &pack,
                     layout: &layout,
                     coffee: &coffee,
                     door_anim_max_ms: 0,
@@ -5026,11 +5027,11 @@ fn sim_and_paint(
         SimInputs {
             world: FloorInputs {
                 scene,
-                pack,
                 now,
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack,
             layout,
             coffee: &HashMap::new(),
             door_anim_max_ms: 0,
@@ -5110,7 +5111,6 @@ fn badged(drawn: &Drawn) -> Vec<(Badged, crate::layout::Bounds)> {
 fn assert_badges_top_their_frames(
     frame: &SimFrame,
     drawn: &[(Badged, crate::layout::Bounds)],
-    layout: &SceneLayout,
     pack: &OfficeArt,
 ) {
     // A breath lifts the drawn top by one pixel, never the badge.
@@ -5129,13 +5129,9 @@ fn assert_badges_top_their_frames(
             .iter()
             .find(|c| frame.agents[c.agent_idx].agent_id == f.agent_id)
             .expect("every drawn sprite has a placement");
-        let desk_top = c.seat_desk.map(|d| {
-            desk_art_top(
-                pack,
-                d.y,
-                crate::pack::desk_art(pack, layout.desk_facing_at(d)).height(),
-            )
-        });
+        let desk_top = c
+            .seat_desk
+            .map(|d| desk_art_top(pack, d.at.y, crate::pack::desk_art(pack, d.facing).height()));
         match desk_top {
             Some(row) => assert!(
                 at.y <= row && (at.y == row || at.y >= body.y),
@@ -5174,7 +5170,7 @@ fn every_seated_badge_tops_its_frame_and_clears_a_raised_monitor() {
         scene.agents.len(),
         "premise: everyone is drawn"
     );
-    assert_badges_top_their_frames(&frame, &drawn, &layout, &pack);
+    assert_badges_top_their_frames(&frame, &drawn, &pack);
     assert!(
         drawn.iter().any(|(f, body)| f.label_anchor.y < body.y),
         "premise: some back-turned sitter's monitor rises over their head"
@@ -5224,8 +5220,10 @@ fn a_typist_keys_on_the_art_its_seat_resolves_to() {
         "[animations.typing_back]\nframes   = [\"typing_back_0.sprite\", \"typing_back_1.sprite\"]\nframe_ms = 250",
     ))
     .expect("the test pack parses");
-    let back = (0..layout.home_desks.len())
-        .find(|&i| layout.desk_facing(FloorLocalDeskIndex(i)) == Facing::North)
+    let back = layout
+        .home_desks
+        .iter()
+        .position(|d| d.facing == Facing::North)
         .expect("a back-turned desk");
     scene.agents.get_mut(&id).expect("the agent").desk_index = GlobalDeskIndex(back);
     let agents: Vec<AgentSlot> = scene.agents.values().cloned().collect();
@@ -5350,7 +5348,7 @@ fn co_located_visitors_badges_step_aside_with_their_sprites() {
     );
     let drawn = badged(&paint_drawn(&owned, &scene, &layout, &pack, now, &frame));
     assert_eq!(drawn.len(), 3, "premise: all three are drawn");
-    assert_badges_top_their_frames(&frame, &drawn, &layout, &pack);
+    assert_badges_top_their_frames(&frame, &drawn, &pack);
     let xs: std::collections::BTreeSet<_> = drawn.iter().map(|(f, _)| f.label_anchor.x).collect();
     assert_eq!(xs.len(), 3, "the badges stacked: {drawn:?}");
 }
@@ -5385,11 +5383,11 @@ fn a_badge_follows_its_sprite_fitted_to_the_canvas_rim() {
                 SimInputs {
                     world: FloorInputs {
                         scene: &scene,
-                        pack: &pack,
                         now,
                         floor: crate::floor::FloorMeta::ground(),
                         pets: PetInputs::default(),
                     },
+                    pack: &pack,
                     layout: &layout,
                     coffee: &coffee,
                     door_anim_max_ms: 0,
@@ -5402,7 +5400,7 @@ fn a_badge_follows_its_sprite_fitted_to_the_canvas_rim() {
                 continue;
             }
             let drawn = badged(&paint_drawn(&owned, &scene, &layout, &pack, now, &frame));
-            assert_badges_top_their_frames(&frame, &drawn, &layout, &pack);
+            assert_badges_top_their_frames(&frame, &drawn, &pack);
             at_the_rim += drawn
                 .iter()
                 .filter(|(_, body)| body.x + body.width == layout.buf_w)
@@ -5462,12 +5460,8 @@ fn every_north_facing_desk_enqueues_a_chair_and_no_south_one_does() {
         let want: std::collections::BTreeSet<(u16, u16)> = layout
             .home_desks
             .iter()
-            .enumerate()
-            .filter(|(i, _)| {
-                layout.desk_facing(pixtuoid_core::state::FloorLocalDeskIndex(*i))
-                    == crate::layout::Facing::North
-            })
-            .map(|(_, &d)| {
+            .filter(|d| d.facing == crate::layout::Facing::North)
+            .map(|&HomeDesk { at: d, .. }| {
                 (
                     crate::sim::anchors::seated_top_left(d, chair_w, crate::layout::Facing::North)
                         .x,
@@ -5812,11 +5806,11 @@ fn the_outside_reaches_only_the_glass() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &pack,
                 now: now0,
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &pack,
             layout: &layout,
             coffee: &HashMap::new(),
             door_anim_max_ms: 0,
@@ -5953,11 +5947,11 @@ fn the_neon_halo_lifts_the_window_glass_it_falls_on() {
         SimInputs {
             world: FloorInputs {
                 scene: &scene,
-                pack: &pack,
                 now: now0,
                 floor: crate::floor::FloorMeta::ground(),
                 pets: PetInputs::default(),
             },
+            pack: &pack,
             layout: &layout,
             coffee: &HashMap::new(),
             door_anim_max_ms: 0,

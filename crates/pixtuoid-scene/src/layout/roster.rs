@@ -5,9 +5,9 @@
 
 use super::placement::{boxed, centred};
 use super::{
-    Bounds, Facing, Furniture, Lounge, MeetingRoom, MeetingTrio, PantryRoom, Pivot, PlantItem,
-    PlantKind, PodDecor, PodDecorItem, Point, SceneLayout, Size, WallDecor, WallDecorItem,
-    WaypointKind, WindowBay, coat_rack_rect_at, furniture_def, sort_row_at,
+    Bounds, Facing, Furniture, HomeDesk, Lounge, MeetingRoom, MeetingTrio, PantryRoom, Pivot,
+    PlantItem, PlantKind, PodDecor, PodDecorItem, Point, SceneLayout, Size, WallDecor,
+    WallDecorItem, WaypointKind, WindowBay, coat_rack_rect_at, furniture_def, sort_row_at,
 };
 use pixtuoid_core::state::FloorLocalDeskIndex;
 
@@ -372,11 +372,11 @@ fn top_left(b: Bounds) -> Point {
 /// Each home desk's filing cabinet, then the desk: the fixture authority the
 /// floor whiteboard also clears, before the layout that rosters them exists.
 pub(crate) fn desk_fixtures(
-    home_desks: &[Point],
+    home_desks: impl IntoIterator<Item = Point>,
     buf_h: u16,
-) -> impl Iterator<Item = Fixture> + '_ {
+) -> impl Iterator<Item = Fixture> {
     let desk = furniture_def(Furniture::Desk).visual;
-    home_desks.iter().enumerate().flat_map(move |(i, &at)| {
+    home_desks.into_iter().enumerate().flat_map(move |(i, at)| {
         let local = FloorLocalDeskIndex(i);
         let depth = Depth::sorted(at.y + desk.h);
         filing_cabinet_top_left(at, local, buf_h)
@@ -396,24 +396,23 @@ pub(crate) fn desk_fixtures(
     })
 }
 
-/// Each home desk's task chair, where `facing` turns its desk north.
-pub(crate) fn desk_chair_fixtures(
-    home_desks: &[Point],
-    facing: impl Fn(FloorLocalDeskIndex) -> Facing,
-) -> impl Iterator<Item = Fixture> {
-    home_desks.iter().enumerate().filter_map(move |(i, &at)| {
-        let local = FloorLocalDeskIndex(i);
-        let facing = facing(local);
-        desk_chair_top_left(at, facing).map(|tl| Fixture {
-            kind: FixtureKind::DeskChair(local),
-            at: tl,
-            visual: boxed(tl, furniture_def(Furniture::DeskChair).visual),
-            depth: Depth::Sorted {
-                row: desk_chair_sort_row(at, facing),
-                tie: Tie::FixtureOver,
-            },
+/// Each home desk's task chair, where its facing turns it north.
+pub(crate) fn desk_chair_fixtures(home_desks: &[HomeDesk]) -> impl Iterator<Item = Fixture> + '_ {
+    home_desks
+        .iter()
+        .enumerate()
+        .filter_map(move |(i, &HomeDesk { at, facing })| {
+            let local = FloorLocalDeskIndex(i);
+            desk_chair_top_left(at, facing).map(|tl| Fixture {
+                kind: FixtureKind::DeskChair(local),
+                at: tl,
+                visual: boxed(tl, furniture_def(Furniture::DeskChair).visual),
+                depth: Depth::Sorted {
+                    row: desk_chair_sort_row(at, facing),
+                    tie: Tie::FixtureOver,
+                },
+            })
         })
-    })
 }
 
 /// Each pod decor item.
@@ -454,8 +453,6 @@ impl SceneLayout {
             cubicle_band: _,
             cubicle_aisle: _,
             home_desks,
-            // A desk attribute, read through `desk_facing`.
-            desk_facings: _,
             waypoints,
             plants,
             wall_decor,
@@ -544,7 +541,7 @@ impl SceneLayout {
                 self.island_bar_mat()
                     .map(|b| backdrop(FixtureKind::IslandMat, b)),
             )
-            .chain(desk_fixtures(home_desks, *buf_h))
+            .chain(desk_fixtures(home_desks.iter().map(|d| d.at), *buf_h))
             .chain(rooms.clone().filter_map(move |(room, _, trio)| {
                 // Off the corridor runner a south room's floor runs into.
                 let rug = trio?.0.rug(corridor.y);
@@ -602,7 +599,7 @@ impl SceneLayout {
                     )
             }))
             .chain(lounge.as_ref().map(|l| {
-                let first_desk_row = home_desks.iter().map(|d| d.y).min();
+                let first_desk_row = home_desks.iter().map(|d| d.at.y).min();
                 let rug = l.rug(first_desk_row.unwrap_or(*buf_h));
                 Fixture {
                     kind: FixtureKind::LoungeRug,
@@ -710,7 +707,7 @@ impl SceneLayout {
                 self.notice_board_rect(room)
                     .map(|b| upright(FixtureKind::NoticeBoard { room }, top_left(b), b))
             }))
-            .chain(desk_chair_fixtures(home_desks, |i| self.desk_facing(i)))
+            .chain(desk_chair_fixtures(home_desks))
     }
 
     /// The fixture hovering `cell` points at: the topmost whose art covers any

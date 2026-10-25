@@ -69,7 +69,7 @@ fn simplify_keeps_genuine_corner() {
 fn routes_around_meeting_room_wall() {
     let l = make_layout();
     let overlay = OccupancyOverlay::new();
-    let from = l.home_desks[0];
+    let from = l.home_desks[0].at;
     let pantry = l
         .waypoints
         .iter()
@@ -179,7 +179,7 @@ fn every_approach_point_is_routable_from_its_home_desk() {
             else {
                 continue;
             };
-            for &desk in &l.home_desks {
+            for &crate::layout::HomeDesk { at: desk, .. } in &l.home_desks {
                 for wp in &l.waypoints {
                     let a = approach_point(
                         wp.kind.furniture(),
@@ -279,13 +279,8 @@ fn every_aimless_wander_destination_is_routable_from_its_home_desk() {
                     for cycle in 0..8u64 {
                         let seed = aimless_wander_seed(id, cycle);
                         let dest = pick_aimless_dest(&l, seed, desk);
-                        if dest
-                            == crate::layout::desk_walk_anchor_facing(
-                                desk,
-                                crate::layout::Facing::South,
-                            )
-                        {
-                            continue; // documented last resort: the agent's own seat
+                        if dest == crate::layout::desk_walk_anchor_facing(desk.at, desk.facing) {
+                            continue; // `pick_aimless_dest`'s last resort: the agent's own seat
                         }
                         for &origin in &origins {
                             assert!(
@@ -614,7 +609,7 @@ fn transient_no_path_fallback_is_not_served_from_the_cache() {
 fn snap_point_to_walkable_returns_walkable_cell() {
     let l = make_layout();
     // A point inside a desk footprint (blocked, with obstacle pad).
-    let desk = l.home_desks[0];
+    let desk = l.home_desks[0].at;
     let blocked_p = Point {
         x: desk.x + 4,
         y: desk.y + 2,

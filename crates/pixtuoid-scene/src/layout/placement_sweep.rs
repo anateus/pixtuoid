@@ -29,7 +29,6 @@ const SWEEP_SIZES: &[(u16, u16)] = &[
     (super::compute::MIN_LAYOUT_W + 1, 120),
     (super::compute::MIN_LAYOUT_W + 3, 70),
     (super::compute::MIN_LAYOUT_W + 4, 160),
-    // The only size here reaching the #566 guard: one layout whose decor it degraded.
     (59, 148),
     (64, 130),
     (96, 60),
@@ -174,7 +173,7 @@ fn pieces(l: &SceneLayout) -> Vec<Piece> {
             FixtureKind::Desk(i) => out.push(Piece::table(
                 format!("desk[{}]", i.0),
                 Pivot::TopLeft,
-                l.home_desks[i.0],
+                l.home_desks[i.0].at,
                 Furniture::Desk,
                 Container::Band,
                 None,
@@ -863,7 +862,7 @@ fn wander_legs(l: &SceneLayout) -> Vec<WanderLeg> {
                 wp.facing,
                 l.pantry_counter_size(),
                 &l.walkable,
-                desk,
+                desk.at,
                 &l.reachable,
             );
             // A `wp.pos` sentinel is the documented "no valid approach"
@@ -872,7 +871,7 @@ fn wander_legs(l: &SceneLayout) -> Vec<WanderLeg> {
                 continue;
             }
             legs.push(WanderLeg {
-                desk,
+                desk: desk.at,
                 kind: wp.kind,
                 origin,
                 approach: a,
@@ -881,19 +880,6 @@ fn wander_legs(l: &SceneLayout) -> Vec<WanderLeg> {
         }
     }
     legs
-}
-
-/// Nothing in the type system pins `desk_facings` parallel to `home_desks`; a short one
-/// makes the tail desks silently fall back to `South`, passing every geometry invariant.
-fn assert_every_desk_has_a_facing(w: u16, h: u16, seed: u64, l: &SceneLayout) {
-    assert_eq!(
-        l.desk_facings.len(),
-        l.home_desks.len(),
-        "{w}x{h} seed {seed}: {} desks but {} facings — the tail would silently \
-         fall back to South",
-        l.home_desks.len(),
-        l.desk_facings.len()
-    );
 }
 
 /// The COARSE twin of [`assert_walkable_connected`]: that one is a 4-connected
@@ -935,24 +921,17 @@ fn every_home_desk_approach_is_routable_from_the_door() {
     sweep_production_floors(assert_home_desk_approaches_are_routable);
 }
 
-#[test]
-fn every_desk_has_a_facing() {
-    sweep(assert_every_desk_has_a_facing);
-    sweep_production_floors(assert_every_desk_has_a_facing);
-}
-
 /// A back-turned desk exists only to face a viewer-facing one across the pod's inner
 /// gap. Stated as the PAIRING, not as `pod_row_facing`'s formula a test could only copy.
 fn assert_back_turned_desks_face_a_partner(w: u16, h: u16, seed: u64, l: &SceneLayout) {
     let south: std::collections::HashSet<Point> = l
         .home_desks
         .iter()
-        .zip(&l.desk_facings)
-        .filter(|&(_, &f)| f == Facing::South)
-        .map(|(&d, _)| d)
+        .filter(|d| d.facing == Facing::South)
+        .map(|d| d.at)
         .collect();
-    for (&d, &f) in l.home_desks.iter().zip(&l.desk_facings) {
-        if f != Facing::North {
+    for &HomeDesk { at: d, facing } in &l.home_desks {
+        if facing != Facing::North {
             continue;
         }
         let partner = Point {
@@ -1046,7 +1025,7 @@ fn short_band_connectivity_boundary_scan() {
 /// Step-1 width sweep across the degradation band, running BOTH connectivity
 /// predicates at that resolution — the discrete `SWEEP_SIZES` grid can't cover
 /// every width, and a sealed pocket at a width it skips ships silently. Heights
-/// span the tall floors where the aisle-seal manifests; only 148 reaches the #566 guard.
+/// span the tall floors where the aisle-seal manifests.
 #[test]
 fn narrow_band_connectivity_boundary_scan() {
     for w in NARROW_BAND {
@@ -1076,7 +1055,7 @@ fn narrow_band_connectivity_boundary_scan() {
 /// Each pod's vertical extent from the desks ALONE, so the guards below test the
 /// layout's output rather than the placement helper's own idea of where the pods are.
 fn pod_y_extents(l: &SceneLayout) -> Vec<(u16, u16)> {
-    let mut ys: Vec<u16> = l.home_desks.iter().map(|d| d.y).collect();
+    let mut ys: Vec<u16> = l.home_desks.iter().map(|d| d.at.y).collect();
     ys.sort_unstable();
     ys.dedup();
     let mut pods = Vec::new();
@@ -1127,7 +1106,7 @@ fn free_standing_furniture_never_stands_inside_a_pod() {
 /// `the_width_floor_stands_no_whiteboard`.
 fn assert_the_whiteboard_lands_when_an_aisle_exists(w: u16, h: u16, seed: u64, l: &SceneLayout) {
     let has_side_rooms = !l.meeting_rooms.is_empty() || l.pantry.is_some();
-    let mut desk_columns: Vec<u16> = l.home_desks.iter().map(|d| d.x).collect();
+    let mut desk_columns: Vec<u16> = l.home_desks.iter().map(|d| d.at.x).collect();
     desk_columns.sort_unstable();
     desk_columns.dedup();
     let lone_pod_column = desk_columns.len() <= usize::from(POD_SIDE);

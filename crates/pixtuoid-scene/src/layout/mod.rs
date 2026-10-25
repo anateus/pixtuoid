@@ -266,6 +266,16 @@ impl Lounge {
     }
 }
 
+/// An agent's home desk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HomeDesk {
+    /// Its top-left, where the pod grid places it.
+    pub at: Point,
+    /// Which way its occupant faces — the ONE authority painters and the
+    /// approach/walk geometry share, so a seat is never drawn off its routed side.
+    pub facing: Facing,
+}
+
 /// The computed office geometry for one floor — quadrant bounds, per-agent
 /// desks, waypoints, decor, walls, and the walkability mask. Built once per
 /// `(buf_w, buf_h, max_desks)`.
@@ -281,11 +291,9 @@ pub struct SceneLayout {
     /// the appliance-placement region (vending/printer). Keep it distinct from
     /// `corridor`: same y/height, different x-extent.
     pub cubicle_aisle: Bounds,
-    /// Per-agent home-desk anchor positions, indexed floor-locally (read via
+    /// Per-agent home desks, indexed floor-locally (read via
     /// [`Self::home_desk`]).
-    pub home_desks: Vec<Point>,
-    /// Facing per home desk, parallel to [`Self::home_desks`].
-    pub(crate) desk_facings: Vec<Facing>,
+    pub home_desks: Vec<HomeDesk>,
     /// Named stops (lounge seats, appliances, meeting slots) agents walk to.
     pub waypoints: Vec<Waypoint>,
     /// Placed potted plants.
@@ -479,6 +487,7 @@ pub(crate) const INTER_POD_AISLE_Y: u16 = 18;
 impl SceneLayout {
     /// Returns `None` if the buffer is too small for even one cubicle plus the
     /// fixed lounge area — the caller paints a "terminal too small" message.
+    /// Panics where [`Self::compute_with_seed`] does.
     pub fn compute(buf_w: u16, buf_h: u16, max_desks: Option<usize>) -> Option<Self> {
         Self::compute_with_seed(buf_w, buf_h, max_desks, 0)
     }
@@ -487,6 +496,11 @@ impl SceneLayout {
     /// physical capacity, `Some(n)` caps at `n` for deterministic
     /// tests/snapshots. The pod grid geometry is always the room's true
     /// capacity regardless of the cap.
+    ///
+    /// # Panics
+    ///
+    /// If the office is still sealed once the #566 guard has dropped every
+    /// decor that can seal it: a layout bug no production floor seed is known to reach.
     pub fn compute_with_seed(
         buf_w: u16,
         buf_h: u16,
@@ -501,10 +515,10 @@ impl SceneLayout {
         self.walkable.is_walkable(x, y)
     }
 
-    /// Typed accessor for a floor's home-desk anchor. `home_desks` is a
+    /// Typed accessor for a floor's home desk. `home_desks` is a
     /// FLOOR-LOCAL vector — index it through a `FloorLocalDeskIndex`, never
     /// with an `AgentSlot.desk_index` directly.
-    pub fn home_desk(&self, i: FloorLocalDeskIndex) -> Option<Point> {
+    pub fn home_desk(&self, i: FloorLocalDeskIndex) -> Option<HomeDesk> {
         self.home_desks.get(i.0).copied()
     }
 
@@ -555,25 +569,6 @@ impl SceneLayout {
             };
             covers && inside(f.visual)
         })
-    }
-
-    /// Which way the desk AT `pos` seats its occupant (an O(desks) scan).
-    pub(crate) fn desk_facing_at(&self, pos: Point) -> Facing {
-        self.home_desks
-            .iter()
-            .position(|&d| d == pos)
-            .map_or(Facing::South, |i| self.desk_facing(FloorLocalDeskIndex(i)))
-    }
-
-    /// Which way desk `i`'s occupant faces — the ONE authority painters and the
-    /// approach/walk geometry share, so a seat is never drawn off its routed side.
-    pub fn desk_facing(&self, i: FloorLocalDeskIndex) -> Facing {
-        debug_assert_eq!(
-            self.desk_facings.len(),
-            self.home_desks.len(),
-            "desk_facings is index-parallel to home_desks; a short one seats the tail viewer-facing and passes every geometry invariant"
-        );
-        self.desk_facings.get(i.0).copied().unwrap_or(Facing::South)
     }
 
     /// The visible top window-wall band height in px: [`wall_band_h`] of this

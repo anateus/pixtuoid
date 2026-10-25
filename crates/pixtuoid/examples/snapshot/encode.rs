@@ -164,9 +164,9 @@ pub(crate) fn compute_crop_rect(
                     anyhow::anyhow!("agent {agent_label:?} is neither placed nor at a home desk")
                 })?;
                 pixtuoid_scene::sim::seated_top_left(
-                    desk,
+                    desk.at,
                     pixtuoid_scene::layout::CHARACTER_SPRITE_W,
-                    layout.desk_facing(idx),
+                    desk.facing,
                 )
             }
         }
@@ -180,7 +180,7 @@ pub(crate) fn compute_crop_rect(
         )
         .ok_or_else(|| anyhow::anyhow!("scene too small to compute a layout"))?;
         let found = match furniture_str.to_lowercase().as_str() {
-            "desk" => layout.home_desks.first().copied(),
+            "desk" => layout.home_desks.first().map(|d| d.at),
             name => {
                 let kind = crate::scenes::waypoint_target(name).ok_or_else(|| {
                     anyhow::anyhow!(
@@ -444,7 +444,7 @@ pub(crate) fn save_renderer_animation(
             for floor in due_navigations(navigations, &mut fired, elapsed_ms) {
                 r.navigate_floor(floor, now);
             }
-            r.render(job.scene, job.pack, now)
+            r.render(job.scene, now)
         },
         |r| r.terminal.backend().buffer(),
     )
@@ -468,15 +468,7 @@ pub(crate) fn save_animation(
         |term, now, _| {
             let mut draw_ctx = DrawCtx {
                 debug_walkable,
-                ..DrawCtx::offscreen(
-                    floor,
-                    office.stores(),
-                    job.theme,
-                    scene,
-                    job.pack,
-                    now,
-                    floor_meta,
-                )
+                ..DrawCtx::offscreen(floor, office.stores(), job.theme, scene, now, floor_meta)
             };
             draw_scene(term, &mut draw_ctx).map(drop)
         },
