@@ -319,15 +319,11 @@ const officeDriverUrl = asset('office-driver.js');
 >
   (function () {
     const script = document.currentScript;
-    if (!(script instanceof HTMLScriptElement)) return;
     const { wasmJsUrl, audioWorkerUrl, musicWorkerUrl, musicWorkletUrl, officeDriverUrl } =
       script.dataset;
-    if (!wasmJsUrl || !audioWorkerUrl || !musicWorkerUrl || !musicWorkletUrl || !officeDriverUrl)
-      return;
 
     const wrap = document.querySelector('.backdrop');
     const canvas = document.getElementById('office-live');
-    if (!wrap || !canvas) return;
     const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
     const hasWasm = typeof WebAssembly !== 'undefined';
 
@@ -407,7 +403,7 @@ const officeDriverUrl = asset('office-driver.js');
     let lastLabelPx = -1;
 
     function ensureBoard() {
-      if (boardWrap || !overlayEl) return;
+      if (boardWrap) return;
       boardWrap = document.createElement('div');
       boardWrap.className = 'ov-board';
       const top = document.createElement('div');
@@ -450,13 +446,8 @@ const officeDriverUrl = asset('office-driver.js');
     }
 
     function updateOverlay() {
-      if (!overlayEl || bufW < 1) return;
-      let data;
-      try {
-        data = JSON.parse(office.overlay_json());
-      } catch (e) {
-        return; // a malformed frame degrades to no overlay, never a throw
-      }
+      if (bufW < 1) return;
+      const data = JSON.parse(office.overlay_json());
       const map = coverMap();
       // Written as a shared CSS var, not per-span, so the labels don't each
       // reflow every frame.
@@ -465,7 +456,7 @@ const officeDriverUrl = asset('office-driver.js');
         lastLabelPx = labelPx;
         overlayEl.style.setProperty('--ov-label-px', labelPx + 'px');
       }
-      const labels = data.labels || [];
+      const labels = data.labels;
       const lift = Math.max(2, map.s); // ~1 buffer px above the head-top
       let i = 0;
       for (; i < labels.length; i++) {
@@ -480,7 +471,7 @@ const officeDriverUrl = asset('office-driver.js');
           labelPool[i] = el;
         }
         const L = labels[i];
-        const key = L.text + '\u0000' + L.color + '\u0000' + (L.badge || '');
+        const key = L.text + '\u0000' + L.color + '\u0000' + L.badge;
         if (el._k !== key) {
           el._k = key;
           const parts = el.children;
@@ -488,7 +479,7 @@ const officeDriverUrl = asset('office-driver.js');
           parts[1].textContent = L.text.slice(1);
           parts[0].className = 'ov-strip';
           parts[0].style.backgroundColor = L.color;
-          parts[1].style.color = L.badge || L.color;
+          parts[1].style.color = L.badge;
         }
         const x = map.ox + L.x * map.s;
         const y = map.oy + L.y * map.s - lift;
@@ -523,8 +514,8 @@ const officeDriverUrl = asset('office-driver.js');
       boardBrand.style.color = b.brand.color;
       boardStar.textContent = b.star.text;
       boardStar.style.color = b.star.color;
-      setSegments(boardMood, b.mood || []);
-      setSegments(boardCtx, b.context || []);
+      setSegments(boardMood, b.mood);
+      setSegments(boardCtx, b.context);
     }
 
     function paint(nowMs) {
@@ -532,7 +523,6 @@ const officeDriverUrl = asset('office-driver.js');
       office.step(nowMs, bufW, BUF_H);
       // Re-read ptr/len every frame — resize and memory.grow move the frame view.
       const view = officeDriver.officeFrameView(office, wasm);
-      if (view.length !== img.data.length) return;
       markEngineResolved();
       // Hold on the bg-tone cover until the boot splash lifts: the roll is never played hidden behind the overlay.
       if (!splashCleared) return;
@@ -561,7 +551,7 @@ const officeDriverUrl = asset('office-driver.js');
         ctx2d.putImageData(img, 0, 0);
         // Caption the settled office only: labels track the FINAL sprite positions, so they'd smear over the rolling floors.
         updateOverlay();
-        if (overlayEl) overlayEl.classList.add('is-on');
+        overlayEl.classList.add('is-on');
       }
     }
     // putImageData writes the sub-1 alpha straight to the canvas, so the
@@ -617,7 +607,7 @@ const officeDriverUrl = asset('office-driver.js');
     // pauseOffset resumes from the frozen moment; tab-hidden stops take NO offset on purpose — the office keeps living while you're away.
     function setPaused(p) {
       paused = p;
-      if (pauseBtn) pauseBtn.setAttribute('aria-pressed', String(p));
+      pauseBtn.setAttribute('aria-pressed', String(p));
       // WCAG 2.2.2 covers the page, not just this canvas — ONE control fans out to every other auto-motion surface.
       document.dispatchEvent(new CustomEvent('pix:paused', { detail: { paused: p } }));
       if (audioCtx && audioPlaying) {
@@ -632,14 +622,12 @@ const officeDriverUrl = asset('office-driver.js');
         start();
       }
     }
-    if (pauseBtn) {
-      pauseBtn.addEventListener('click', function () {
-        setPaused(!paused);
-      });
-    }
+    pauseBtn.addEventListener('click', function () {
+      setPaused(!paused);
+    });
     // The pause control governs the page's wasm-independent ambient motion via pix:paused, so it stays reachable on a no-wasm engine or a failed fetch (#456).
     function syncPauseBtn() {
-      if (pauseBtn) pauseBtn.hidden = mq.matches;
+      pauseBtn.hidden = mq.matches;
     }
     syncPauseBtn();
 
@@ -657,7 +645,6 @@ const officeDriverUrl = asset('office-driver.js');
     let oneShotBufs = {};
     let audioSR = 44100;
     let gainDezipperS = 0;
-    const ONESHOT_WIRES = [0, 1, 2, 3, 4];
 
     // Copy OUT of wasm memory before the next memory.grow detaches the view — audioSR is a param so no wasm call splits the view from the copy.
     function audioMakeBuffer(ptr, len) {
@@ -690,12 +677,10 @@ const officeDriverUrl = asset('office-driver.js');
       musicGain.gain.value = 0;
       musicGain.connect(audioBus);
       oneShotBufs = {};
-      for (const wire of ONESHOT_WIRES) {
+      for (const wire of office.audio_oneshot_wires()) {
         oneShotBufs[wire] = [];
         // Grow until the engine reports an empty slot, so the Rust-side pool size is never duplicated across the wire.
-        // POOL_MAX is belt-and-braces: a regression returning non-empty unboundedly must never hang the main thread.
-        const POOL_MAX = 1024;
-        for (let j = 0; j < POOL_MAX && office.audio_oneshot_len(wire, j) > 0; j++) {
+        for (let j = 0; office.audio_oneshot_len(wire, j) > 0; j++) {
           oneShotBufs[wire].push(
             audioMakeBuffer(office.audio_oneshot_ptr(wire, j), office.audio_oneshot_len(wire, j))
           );
@@ -750,12 +735,7 @@ const officeDriverUrl = asset('office-driver.js');
     function audioTick(nowMs) {
       if (!audioReady || !audioCtx) return;
       // ALWAYS advance the engine even while MUTED: skipping the tick freezes the cue tracker, which then replays a stacked one-shot volley on unmute.
-      let cmd;
-      try {
-        cmd = JSON.parse(office.audio_tick(nowMs));
-      } catch (e) {
-        return; // a bad frame degrades to holding the last gains, never a throw
-      }
+      const cmd = JSON.parse(office.audio_tick(nowMs));
       if (cmd.music) musicTick(cmd.music.controls);
       // Muted = a suspended AudioContext: nodes queued against one all fire at once on resume, so schedule nothing.
       if (!audioPlaying) return;
@@ -815,10 +795,8 @@ const officeDriverUrl = asset('office-driver.js');
         audioBus = null;
         musicGain = null;
       }
-      if (audioBtn) {
-        audioBtn.setAttribute('aria-pressed', 'false');
-        audioBtn.hidden = true;
-      }
+      audioBtn.setAttribute('aria-pressed', 'false');
+      audioBtn.hidden = true;
     }
     let prewarm = 'idle';
     let prewarmWorker = null;
@@ -863,7 +841,7 @@ const officeDriverUrl = asset('office-driver.js');
       const pieces = [];
       // The worker's loop list is sized by the Rust-side loop_count() authority — adopt whatever it sent; audio_adopt_loop validates.
       for (let i = 0; i < data.loops.length; i++) pieces.push({ loop: i, buf: data.loops[i] });
-      for (const wire of ONESHOT_WIRES) {
+      for (const wire of office.audio_oneshot_wires()) {
         for (const buf of data.oneshots[wire] || []) pieces.push({ wire: wire, buf: buf });
       }
       let at = 0;
@@ -973,7 +951,7 @@ const officeDriverUrl = asset('office-driver.js');
     }
     function setAudioPlaying(on) {
       audioPlaying = on;
-      if (audioBtn) audioBtn.setAttribute('aria-pressed', String(on));
+      audioBtn.setAttribute('aria-pressed', String(on));
       try {
         window.localStorage.setItem(AUDIO_PREF, on ? '1' : '0');
       } catch (e) {
@@ -983,18 +961,16 @@ const officeDriverUrl = asset('office-driver.js');
       if (on && !paused) audioCtx.resume();
       else audioCtx.suspend();
     }
-    if (audioBtn) {
-      audioBtn.addEventListener('click', function () {
-        if (audioUnavailable) return;
-        if (!audioReady && !audioBooting) audioStart();
-        if (audioUnavailable) return; // audioStart just failed (ctor threw) → don't flip to a silent "playing"
-        setAudioPlaying(!audioPlaying);
-      });
-    }
+    audioBtn.addEventListener('click', function () {
+      if (audioUnavailable) return;
+      if (!audioReady && !audioBooting) audioStart();
+      if (audioUnavailable) return; // audioStart just failed (ctor threw) → don't flip to a silent "playing"
+      setAudioPlaying(!audioPlaying);
+    });
     let audioBtnShown = false;
     // AUDIO_PREF is a remembered CHOICE restored on the visitor's FIRST gesture: autoplay policy forbids resuming without one, so this can never become an on-load restore.
     function showAudioBtn() {
-      if (!audioBtn || mq.matches || audioBtnShown) return;
+      if (mq.matches || audioBtnShown) return;
       audioBtn.hidden = false;
       audioBtnShown = true;
       let remembered = false;
@@ -1082,11 +1058,7 @@ const officeDriverUrl = asset('office-driver.js');
               setTimeout(prewarmSpawn, PREWARM_IDLE_FALLBACK_MS);
             }
             window.__pixHire = function () {
-              try {
-                return office.hire();
-              } catch (e) {
-                return false; // never let a background flourish break the click
-              }
+              return office.hire();
             };
           });
         })
@@ -1158,10 +1130,10 @@ const officeDriverUrl = asset('office-driver.js');
           stopBgTicks(); // hidden-tab playback must not re-animate a poster-still office
           // Reduced motion IS the poster-still design: reset the pause flag, or the statusline feed / hero dust stay stuck paused after a later un-reduce.
           paused = false;
-          if (pauseBtn) pauseBtn.setAttribute('aria-pressed', 'false');
+          pauseBtn.setAttribute('aria-pressed', 'false');
           document.dispatchEvent(new CustomEvent('pix:paused', { detail: { paused: false } }));
           wrap.classList.remove('is-live');
-          if (overlayEl) overlayEl.classList.remove('is-on');
+          overlayEl.classList.remove('is-on');
           live = false;
           // …and rewind the reveal with it, or the surviving progress leaves rt >= 1 and the office SNAPS back in on un-reduce.
           reveal = freshReveal();
@@ -1169,7 +1141,7 @@ const officeDriverUrl = asset('office-driver.js');
           // Reduced motion stops the rAF loop, so the sound loops would drone unfed behind the poster — suspend, keeping the
           // flag on so an un-reduce resumes it. Re-arm the ♩, or showAudioBtn's once-guard keeps it hidden through the fresh boot.
           if (audioCtx && audioPlaying) audioCtx.suspend();
-          if (audioBtn) audioBtn.hidden = true;
+          audioBtn.hidden = true;
           audioBtnShown = false;
         } else if (hasWasm) {
           cover();
@@ -1188,7 +1160,6 @@ const officeDriverUrl = asset('office-driver.js');
   // center and releases it in the gaps. One style.opacity write per changed frame keeps it compositor-only.
   (function () {
     const dimmer = document.getElementById('dimmer');
-    if (!dimmer) return;
     const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
     const DIM_MAX = 0.86;
 
