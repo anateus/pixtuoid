@@ -107,6 +107,12 @@ pub enum AgentEvent {
         /// The completing tool call's id (pairs with its `ActivityStart`).
         tool_use_id: Option<String>,
     },
+    /// The agent's foreground work ended: its turn, or a wait outside one
+    /// (codewhale `session_idle`). It names no call.
+    TurnEnd {
+        /// The agent whose work ended.
+        agent_id: AgentId,
+    },
     /// The agent is blocked on a permission/input prompt — the slot goes Waiting.
     Waiting {
         /// The waiting agent.
@@ -253,12 +259,19 @@ impl AgentEvent {
         }
     }
 
+    /// A turn's end. THE constructor every decoder mints one through, so a
+    /// field it gains lands in ONE place.
+    pub(crate) fn turn_end(agent_id: AgentId) -> Self {
+        AgentEvent::TurnEnd { agent_id }
+    }
+
     /// The agent id this event concerns (every variant carries one).
     pub fn agent_id(&self) -> AgentId {
         match self {
             AgentEvent::SessionStart { agent_id, .. } => *agent_id,
             AgentEvent::ActivityStart { agent_id, .. } => *agent_id,
             AgentEvent::ActivityEnd { agent_id, .. } => *agent_id,
+            AgentEvent::TurnEnd { agent_id } => *agent_id,
             AgentEvent::Waiting { agent_id, .. } => *agent_id,
             AgentEvent::Rename { agent_id, .. } => *agent_id,
             AgentEvent::SessionEnd { agent_id, .. } => *agent_id,
@@ -270,14 +283,33 @@ impl AgentEvent {
     }
 
     /// Whether this event shows its session working now: the creation
-    /// polarity's evidence for a slot no start announced. A start carries its
-    /// own authority, and an end, a model, usage or title line shows nothing,
-    /// nor does [`ProofOfLife`](Self::ProofOfLife), which vouches a visible
-    /// slot past the sweeps and must never create one.
+    /// polarity's evidence for a slot no start announced. A session start
+    /// carries its own authority, and a session end, a model, usage or title
+    /// line shows nothing, nor does [`ProofOfLife`](Self::ProofOfLife), which
+    /// vouches a visible slot past the sweeps and must never create one.
     pub(crate) fn shows_activity(&self) -> bool {
         match self {
             AgentEvent::ActivityStart { .. }
             | AgentEvent::ActivityEnd { .. }
+            | AgentEvent::TurnEnd { .. }
+            | AgentEvent::Waiting { .. } => true,
+            AgentEvent::SessionStart { .. }
+            | AgentEvent::Rename { .. }
+            | AgentEvent::SessionEnd { .. }
+            | AgentEvent::ProofOfLife { .. }
+            | AgentEvent::Identity { .. }
+            | AgentEvent::ModelInfo { .. }
+            | AgentEvent::Usage { .. } => false,
+        }
+    }
+
+    /// Whether this event is its session's work, which keeps the session and
+    /// its ancestors past the stale sweep.
+    pub(crate) fn refreshes_lineage(&self) -> bool {
+        match self {
+            AgentEvent::ActivityStart { .. }
+            | AgentEvent::ActivityEnd { .. }
+            | AgentEvent::TurnEnd { .. }
             | AgentEvent::Waiting { .. } => true,
             AgentEvent::SessionStart { .. }
             | AgentEvent::Rename { .. }
