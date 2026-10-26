@@ -127,8 +127,10 @@ const officeDriverUrl = asset('office-driver.js');
     pointer-events: none;
     opacity: 0;
     transition: opacity 0.35s ease;
-    font-family: var(--font-mono);
-    --ov-label-px: 12px;
+    font-family: 'Fusion Pixel 8px', var(--font-mono);
+    /* One weight: a synthesized bold smears its pixels. */
+    font-synthesis: none;
+    --ov-label-px: 16px;
   }
   .backdrop__overlay.is-on {
     opacity: 1;
@@ -144,9 +146,7 @@ const officeDriverUrl = asset('office-driver.js');
     top: 0;
     white-space: nowrap;
     font-size: var(--ov-label-px);
-    font-weight: 600;
     line-height: 1;
-    letter-spacing: -0.01em;
     text-shadow:
       0 1px 2px rgba(0, 0, 0, 0.9),
       0 0 3px rgba(0, 0, 0, 0.75);
@@ -163,8 +163,14 @@ const officeDriverUrl = asset('office-driver.js');
     color: transparent;
     text-shadow: none;
   }
-  /* A status lamp with a glint, glowing in its tone, where the glyph was. */
+  /* A status lamp with a glint, glowing in its tone, where the glyph was:
+     one column, though the face draws the glyph full-width. */
   .ov-lamp {
+    display: inline-block;
+    width: 1ch;
+    height: 1em;
+    overflow: hidden;
+    vertical-align: top;
     color: transparent;
     text-shadow: none;
     background: radial-gradient(
@@ -184,8 +190,6 @@ const officeDriverUrl = asset('office-driver.js');
     justify-content: space-between;
     overflow: hidden;
     line-height: 1;
-    font-weight: 700;
-    letter-spacing: -0.02em;
     text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
     will-change: transform;
   }
@@ -377,6 +381,7 @@ const officeDriverUrl = asset('office-driver.js');
     let raf = 0;
     let last = 0;
     let live = false;
+    let captionFace = false;
     const pauseBtn = document.getElementById('office-pause');
     let paused = false;
     let pauseOffset = 0;
@@ -445,13 +450,22 @@ const officeDriverUrl = asset('office-driver.js');
       return { s, ox: r.left + (r.width - bufW * s) / 2, oy: r.top + (r.height - BUF_H * s) / 2 };
     }
 
+    // Fusion Pixel 8px's em: its glyph pixels land on whole CSS pixels only at
+    // a multiple, so a size snaps to one; a box under one em keeps its own.
+    const PIXEL_EM = 8;
+    function pixelEm(px, snap) {
+      const ems = snap(px / PIXEL_EM);
+      return ems < 1 ? px : PIXEL_EM * ems;
+    }
+
     function updateOverlay() {
       if (bufW < 1) return;
       const data = JSON.parse(office.overlay_json());
       const map = coverMap();
       // Written as a shared CSS var, not per-span, so the labels don't each
       // reflow every frame.
-      const labelPx = Math.max(9, Math.min(20, map.s * 2.2));
+      // At least 9 px, snapped to the face's em, at most two ems.
+      const labelPx = Math.min(2 * PIXEL_EM, pixelEm(Math.max(9, map.s * 2.2), Math.round));
       if (labelPx !== lastLabelPx) {
         lastLabelPx = labelPx;
         overlayEl.style.setProperty('--ov-label-px', labelPx + 'px');
@@ -509,7 +523,7 @@ const officeDriverUrl = asset('office-driver.js');
       boardWrap.style.transform = 'translate(' + bx + 'px,' + by + 'px)';
       boardWrap.style.width = bw + 'px';
       boardWrap.style.height = bh + 'px';
-      boardWrap.style.fontSize = Math.max(4, (bh / 3) * 0.82) + 'px';
+      boardWrap.style.fontSize = pixelEm((bh / 3) * 0.82, Math.floor) + 'px';
       boardBrand.textContent = b.brand.text;
       boardBrand.style.color = b.brand.color;
       boardStar.textContent = b.star.text;
@@ -550,8 +564,10 @@ const officeDriverUrl = asset('office-driver.js');
         img.data.set(view);
         ctx2d.putImageData(img, 0, 0);
         // Caption the settled office only: labels track the FINAL sprite positions, so they'd smear over the rolling floors.
-        updateOverlay();
-        overlayEl.classList.add('is-on');
+        if (captionFace) {
+          updateOverlay();
+          overlayEl.classList.add('is-on');
+        }
       }
     }
     // putImageData writes the sub-1 alpha straight to the canvas, so the
@@ -1037,6 +1053,12 @@ const officeDriverUrl = asset('office-driver.js');
     function boot() {
       if (booted) return;
       booted = true;
+      // The captions' face, fetched beside the wasm: `optional` keeps a face
+      // that is late at its first use out for the whole visit.
+      const faceIn = function () {
+        captionFace = true;
+      };
+      document.fonts.load('8px "Fusion Pixel 8px"').then(faceIn, faceIn);
       // Showcase.astro's VIBING channel boots a SECOND Office off the SAME wasm module, and __wbg_init memoizes only the RESOLVED
       // instance — two racing `mod.default()` calls each instantiate and stomp the one module-global `wasm`, so drv.sharedWasm memoizes ONE init promise.
       import(officeDriverUrl)

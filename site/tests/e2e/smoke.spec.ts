@@ -758,7 +758,10 @@ test('crisp AA captions overlay the live office (name badges + neon board)', asy
   const label = page.locator('#office-overlay .ov-label').first();
   await expect(label).toHaveText(/\S/, { timeout: 10_000 });
   const labelFont = await label.evaluate((el) => getComputedStyle(el).fontFamily);
-  expect(labelFont).toContain('Monaspace Neon');
+  expect(labelFont).toContain('Fusion Pixel 8px');
+  // A glyph pixel lands on whole CSS pixels only at a multiple of the face's em.
+  const labelPx = await label.evaluate((el) => parseFloat(getComputedStyle(el).fontSize));
+  expect(labelPx % 8).toBe(0);
   const parts = await label.evaluate((el) =>
     Array.from(el.children).map((c) => ({
       text: c.textContent,
@@ -772,7 +775,11 @@ test('crisp AA captions overlay the live office (name badges + neon board)', asy
   const brand = page.locator('#office-overlay .ov-board .ov-brow--top span').first();
   await expect(brand).toHaveText(/\S/, { timeout: 10_000 });
   const brandFont = await brand.evaluate((el) => getComputedStyle(el).fontFamily);
-  expect(brandFont).toContain('Monaspace Neon');
+  expect(brandFont).toContain('Fusion Pixel 8px');
+  const faces = await page.evaluate(
+    async () => (await document.fonts.load('8px "Fusion Pixel 8px"', 'a')).length
+  );
+  expect(faces).toBeGreaterThan(0);
   expect(errors()).toEqual([]);
 });
 
@@ -827,6 +834,38 @@ test('the neon board keeps one monospace column per char, through a flap roll', 
     samples[0].ch / 2
   );
   expect(errors()).toEqual([]);
+});
+
+// The board's box is six office pixels tall: under one em a row keeps its own
+// size, or the third row falls out of the box.
+test('the neon board keeps its rows inside its box on a landscape phone', async ({ page }) => {
+  const errors = watchErrors(page);
+  await page.setViewportSize({ width: 844, height: 390 });
+  await gotoLive(page);
+  await expect(page.locator('#office-overlay.is-on')).toBeAttached({ timeout: 10_000 });
+  const board = page.locator('#office-overlay .ov-board');
+  await expect(board.locator('span').first()).toHaveText(/\S/, { timeout: 10_000 });
+  expect(await board.evaluate((el) => el.scrollHeight <= el.clientHeight)).toBe(true);
+  expect(errors()).toEqual([]);
+});
+
+// A face that fails to load falls back, as every site face does, never
+// leaving the office uncaptioned.
+test('the captions show in a fallback when their face fails to load', async ({ page }) => {
+  const errors = watchErrors(page);
+  let faceHits = 0;
+  await page.route('**/fusion-pixel-8px*.woff2', (route) => {
+    faceHits++;
+    return route.abort();
+  });
+  await gotoLive(page);
+  await expect(page.locator('#office-overlay.is-on')).toBeAttached({ timeout: 10_000 });
+  await expect(page.locator('#office-overlay .ov-label').first()).toHaveText(/\S/, {
+    timeout: 10_000,
+  });
+  expect(faceHits, 'the face fetch was aborted').toBeGreaterThan(0);
+  // The one error is the aborted fetch itself.
+  expect(errors().filter((e) => !e.includes('net::ERR_FAILED'))).toEqual([]);
 });
 
 test('reduced motion hides the caption overlay (still poster, no captions)', async ({
