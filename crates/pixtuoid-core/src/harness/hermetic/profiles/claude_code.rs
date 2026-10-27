@@ -11,7 +11,7 @@ const TUI: tui::Tui = tui::Tui {
     args: &["--permission-mode", "manual"],
     composer: tui::Composer {
         marker: "❯",
-        above: tui::Above::Rule {
+        border: tui::Border::Rule {
             glyph: '─',
             corners: None,
         },
@@ -24,8 +24,9 @@ const TUI: tui::Tui = tui::Tui {
         // ignores keys for (`AM=150`).
         dwell: std::time::Duration::from_secs(7),
     }],
+    cancel: &[],
     quit: &[tui::Key::Text("/exit"), tui::Key::Enter],
-    renders_under_conpty: true,
+    conpty: tui::ConPty::Renders,
 };
 
 pub(crate) const PROFILE: Profile = Profile {
@@ -124,10 +125,7 @@ pub(crate) const PROFILE: Profile = Profile {
         Scenario {
             name: "permission",
             shape: Shape::Permission,
-            surface: Surface::Tui {
-                row: &TUI,
-                answer: tui::Answer::Deny,
-            },
+            surface: Surface::Tui { row: &TUI },
             expects: &[
                 "SessionStart",
                 "PreToolUse",

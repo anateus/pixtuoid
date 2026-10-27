@@ -11,12 +11,13 @@ const TUI: tui::Tui = tui::Tui {
     args: &[],
     composer: tui::Composer {
         marker: "╰─",
-        above: tui::Above::Nothing,
+        border: tui::Border::Nothing,
     },
     gates: &[],
+    cancel: &[],
     // `src/slash-commands/builtin-lifecycle.ts:835-839`.
     quit: &[tui::Key::Text("/exit"), tui::Key::Enter],
-    renders_under_conpty: true,
+    conpty: tui::ConPty::Renders,
 };
 
 pub(crate) const PROFILE: Profile = Profile {
@@ -129,10 +130,7 @@ startup:
         Scenario {
             name: "new-session",
             shape: Shape::Succession,
-            surface: Surface::Tui {
-                row: &TUI,
-                answer: tui::Answer::Nothing,
-            },
+            surface: Surface::Tui { row: &TUI },
             expects: &["session_start", "session_switch", "session_shutdown"],
             fixture: "omp/fixtures/new-session-hermetic",
             turn: Turn {

@@ -15,7 +15,7 @@ const TUI: tui::Tui = tui::Tui {
     ],
     composer: tui::Composer {
         marker: "›",
-        above: tui::Above::Nothing,
+        border: tui::Border::Nothing,
     },
     gates: &[tui::Gate {
         shows: "Would you like to run the following command?",
@@ -26,8 +26,11 @@ const TUI: tui::Tui = tui::Tui {
         // codex is unverified).
         dwell: std::time::Duration::from_millis(500),
     }],
+    // `chat.interrupt_turn` (`tui/src/keymap.rs:1695` at `rust-v0.164.0`),
+    // while a turn runs (`tui/src/bottom_pane/mod.rs:1822-1835`).
+    cancel: &[tui::Key::Esc],
     quit: &[tui::Key::Text("/exit"), tui::Key::Enter],
-    renders_under_conpty: true,
+    conpty: tui::ConPty::Renders,
 };
 
 pub(crate) const PROFILE: Profile = Profile {
@@ -150,10 +153,7 @@ trust_level = "trusted"
         Scenario {
             name: "permission",
             shape: Shape::Permission,
-            surface: Surface::Tui {
-                row: &TUI,
-                answer: tui::Answer::Deny,
-            },
+            surface: Surface::Tui { row: &TUI },
             expects: &[
                 "SessionStart",
                 "UserPromptSubmit",
@@ -162,6 +162,14 @@ trust_level = "trusted"
                 "SessionEnd",
             ],
             fixture: "fixtures/codex/permission-hermetic",
+            turn: Turn::PROFILE,
+        },
+        Scenario {
+            name: "cancel",
+            shape: Shape::Cancel,
+            surface: Surface::Tui { row: &TUI },
+            expects: &["SessionStart", "UserPromptSubmit", "SessionEnd"],
+            fixture: "fixtures/codex/cancel-hermetic",
             turn: Turn::PROFILE,
         },
     ],

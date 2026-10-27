@@ -30,6 +30,23 @@ pub mod verify;
 /// any, and a real provider must refuse it.
 pub const DUMMY_KEY: &str = "hermetic-dummy-key";
 
+/// The first line of [`Placeholder::Stream`]'s reply: on screen, the TUI
+/// driver's cue that the turn is mid-stream.
+pub(crate) const STREAM_CUE: &str = "HERMETIC-STREAM";
+/// How many numbered lines follow [`STREAM_CUE`]: enough that, at its
+/// script's pace, the reply outlasts the driver's [`tui::BUDGET`]
+/// (`a_cancel_script_streams_its_reply_past_the_drivers_budget`), so an
+/// uncancelled turn never ends inside a run.
+const STREAM_LINES: usize = 600;
+
+/// [`Placeholder::Stream`]'s reply.
+fn stream_reply() -> String {
+    std::iter::once(STREAM_CUE.to_owned())
+        .chain((1..=STREAM_LINES).map(|n| n.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// A fact that differs between Unix and Windows. Both arms are plain data, so
 /// a test on any host reads both, as `platform::resolve_user_home_opt` takes
 /// its `windows` flag.
@@ -134,6 +151,9 @@ pub enum Shape {
     /// A command that starts the CLI's next session in place: the session it
     /// switches away from ends, and a root session succeeds it.
     Succession,
+    /// A turn the user cancels while its reply streams: the session
+    /// registers, and its turn ends.
+    Cancel,
 }
 
 impl Shape {
@@ -149,7 +169,8 @@ impl Shape {
                 | Self::Permission
                 | Self::Subagent
                 | Self::ChildError
-                | Self::Succession => false,
+                | Self::Succession
+                | Self::Cancel => false,
             },
             ProcessExit::Signalled | ProcessExit::OutOfTime => false,
         }
@@ -163,8 +184,22 @@ impl Shape {
             | Self::Permission
             | Self::Subagent
             | Self::ModelError
-            | Self::ChildError => true,
+            | Self::ChildError
+            | Self::Cancel => true,
             Self::Succession => false,
+        }
+    }
+
+    /// How a TUI run answers its turn.
+    pub const fn answer(self) -> tui::Answer {
+        match self {
+            Self::Permission => tui::Answer::Deny,
+            Self::Cancel => tui::Answer::Cancel,
+            Self::ToolRun
+            | Self::Subagent
+            | Self::ModelError
+            | Self::ChildError
+            | Self::Succession => tui::Answer::Nothing,
         }
     }
 }
@@ -178,8 +213,6 @@ pub enum Surface {
     Tui {
         /// The CLI's interactive facts.
         row: &'static tui::Tui,
-        /// How the run answers the turn's dialog.
-        answer: tui::Answer,
     },
 }
 
@@ -371,6 +404,7 @@ impl Profile {
                 Placeholder::Note.as_str(),
                 crate::harness::CAPTURE_NOTE.to_owned(),
             ),
+            (Placeholder::Stream.as_str(), stream_reply()),
         ]
         .into_iter()
         .chain(
@@ -577,14 +611,15 @@ impl Profile {
     }
 }
 
-/// The first of `scenarios` a leg on `windows` runs and no dialog stops, since
-/// a TUI's gate waits on a hook.
+/// The first of `scenarios` a leg on `windows` runs whose TUI turn, if it has
+/// one, the driver need not answer: a gate waits on a hook, and a cancel's
+/// reply outlasts the run ([`STREAM_LINES`]).
 fn lifecycle_turn_of(scenarios: &[Scenario], windows: bool) -> Option<&Scenario> {
     scenarios.iter().find(|s| {
         s.not_run_on(windows).is_none()
             && match s.surface {
                 Surface::Headless => true,
-                Surface::Tui { answer, .. } => answer == tui::Answer::Nothing,
+                Surface::Tui { .. } => s.shape.answer() == tui::Answer::Nothing,
             }
     })
 }
@@ -600,10 +635,8 @@ impl Scenario {
     /// Why a leg on `windows` doesn't run it, if it doesn't.
     pub fn not_run_on(&self, windows: bool) -> Option<&'static str> {
         match self.surface {
-            Surface::Tui { row, .. } if windows && !row.renders_under_conpty => {
-                Some("its TUI paints nothing under ConPTY")
-            }
-            _ => None,
+            Surface::Tui { row, .. } if windows => row.conpty.not_run(),
+            Surface::Tui { .. } | Surface::Headless => None,
         }
     }
 }
@@ -775,56 +808,105 @@ mod tests {
     }
 
     #[test]
-    fn a_lifecycle_turns_a_scenario_its_leg_runs_and_no_dialog_stops() {
-        let tui = |source: &str, name: &str, answer| match profile(source)
-            .and_then(|p| p.scenario(name))
-            .expect("profiled")
-            .surface
-        {
-            Surface::Tui { row, .. } => Surface::Tui { row, answer },
-            Surface::Headless => panic!("{source}/{name} drives no TUI"),
+    fn a_lifecycle_turns_a_scenario_its_leg_runs_and_the_driver_need_not_answer() {
+        let tui = |source: &str, name: &str| {
+            let surface = profile(source)
+                .and_then(|p| p.scenario(name))
+                .expect("profiled")
+                .surface;
+            assert!(
+                matches!(surface, Surface::Tui { .. }),
+                "{source}/{name} drives no TUI"
+            );
+            surface
         };
-        let scenario = |name, surface| Scenario {
+        let scenario = |name, shape, surface| Scenario {
             name,
-            shape: Shape::ToolRun,
+            shape,
             surface,
             expects: &[],
             fixture: name,
             turn: Turn::PROFILE,
         };
         let scenarios = [
-            scenario("gated", tui("claude-code", "permission", tui::Answer::Deny)),
-            scenario("unpainted", tui("grok", "permission", tui::Answer::Nothing)),
-            scenario("ungated", tui("omp", "new-session", tui::Answer::Nothing)),
-            scenario("headless", Surface::Headless),
+            scenario("gated", Shape::Permission, tui("claude-code", "permission")),
+            scenario("cancelled", Shape::Cancel, tui("codex", "cancel")),
+            scenario("unpainted", Shape::ToolRun, tui("grok", "permission")),
+            scenario("ungated", Shape::ToolRun, tui("omp", "new-session")),
+            scenario("headless", Shape::ToolRun, Surface::Headless),
         ];
         let picked = |s: &[Scenario], windows| lifecycle_turn_of(s, windows).map(|s| s.name);
-        assert_eq!(picked(&scenarios[..1], false), None);
-        assert_eq!(picked(&scenarios[..2], false), Some("unpainted"));
+        assert_eq!(picked(&scenarios[..2], false), None);
+        assert_eq!(picked(&scenarios[..3], false), Some("unpainted"));
         assert_eq!(
-            picked(&scenarios[..2], true),
+            picked(&scenarios[..3], true),
             None,
             "ConPTY paints it nothing"
         );
-        assert_eq!(picked(&scenarios[..3], true), Some("ungated"));
-        assert_eq!(picked(&scenarios[3..], true), Some("headless"));
+        assert_eq!(picked(&scenarios[..4], true), Some("ungated"));
+        assert_eq!(picked(&scenarios[4..], true), Some("headless"));
     }
 
     #[test]
-    fn a_tui_turn_answers_a_gate_exactly_when_its_shape_is_permission() {
-        // A turn waiting on a dialog it never raises stalls, and the verdict
-        // blames its CLI.
+    fn a_cancel_runs_on_a_tui_whose_row_names_its_cancel_keys() {
+        // A headless run has no way to cancel its turn.
         for p in PROFILES {
-            for s in p.scenarios {
-                let Surface::Tui { answer, .. } = s.surface else {
-                    continue;
+            for s in p.scenarios.iter().filter(|s| s.shape == Shape::Cancel) {
+                let Surface::Tui { row } = s.surface else {
+                    panic!("{}/{} runs headless", p.source, s.name);
                 };
-                assert_eq!(
-                    answer != tui::Answer::Nothing,
-                    s.shape == Shape::Permission,
-                    "{}/{}",
-                    p.source,
-                    s.name
+                assert!(
+                    !row.cancel.is_empty(),
+                    "{}: its row names no cancel keys",
+                    p.source
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cancel_script_streams_its_reply_past_the_drivers_budget() {
+        // A reply that ends inside the run ends its turn uncancelled, and that
+        // end passes for the cancel's.
+        let reply = stream_reply();
+        assert!(reply.starts_with(&format!("{STREAM_CUE}\n")));
+        for p in PROFILES {
+            for s in p.scenarios.iter().filter(|s| s.shape == Shape::Cancel) {
+                let script: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(s.script(p.source)).expect("the script"),
+                )
+                .expect("json");
+                let streams: Vec<&Value> = script["fixtures"]
+                    .as_array()
+                    .expect("fixtures")
+                    .iter()
+                    .filter(|f| f["response"]["content"] == Placeholder::Stream.as_str())
+                    .collect();
+                let [stream] = streams[..] else {
+                    panic!("{}: {} replies stream", p.source, streams.len());
+                };
+                // Any other key may pace or cut the stream (aimock's
+                // `dist/sse-writer.js` `calculateDelay`, `dist/interruption.js`
+                // at v1.45.1).
+                for key in stream.as_object().expect("a reply").keys() {
+                    assert!(
+                        ["match", "response", "latency", "chunkSize"].contains(&key.as_str()),
+                        "{}: {key}",
+                        p.source
+                    );
+                }
+                let per_chunk = |key: &str| {
+                    stream[key]
+                        .as_u64()
+                        .unwrap_or_else(|| panic!("{}: no {key}", p.source))
+                };
+                let chunks = u64::try_from(reply.len())
+                    .expect("a short reply")
+                    .div_ceil(per_chunk("chunkSize"));
+                assert!(
+                    Duration::from_millis(chunks * per_chunk("latency")) > tui::BUDGET,
+                    "{}: its reply ends inside the driver's budget",
+                    p.source
                 );
             }
         }

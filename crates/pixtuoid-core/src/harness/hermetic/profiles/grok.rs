@@ -17,7 +17,7 @@ const TUI: tui::Tui = tui::Tui {
     args: &["--permission-mode", "default"],
     composer: tui::Composer {
         marker: "  │ ❯",
-        above: tui::Above::Rule {
+        border: tui::Border::Rule {
             glyph: '─',
             corners: Some(('╭', '╮')),
         },
@@ -27,12 +27,13 @@ const TUI: tui::Tui = tui::Tui {
         deny: &[tui::Key::Text("4")],
         dwell: std::time::Duration::ZERO,
     }],
+    cancel: &[],
     // `/exit` is `/quit`'s alias
     // (`crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md:71-73`).
     quit: &[tui::Key::Text("/exit"), tui::Key::Enter],
     // It clears the alternate screen and paints nothing more (`hermetic.yml`'s
     // Windows leg, run 39177894288's `grok/permission/tui.log`).
-    renders_under_conpty: false,
+    conpty: tui::ConPty::PaintsNothing,
 };
 
 /// The registration a grok envelope's `hookEventName` answers to: the wire
@@ -178,10 +179,7 @@ pub(crate) const PROFILE: Profile = Profile {
         Scenario {
             name: "permission",
             shape: Shape::Permission,
-            surface: Surface::Tui {
-                row: &TUI,
-                answer: tui::Answer::Deny,
-            },
+            surface: Surface::Tui { row: &TUI },
             expects: &[
                 "SessionStart",
                 "UserPromptSubmit",

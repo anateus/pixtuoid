@@ -20,12 +20,17 @@ const SETTLE: Duration = Duration::from_secs(3);
 /// How long an unchanged screen may stand before a turn that never finished is
 /// given up: an unrecognised dialog stalls a run, and its key is never guessed.
 const STALL: Duration = Duration::from_secs(20);
+/// How long one run may take, end to end, before `tui_drive` kills the CLI:
+/// inside the recorder's [`super::TURN_BUDGET`], so the driver gives up first
+/// and logs the screen it stood at.
+pub const BUDGET: Duration = Duration::from_secs(120);
 
 /// `tui_drive`'s exit when it gave up on a run it could not finish.
 pub const GAVE_UP: i32 = 3;
-/// `tui_drive`'s exit when it gave up on a submitted turn that raised no gate
-/// it knows to refuse: a verdict on the CLI, not a run that could not happen.
-pub(crate) const UNREFUSED: i32 = 4;
+/// `tui_drive`'s exit when it gave up on a submitted turn that never showed
+/// what its [`Answer`] answers: a verdict on the CLI, not a run that could not
+/// happen.
+pub(crate) const UNANSWERED: i32 = 4;
 
 /// A key the driver writes to the pty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,42 +65,60 @@ pub(crate) struct Gate {
     pub(crate) dwell: Duration,
 }
 
-/// How a scenario's run answers its turn's dialog, and so when the turn is over.
+/// How a scenario's run answers its turn, and so when the turn is over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
-    /// Refuse it with its gate's `deny` keys; the turn is over once refused
-    /// and the screen settles.
+    /// Refuse its dialog with its gate's `deny` keys; the turn is over once
+    /// refused and the screen settles.
     Deny,
+    /// Cancel it with its row's `cancel` keys once the screen shows its reply
+    /// streaming; the turn is over once cancelled and the screen settles.
+    Cancel,
     /// Nothing: the turn raises no dialog, and is over once the screen settles
     /// after the prompt.
     Nothing,
 }
 
+impl Answer {
+    /// What the screen must show before this answer is given, if anything.
+    pub(crate) const fn awaits(self) -> Option<&'static str> {
+        match self {
+            Self::Deny => Some("a gate the driver knows to refuse"),
+            Self::Cancel => Some("its reply streaming for the driver to cancel"),
+            Self::Nothing => None,
+        }
+    }
+}
+
 /// Where a CLI's composer is on screen.
 #[derive(Debug)]
 pub(crate) struct Composer {
-    /// What its input line starts with, at the line's first column. A
-    /// dialog's highlighted choice and the conversation's echo of a prompt
-    /// can start with it too.
+    /// What its input line starts with, at the line's first column, or at any
+    /// indent under [`Border::Footed`]. A dialog's highlighted choice and the
+    /// conversation's echo of a prompt can start with it too.
     pub(crate) marker: &'static str,
-    pub(crate) above: Above,
+    pub(crate) border: Border,
 }
 
-/// What a composer draws directly above its input line, which tells the
-/// input line from the other marked lines.
+/// What a composer draws around its input line, which tells the input line
+/// from the other marked lines.
 #[derive(Debug)]
-pub(crate) enum Above {
-    /// A rule of `glyph`, between `corners` when the composer is boxed; no
-    /// other marked line sits under it.
+pub(crate) enum Border {
+    /// A rule of `glyph` above it, between `corners` when the composer is
+    /// boxed; no other marked line sits under it.
     Rule {
         glyph: char,
         corners: Option<(char, char)>,
     },
-    /// A rule of `glyph`, which may carry a title, with another under the
-    /// input line: the input line is the one under the screen's next-to-last
-    /// rule, since a pair of them also frames the conversation's echo of a
-    /// prompt.
-    Framed { glyph: char },
+    /// A rule of `glyph` above it, which may carry a title, and another under
+    /// it: the input line is the one under the screen's next-to-last rule,
+    /// since a pair of them also borders the conversation's echo of a prompt.
+    Rules { glyph: char },
+    /// A box closed by a bottom edge opening with `edge`, the input line
+    /// `rows` rows above the screen's last such edge, at any indent: the
+    /// conversation's echo of a prompt wears the same marker, in a box with no
+    /// edge.
+    Footed { edge: char, rows: usize },
     /// Nothing: the input line is the screen's last marked line, which only a
     /// dialog drawn below it displaces, its numbered choice then the last.
     Nothing,
@@ -112,9 +135,35 @@ pub struct Tui {
     /// tool after the refusal (`a_permission_script_calls_no_tool_after_its_refusal`).
     /// One the table doesn't name stalls the run.
     pub(crate) gates: &'static [Gate],
+    /// What cancels a running turn the way a user would, for a run that
+    /// answers [`Answer::Cancel`]; empty for a CLI no scenario cancels.
+    pub(crate) cancel: &'static [Key],
     /// What ends the session the way a user would, so its end hook fires.
     pub(crate) quit: &'static [Key],
-    pub(crate) renders_under_conpty: bool,
+    pub(crate) conpty: ConPty,
+}
+
+/// What a Windows leg has seen the TUI do under ConPTY.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ConPty {
+    /// It renders, and a Windows leg drives it.
+    Renders,
+    /// It paints nothing, so no Windows leg drives it.
+    PaintsNothing,
+    /// No Windows leg has driven it yet, so none does until one shows that
+    /// it renders.
+    Unverified,
+}
+
+impl ConPty {
+    /// Why a Windows leg doesn't drive it, if it doesn't.
+    pub(crate) const fn not_run(self) -> Option<&'static str> {
+        match self {
+            Self::Renders => None,
+            Self::PaintsNothing => Some("its TUI paints nothing under ConPTY"),
+            Self::Unverified => Some("its TUI was never run under ConPTY"),
+        }
+    }
 }
 
 impl Tui {
@@ -148,10 +197,20 @@ enum Phase {
     Quit,
 }
 
-/// A dialog on screen: its row in the gate table, and when it appeared.
+/// What a run's answer waits for on screen, and how it is given.
+#[derive(Debug, Clone, Copy)]
+struct Cue {
+    /// Text on screen while it stands.
+    shows: &'static str,
+    keys: &'static [Key],
+    /// As [`Gate::dwell`].
+    dwell: Duration,
+}
+
+/// A cue on screen, and when it appeared.
 #[derive(Debug, Clone, Copy)]
 struct Open {
-    gate: usize,
+    shows: &'static str,
     since: Instant,
 }
 
@@ -200,8 +259,11 @@ impl<'a> Driver<'a> {
         if now.duration_since(self.changed_at) >= STALL {
             return Action::Fail("the screen stood still with the turn unfinished");
         }
-        if let Some(action) = self.gate(now) {
+        if let Some(action) = self.answer(now) {
             return action;
+        }
+        if self.dialog_open() {
+            return Action::Wait;
         }
         match self.phase {
             Phase::Boot if self.composer().is_some() => {
@@ -212,8 +274,8 @@ impl<'a> Driver<'a> {
                 self.phase = Phase::Submitted { enter_at: now };
                 Action::Keys(&[Key::Enter])
             }
-            // A turn that raised its dialog was submitted: a prompt shown after
-            // it is the conversation's echo.
+            // A turn already answered was submitted: a prompt shown after its
+            // answer is the conversation's echo.
             Phase::Submitted { enter_at } if !self.answered && self.composer_holds_prompt() => {
                 if now.duration_since(enter_at) < ENTER_RETRY {
                     return Action::Wait;
@@ -239,67 +301,88 @@ impl<'a> Driver<'a> {
     /// What `tui_drive` exits with if it gives up now.
     pub fn gave_up(&self) -> i32 {
         match self.phase {
-            Phase::Submitted { .. } if self.owes_answer() => UNREFUSED,
+            Phase::Submitted { .. } if self.owes_answer() => UNANSWERED,
             _ => GAVE_UP,
         }
     }
 
-    /// Whether the turn still waits on the dialog its answer answers.
+    /// Whether the turn still waits on what its answer answers.
     fn owes_answer(&self) -> bool {
-        self.answer != Answer::Nothing && !self.answered
+        self.answer.awaits().is_some() && !self.answered
     }
 
-    /// A dialog on screen: answered after it has stood its dwell, once the
-    /// prompt is submitted; before that, or in a run that answers none, it
-    /// stalls the run like any dialog nobody planned for. Once per run
-    /// ([`Tui::gates`]): a frame drawn before the answer landed still shows the
-    /// dialog, and so does one after a frame that dropped it; a second key would
-    /// land on the turn. While one is open nothing else is sent, so no Enter can
-    /// land on it and pick its first choice.
-    fn gate(&mut self, now: Instant) -> Option<Action> {
-        let Some(index) = self
-            .tui
-            .gates
-            .iter()
-            .position(|g| self.screen.contains(g.shows))
-        else {
+    /// Its answer's cue on screen, if one stands: for a refusal the first
+    /// dialog its row lists, for a cancel the reply's first line.
+    fn cue(&self) -> Option<Cue> {
+        match self.answer {
+            Answer::Deny => self
+                .tui
+                .gates
+                .iter()
+                .find(|g| self.screen.contains(g.shows))
+                .map(|g| Cue {
+                    shows: g.shows,
+                    keys: g.deny,
+                    dwell: g.dwell,
+                }),
+            Answer::Cancel => self.screen.contains(super::STREAM_CUE).then_some(Cue {
+                shows: super::STREAM_CUE,
+                keys: self.tui.cancel,
+                dwell: Duration::ZERO,
+            }),
+            Answer::Nothing => None,
+        }
+    }
+
+    /// Its answer, once its cue has stood its dwell after the prompt was
+    /// submitted; a cue before that stalls the run. Once per run: a frame
+    /// drawn before the answer landed still shows its cue, and a second key
+    /// would land on the turn.
+    fn answer(&mut self, now: Instant) -> Option<Action> {
+        if self.answered {
+            return None;
+        }
+        let Some(cue) = self.cue() else {
             self.open = None;
             return None;
-        };
-        let gate = &self.tui.gates[index];
-        let keys = match self.answer {
-            Answer::Deny => gate.deny,
-            Answer::Nothing => return Some(Action::Wait),
         };
         if !matches!(self.phase, Phase::Submitted { .. }) {
             return Some(Action::Wait);
         }
         let open = match self.open {
-            Some(open) if open.gate == index => open,
+            Some(open) if open.shows == cue.shows => open,
             _ => Open {
-                gate: index,
+                shows: cue.shows,
                 since: now,
             },
         };
         self.open = Some(open);
-        if self.answered || now.duration_since(open.since) < gate.dwell {
+        if now.duration_since(open.since) < cue.dwell {
             return Some(Action::Wait);
         }
         self.answered = true;
-        Some(Action::Keys(keys))
+        Some(Action::Keys(cue.keys))
+    }
+
+    /// Whether a dialog its row lists stands ([`Tui::gates`]): nothing else is
+    /// sent then, so no Enter can land on it and pick its first choice, and
+    /// one its answer does not refuse stalls the run like any dialog nobody
+    /// planned for.
+    fn dialog_open(&self) -> bool {
+        self.tui.gates.iter().any(|g| self.screen.contains(g.shows))
     }
 
     /// The text after the composer's marker on its input line.
     fn composer(&self) -> Option<&str> {
         let composer = &self.tui.composer;
         let lines: Vec<&str> = self.screen.lines().collect();
-        match composer.above {
-            Above::Rule { glyph, corners } => lines.windows(2).rev().find_map(|pair| {
+        match composer.border {
+            Border::Rule { glyph, corners } => lines.windows(2).rev().find_map(|pair| {
                 is_rule(pair[0], glyph, corners)
                     .then(|| pair[1].strip_prefix(composer.marker))
                     .flatten()
             }),
-            Above::Framed { glyph } => {
+            Border::Rules { glyph } => {
                 let (top, _) = lines
                     .iter()
                     .enumerate()
@@ -308,7 +391,16 @@ impl<'a> Driver<'a> {
                     .nth(1)?;
                 lines.get(top + 1)?.strip_prefix(composer.marker)
             }
-            Above::Nothing => {
+            Border::Footed { edge, rows } => {
+                let bottom = lines
+                    .iter()
+                    .rposition(|l| l.trim_start().starts_with(edge))?;
+                lines
+                    .get(bottom.checked_sub(rows)?)?
+                    .trim_start()
+                    .strip_prefix(composer.marker)
+            }
+            Border::Nothing => {
                 let typed = lines
                     .iter()
                     .rev()
@@ -418,6 +510,9 @@ mod tests {
     const PROMPT: &str = "Read NOTE.txt, then list this directory, then read NOTE.txt again.";
     const CODEX_BOOT: &str = include_str!("screens/codex-boot.txt");
     const CODEX_GATE: &str = include_str!("screens/codex-gate.txt");
+    const CODEX_CANCEL: &str = include_str!("screens/codex-cancel.txt");
+    const OPENCODE_BOOT: &str = include_str!("screens/opencode-boot.txt");
+    const OPENCODE_CANCEL: &str = include_str!("screens/opencode-cancel.txt");
     const OMP_BOOT: &str = include_str!("screens/omp-boot.txt");
     const OMP_NEW: &str = include_str!("screens/omp-new.txt");
     const CODEWHALE_BOOT: &str = include_str!("screens/codewhale-boot.txt");
@@ -427,12 +522,11 @@ mod tests {
 
     /// `source`'s TUI scenario `name`: its row, and how it answers its turn.
     fn tui_scenario(source: &str, name: &str) -> (&'static Tui, Answer) {
-        match profile(source)
+        let s = profile(source)
             .and_then(|p| p.scenario(name))
-            .expect("profiled")
-            .surface
-        {
-            Surface::Tui { row, answer } => (row, answer),
+            .expect("profiled");
+        match s.surface {
+            Surface::Tui { row } => (row, s.shape.answer()),
             Surface::Headless => panic!("{source}/{name} drives no TUI"),
         }
     }
@@ -630,7 +724,7 @@ mod tests {
     #[test]
     fn a_run_quits_unanswered_only_where_it_answers_nothing() {
         let (tui, _) = omp();
-        for answer in [Answer::Deny, Answer::Nothing] {
+        for answer in [Answer::Deny, Answer::Cancel, Answer::Nothing] {
             let t0 = Instant::now();
             let mut d = Driver::new(tui, answer, PROMPT.to_owned(), t0);
             assert_eq!(d.step(OMP_BOOT, t0), Action::Type(PROMPT.to_owned()));
@@ -641,7 +735,7 @@ mod tests {
             let moved = t0 + Duration::from_millis(1);
             assert_eq!(d.step(OMP_NEW, moved), Action::Wait);
             let end = match answer {
-                Answer::Deny => Action::Wait,
+                Answer::Deny | Answer::Cancel => Action::Wait,
                 Answer::Nothing => Action::Quit(tui.quit),
             };
             assert_eq!(d.step(OMP_NEW, moved + SETTLE), end, "{answer:?}");
@@ -720,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn a_give_up_after_the_prompt_with_no_gate_refused_is_unrefused() {
+    fn a_give_up_after_the_prompt_with_no_gate_refused_is_unanswered() {
         let t0 = Instant::now();
         let mut d = driver(t0);
         assert_eq!(d.gave_up(), GAVE_UP, "the CLI never booted");
@@ -730,7 +824,7 @@ mod tests {
             d.step(DONE, t0 + STALL),
             Action::Fail("the screen stood still with the turn unfinished")
         );
-        assert_eq!(d.gave_up(), UNREFUSED, "the turn ran with no gate");
+        assert_eq!(d.gave_up(), UNANSWERED, "the turn ran with no gate");
         let mut d = driver(t0);
         submitted(&mut d, t0);
         d.step(GATE, t0);
@@ -761,6 +855,80 @@ mod tests {
         );
     }
 
+    /// codex's cancel run, submitted, at its screen before the reply streamed.
+    fn codex_cancelling(t0: Instant) -> (Driver<'static>, &'static Tui, String) {
+        let (tui, answer) = tui_scenario("codex", "cancel");
+        assert_eq!(answer, Answer::Cancel);
+        let mut d = Driver::new(tui, answer, PROMPT.to_owned(), t0);
+        assert_eq!(d.step(CODEX_BOOT, t0), Action::Type(PROMPT.to_owned()));
+        assert_eq!(d.step(CODEX_BOOT, t0), Action::Keys(&[Key::Enter]));
+        (d, tui, CODEX_CANCEL.replace(super::super::STREAM_CUE, ""))
+    }
+
+    #[test]
+    fn a_turn_is_cancelled_once_its_reply_streams_and_quit_once_the_screen_settles() {
+        let t0 = Instant::now();
+        let (mut d, tui, waiting) = codex_cancelling(t0);
+        let t1 = t0 + Duration::from_millis(1);
+        assert_eq!(d.step(&waiting, t1), Action::Wait);
+        assert_eq!(
+            d.step(&waiting, t1 + SETTLE),
+            Action::Wait,
+            "a quiet stretch before the reply streams is not the turn's end"
+        );
+        let t2 = t1 + SETTLE;
+        assert_eq!(d.step(CODEX_CANCEL, t2), Action::Keys(tui.cancel));
+        assert_eq!(
+            d.step(CODEX_CANCEL, t2 + ENTER_RETRY),
+            Action::Wait,
+            "a frame drawn before the cancel landed"
+        );
+        assert_eq!(d.step(CODEX_CANCEL, t2 + SETTLE), Action::Quit(tui.quit));
+        assert_eq!(d.gave_up(), GAVE_UP, "its turn was cancelled");
+    }
+
+    #[test]
+    fn a_turn_whose_reply_never_streams_gives_up_unanswered() {
+        let t0 = Instant::now();
+        let (mut d, _, waiting) = codex_cancelling(t0);
+        d.step(&waiting, t0);
+        assert_eq!(
+            d.step(&waiting, t0 + STALL),
+            Action::Fail("the screen stood still with the turn unfinished")
+        );
+        assert_eq!(d.gave_up(), UNANSWERED);
+    }
+
+    /// The boot screen's input line holds a placeholder; the session's holds
+    /// nothing, under the prompt's echo, which wears the same bar.
+    #[test]
+    fn opencodes_input_line_sits_its_rows_above_the_edge_and_never_on_the_echo() {
+        const PLACEHOLDER: &str = "Ask anything… \"What is the tech stack of this project?\"";
+        let (tui, answer) = tui_scenario("opencode", "cancel");
+        let t0 = Instant::now();
+        let mut d = Driver::new(tui, answer, PROMPT.to_owned(), t0);
+        assert_eq!(d.step(OPENCODE_BOOT, t0), Action::Type(PROMPT.to_owned()));
+        assert_eq!(d.composer(), Some(format!("  {PLACEHOLDER}").as_str()));
+        let typed = OPENCODE_BOOT.replacen(PLACEHOLDER, PROMPT, 1);
+        assert_ne!(typed, OPENCODE_BOOT, "the placeholder moved");
+        assert_eq!(d.step(&typed, t0), Action::Keys(&[Key::Enter]));
+        assert_eq!(d.step(&typed, t0), Action::Wait);
+        assert_eq!(
+            d.step(&typed, t0 + ENTER_RETRY),
+            Action::Keys(&[Key::Enter]),
+            "a composer still holding the prompt was never submitted"
+        );
+        let session = OPENCODE_CANCEL.replace(super::super::STREAM_CUE, "");
+        let t1 = t0 + ENTER_RETRY;
+        assert_eq!(d.step(&session, t1), Action::Wait);
+        assert_eq!(d.composer(), Some(""));
+        assert_eq!(
+            d.step(&session, t1 + ENTER_RETRY),
+            Action::Wait,
+            "the echo of the prompt is not the composer"
+        );
+    }
+
     #[test]
     fn a_rule_closes_on_its_rows_corners_and_nothing_else() {
         let plain = |l| is_rule(l, '─', None);
@@ -786,12 +954,20 @@ mod tests {
     }
 
     /// Each row over its run's recorded boot screen and the screen its turn
-    /// ended at: the gate it refused, where it answers one.
+    /// ended at: the gate it refused or the reply it cancelled, where it
+    /// answers one.
     #[test]
     fn each_row_takes_the_prompt_and_ends_the_turn_its_run_recorded_as_it_answers() {
         let recorded = [
             ("claude-code", "permission", BOOT, GATE),
             ("codex", "permission", CODEX_BOOT, CODEX_GATE),
+            ("codex", "cancel", CODEX_BOOT, CODEX_CANCEL),
+            (
+                "opencode",
+                "cancel",
+                include_str!("screens/opencode-boot.txt"),
+                include_str!("screens/opencode-cancel.txt"),
+            ),
             (
                 "kimi",
                 "permission",
@@ -859,13 +1035,14 @@ mod tests {
                 "{source}"
             );
             assert_eq!(d.step(boot, t0), Action::Keys(&[Key::Enter]), "{source}");
-            if answer == Answer::Nothing {
-                let moved = t0 + Duration::from_millis(1);
-                assert_eq!(
-                    d.step(end, moved),
-                    Action::Wait,
-                    "{source}: the screen moved"
-                );
+            let moved = t0 + Duration::from_millis(1);
+            let first = match answer {
+                Answer::Deny => None,
+                Answer::Cancel => Some(Action::Keys(tui.cancel)),
+                Answer::Nothing => Some(Action::Wait),
+            };
+            if let Some(first) = first {
+                assert_eq!(d.step(end, moved), first, "{source}: the screen moved");
                 assert_eq!(
                     d.step(end, moved + SETTLE),
                     Action::Quit(tui.quit),
