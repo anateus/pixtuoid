@@ -10,19 +10,21 @@ pub(crate) use driver::run;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pixtuoid_core::SceneState;
 use pixtuoid_core::source::manager::SourceDeath;
 use pixtuoid_core::state::{ActivityState, DaemonState, MAX_FLOORS};
 use ratatui::layout::Size as TermSize;
-use tokio::sync::watch;
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::graphics::Plan;
 
-/// The reducer publishes a fresh `Arc<SceneState>` on every mutation through this watch
-/// channel. Consumers (renderer, headless summary loop) hold a `Receiver`, call
-/// `borrow()` for an O(1) pointer read, and never block the writer.
+/// A painter's (TUI, floating) scene feed: [`SceneSink::Latest`](pipeline::SceneSink)
+/// publishes a fresh `Arc<SceneState>` after each change; the painter holds a
+/// `Receiver`, calls `borrow()` for an O(1) pointer read, and never blocks the
+/// writer.
 pub(crate) type SceneRx = watch::Receiver<Arc<SceneState>>;
 
 /// Fallback desk capacity when the terminal cannot be queried (e.g. headless mode).
@@ -192,6 +194,88 @@ fn summarize(scene: &SceneState) -> String {
         agents.join(", "),
         daemons.join(", ")
     )
+}
+
+/// Headless stdout: one [`summarize`] line per change of the scene. It follows
+/// every applied event, never a sample, so a state that lasts no frame (a call
+/// that starts and ends in one transcript read) is still logged.
+#[derive(Default)]
+pub(crate) struct TransitionLog {
+    last: String,
+}
+
+impl TransitionLog {
+    /// `scene`'s line, when it differs from the last one logged.
+    pub(crate) fn line(&mut self, scene: &SceneState) -> Option<String> {
+        let line = summarize(scene);
+        (line != self.last).then(|| {
+            self.last.clone_from(&line);
+            line
+        })
+    }
+}
+
+/// How many lines headless stdout may fall behind before its reader counts as
+/// stalled and the run ends: far past a live burst (a long transcript's first
+/// sight replays every call), and at about a hundred bytes a line, a few MB.
+pub(crate) const TRANSITION_LOG_CAPACITY: usize = 1 << 16;
+
+/// Headless stdout's bounded queue. Its producers (the reducer's transitions,
+/// headless's health lines) never block: a line that finds it full flags a
+/// stall, which ends the run, since dropping or merging lines would leave the
+/// log silently incomplete.
+#[derive(Clone)]
+pub(crate) struct LogQueue {
+    lines: mpsc::Sender<String>,
+    stall: Arc<Stall>,
+}
+
+#[derive(Default)]
+struct Stall {
+    flagged: Notify,
+    refused: AtomicUsize,
+}
+
+impl LogQueue {
+    /// A queue of `capacity` lines, and the receiver its reader drains.
+    pub(crate) fn bounded(capacity: usize) -> (Self, mpsc::Receiver<String>) {
+        let (lines, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                lines,
+                stall: Arc::default(),
+            },
+            rx,
+        )
+    }
+
+    /// Queue `line`; `false` once the reader has left or stalled.
+    pub(crate) fn push(&self, line: String) -> bool {
+        match self.lines.try_send(line) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.stall.refused.fetch_add(1, Ordering::Relaxed);
+                self.stall.flagged.notify_one();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.lines.is_closed()
+    }
+
+    /// Resolves once a push found the queue full.
+    pub(crate) async fn stalled(&self) {
+        self.stall.flagged.notified().await;
+    }
+
+    /// Lines a stalled reader leaves unwritten: those queued, and those refused.
+    pub(crate) fn unwritten(&self) -> usize {
+        self.lines.max_capacity() - self.lines.capacity()
+            + self.stall.refused.load(Ordering::Relaxed)
+    }
 }
 
 /// Format a `SourceDeath` for the headless stdout health line. Both fields are
@@ -555,6 +639,46 @@ mod tests {
     fn boot_capacities_falls_back_to_default_on_tiny_terminal() {
         let caps = boot_capacities_for(classic(), term(10, 10));
         assert_eq!(caps, [FALLBACK_DESKS; MAX_FLOORS]);
+    }
+
+    /// A queue nobody drains: the pushes past its capacity are refused and
+    /// counted, the stall is flagged, and the lines it kept are the first ones,
+    /// in order.
+    #[tokio::test]
+    async fn a_full_log_queue_refuses_and_counts_past_its_capacity() {
+        const CAP: usize = 4;
+        const OVER: usize = 3;
+        let (queue, mut lines) = LogQueue::bounded(CAP);
+        let sent: Vec<String> = (0..CAP + OVER).map(|n| format!("line {n}")).collect();
+        let taken: Vec<bool> = sent.iter().map(|line| queue.push(line.clone())).collect();
+        assert_eq!(taken, [[true; CAP].as_slice(), &[false; OVER]].concat());
+        assert_eq!(queue.unwritten(), CAP + OVER);
+        tokio::time::timeout(std::time::Duration::from_secs(5), queue.stalled())
+            .await
+            .expect("a refused push flags the stall");
+        let kept: Vec<String> = std::iter::from_fn(|| lines.try_recv().ok()).collect();
+        assert_eq!(kept, sent[..CAP]);
+    }
+
+    #[test]
+    fn a_transition_log_writes_a_scene_again_only_once_it_changed() {
+        let mut log = TransitionLog::default();
+        let mut scene = SceneState::new([8; MAX_FLOORS]);
+        assert_eq!(log.line(&scene).as_deref(), Some("agents=[] daemons=[]"));
+        assert_eq!(log.line(&scene), None, "a sweep that changed nothing");
+        Reducer::new().apply(
+            &mut scene,
+            pixtuoid_core::source::AgentEvent::SessionStart {
+                agent_id: pixtuoid_core::AgentId::from_transcript_path("/p/a.jsonl"),
+                source: "claude-code".into(),
+                session_id: "s".into(),
+                cwd: std::path::PathBuf::from("/repo"),
+                parent_id: None,
+            },
+            SystemTime::now(),
+            Transport::Hook,
+        );
+        assert!(log.line(&scene).is_some());
     }
 
     #[test]

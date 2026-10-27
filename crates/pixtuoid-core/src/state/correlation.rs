@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::AgentId;
 use crate::source::Transport;
+use crate::state::requests::ActionRequests;
 
 /// Window in which a Hook event suppresses a later Jsonl event with the same
 /// tool_use_id. The suppression is asymmetric by event kind — see
@@ -108,10 +109,10 @@ impl ChildEnd {
 
 /// Kind half of a hook-wins dedup record, driving the asymmetric drop matrix
 /// (#150): an End record suppresses BOTH JSONL kinds — the tool is over, so a
-/// lagged JSONL Start replay would falsely re-Activate and cancel the armed
-/// idle debounce — while a Start record suppresses only Starts. A JSONL End
+/// lagged JSONL Start replay would falsely re-Activate a settled slot — while
+/// a Start record suppresses only Starts. A JSONL End
 /// must never be eaten by its own tool's dispatch record: when the best-effort
-/// PostToolUse hook drops, an eaten Task self-End leaks `active_tasks` for the
+/// PostToolUse hook drops, an eaten Task self-End leaks `tasks_in_flight` for the
 /// rest of the session. Don't "simplify" this to exact-kind matching — it
 /// would orphan the lagged-pair case (pinned by
 /// `late_batched_jsonl_pair_after_delivered_hook_end_is_fully_dropped`).
@@ -137,7 +138,7 @@ pub(super) struct Correlation {
     /// Per-agent set of Task tool_use_ids currently in flight: the parent
     /// stays Delegating while one is, an unnamed child's hook activity is
     /// dropped, and the set's drain may arm b1.
-    pub(super) active_tasks: HashMap<AgentId, HashSet<String>>,
+    pub(super) tasks_in_flight: HashMap<AgentId, HashSet<String>>,
     /// Tombstones for Task tool_use_ids whose drain already completed: a
     /// lagged JSONL pair-replay after the drain re-inserts the tuid as a
     /// FRESH first insert (set empty, dedup record GC'd), so the tracker's
@@ -148,17 +149,7 @@ pub(super) struct Correlation {
     /// a slot vouched for within [`PROOF_OF_LIFE_TTL`] is skipped by
     /// `sweep_stale`'s candidate collection.
     pub(super) recent_proof_of_life: HashMap<AgentId, SystemTime>,
-    /// The tool calls an agent's `Waiting` is gated on. Singly populated by
-    /// inference — the `tool_use_id` that was Active immediately before the
-    /// Waiting (a CC permission `Notification` fires mid-tool) — or pushed
-    /// explicitly by a `Waiting` that NAMES its gated call (omp
-    /// `tool_approval_requested`, which can queue several, #951). When a
-    /// member's `ActivityEnd` arrives the permission has been resolved, so
-    /// the Waiting resolves instead of lingering until the agent's next tool;
-    /// a *parallel* tool ending carries a non-member id and cannot
-    /// false-clear a still-pending permission. Codex never populates this —
-    /// its tool events carry no `tool_use_id`.
-    pub(super) gated_before_waiting: HashMap<AgentId, Vec<Arc<str>>>,
+    pub(super) action_requests: ActionRequests,
     /// Tool calls already counted into `tool_call_count`, so the SAME logical
     /// call re-observed on the other transport counts once (#951). Not
     /// [`HOOK_WINS_WINDOW`]'s job: omp's transcript writes the call BEFORE the
@@ -205,16 +196,25 @@ pub(super) fn elapsed_past(now: SystemTime, ts: SystemTime, ttl: Duration) -> bo
     now.duration_since(ts).is_ok_and(|d| d > ttl)
 }
 
+/// An arbitrary Task of `set`, as the `Arc<str>` the FSM takes. The CHOICE
+/// among several is deliberately unspecified — a Delegating slot only needs
+/// proof that *some* delegation is live, and the set is a `HashSet` with no
+/// ordering to promise.
+pub(super) fn any_task(set: &HashSet<String>) -> Option<Arc<str>> {
+    set.iter().next().map(|t| Arc::<str>::from(t.as_str()))
+}
+
 impl Correlation {
-    /// An arbitrary in-flight Task tuid for `id`, as the `Arc<str>` the FSM
-    /// takes. The CHOICE among several is deliberately unspecified —
-    /// `fsm::enter_delegating` only needs proof that *some* delegation is live,
-    /// and `active_tasks` is a `HashSet` with no ordering to promise.
-    pub(super) fn any_active_task(&self, id: &AgentId) -> Option<Arc<str>> {
-        self.active_tasks
+    /// [`any_task`] of `id`'s Tasks in flight.
+    pub(super) fn any_task_in_flight(&self, id: &AgentId) -> Option<Arc<str>> {
+        self.tasks_in_flight.get(id).and_then(any_task)
+    }
+
+    /// Whether `call` was already counted into `id`'s `tool_call_count`.
+    pub(super) fn is_counted(&self, id: &AgentId, call: &str) -> bool {
+        self.counted_calls
             .get(id)
-            .and_then(|s| s.iter().next())
-            .map(|t| Arc::<str>::from(t.as_str()))
+            .is_some_and(|calls| calls.contains_key(call))
     }
 
     /// Whether a child end of `id` landed after `since`, however old.
@@ -349,21 +349,6 @@ impl Correlation {
             calls.retain(|_, ts| is_fresh(now, *ts, super::reducer::STALE_WAITING_TIMEOUT));
             !calls.is_empty()
         });
-    }
-
-    /// Whether `tuid` is a live gate member for `id` — THE membership
-    /// predicate, so the member-vs-whole-set decisions can't drift per site.
-    pub(super) fn gate_matches(&self, id: &AgentId, tuid: &str) -> bool {
-        self.gated_before_waiting
-            .get(id)
-            .is_some_and(|g| g.iter().any(|m| &**m == tuid))
-    }
-
-    /// Remove ONE gate member; a parallel approval keeps its own.
-    pub(super) fn remove_gate_member(&mut self, id: &AgentId, tuid: &str) {
-        if let Some(g) = self.gated_before_waiting.get_mut(id) {
-            g.retain(|m| &**m != tuid);
-        }
     }
 
     /// Whether `id` holds a FRESH probe vouch. The single freshness predicate

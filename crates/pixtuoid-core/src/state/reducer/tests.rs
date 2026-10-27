@@ -180,7 +180,7 @@ fn generic_tool_displaying_delegating_keeps_the_active_window() {
 }
 
 #[test]
-fn gated_before_waiting_evicted_on_apply_path_sweep() {
+fn an_action_request_is_evicted_on_apply_path_sweep() {
     use crate::AgentId;
     use crate::source::{AgentEvent, ToolDetail, Transport};
     use crate::state::SceneState;
@@ -224,8 +224,8 @@ fn gated_before_waiting_evicted_on_apply_path_sweep() {
         Transport::Hook,
     );
     assert!(
-        r.corr.gated_before_waiting.contains_key(&id),
-        "gate recorded while Waiting mid-tool"
+        r.corr.action_requests.contains(&id),
+        "request recorded while Waiting mid-tool"
     );
 
     // The UNRELATED event below is what runs sweep_exited on the APPLY path.
@@ -258,8 +258,8 @@ fn gated_before_waiting_evicted_on_apply_path_sweep() {
         "exited slot swept on the apply path"
     );
     assert!(
-        !r.corr.gated_before_waiting.contains_key(&id),
-        "apply-path sweep_exited must evict the gated entry (not only tick's retain)"
+        !r.corr.action_requests.contains(&id),
+        "apply-path sweep_exited must evict the action request (not only tick's retain)"
     );
 }
 
@@ -729,7 +729,7 @@ fn resurrect_in_place_evicts_correlation_maps_but_keeps_proof_of_life() {
         Transport::Hook,
     );
     // A dispatch that fully drains arms the b1 cascade and leaves an (empty)
-    // active_tasks entry behind.
+    // tasks_in_flight entry behind.
     r.apply(
         &mut scene,
         AgentEvent::ActivityStart {
@@ -756,13 +756,10 @@ fn resurrect_in_place_evicts_correlation_maps_but_keeps_proof_of_life() {
         Transport::Hook,
     );
     assert!(
-        r.corr.active_tasks.contains_key(&id),
+        r.corr.tasks_in_flight.contains_key(&id),
         "active task populated"
     );
-    assert!(
-        r.corr.gated_before_waiting.contains_key(&id),
-        "gate populated"
-    );
+    assert!(r.corr.action_requests.contains(&id), "request populated");
     assert!(r.pending_b1_cascades.contains_key(&id), "cascade armed");
     assert!(
         r.corr.recent_proof_of_life.contains_key(&id),
@@ -795,12 +792,12 @@ fn resurrect_in_place_evicts_correlation_maps_but_keeps_proof_of_life() {
         "resurrected"
     );
     assert!(
-        !r.corr.active_tasks.contains_key(&id),
-        "resurrect must evict the dead life's active_tasks entry"
+        !r.corr.tasks_in_flight.contains_key(&id),
+        "resurrect must evict the dead life's tasks_in_flight entry"
     );
     assert!(
-        !r.corr.gated_before_waiting.contains_key(&id),
-        "resurrect must evict the dead life's gated_before_waiting entry"
+        !r.corr.action_requests.contains(&id),
+        "resurrect must evict the dead life's action request"
     );
     assert!(
         !r.pending_b1_cascades.contains_key(&id),
@@ -916,11 +913,11 @@ fn correlation_maps_stay_bounded_across_a_long_stream() {
     const ITERS: u64 = 3_000;
     const MAP_NAMES: [&str; 7] = [
         "recent_hook_tool_uses",
-        "active_tasks",
+        "tasks_in_flight",
         "recent_task_drains",
         "lifecycles",
         "recent_proof_of_life",
-        "gated_before_waiting",
+        "action_requests",
         "counted_calls",
     ];
 
@@ -1015,7 +1012,7 @@ fn correlation_maps_stay_bounded_across_a_long_stream() {
             now,
             Transport::Hook,
         );
-        // An ORPHAN Task (no SessionStart, so no slot) leaves an active_tasks
+        // An ORPHAN Task (no SessionStart, so no slot) leaves an tasks_in_flight
         // entry reaped ONLY by tick's slot-removal retain.
         r.apply(
             &mut scene,
@@ -1033,11 +1030,11 @@ fn correlation_maps_stay_bounded_across_a_long_stream() {
 
         let lens = [
             r.corr.recent_hook_tool_uses.len(),
-            r.corr.active_tasks.len(),
+            r.corr.tasks_in_flight.len(),
             r.corr.recent_task_drains.len(),
             r.corr.lifecycles.len(),
             r.corr.recent_proof_of_life.len(),
-            r.corr.gated_before_waiting.len(),
+            r.corr.action_requests.len(),
             r.corr
                 .counted_calls
                 .values()

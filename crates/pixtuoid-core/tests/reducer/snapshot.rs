@@ -109,8 +109,6 @@ fn full_scene_serialization_is_stable() {
         at(5),
         Transport::Hook,
     );
-    // Active→Idle debounce: the trailing ActivityEnd arms pending_idle_at but
-    // keeps Active.
     r.apply(
         &mut scene,
         AgentEvent::SessionStart {
@@ -142,6 +140,16 @@ fn full_scene_serialization_is_stable() {
             tool_use_id: Some("w-1".into()),
         },
         at(7),
+        Transport::Hook,
+    );
+    // Populates `exiting_at`: the snapshot's one non-null Option<SystemTime>.
+    r.apply(
+        &mut scene,
+        AgentEvent::SessionEnd {
+            agent_id: winding,
+            as_child: false,
+        },
+        at(8),
         Transport::Hook,
     );
 

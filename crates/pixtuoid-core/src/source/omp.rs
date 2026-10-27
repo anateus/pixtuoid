@@ -573,11 +573,11 @@ const ROLE_TOOL_RESULT: &str = "toolResult";
 /// case: it could never close its Start, leaking Active forever.
 const BLOCK_TOOL_CALL: &str = "toolCall";
 
-/// The tool that BLOCKS on human input: its `ActivityStart` binds the reducer's
-/// `gated_before_waiting` gate to the ask's own tool_use_id, so the answer's
-/// `toolResult` resolves the Wait. Ask pairs are appended LAST — a sibling's later
-/// ActivityStart would flip the slot back to Active, drop the gate, and strand the
-/// Wait forever.
+/// The tool that BLOCKS on human input: its `ActivityStart` makes the ask's own
+/// tool_use_id a member of the reducer's action request, so the answer's
+/// `toolResult` resolves the Wait. The request takes as its member the call
+/// shown when it is raised, so ask pairs are appended LAST: each ask's Waiting
+/// directly follows its own start, never a sibling's.
 const TOOL_ASK: &str = "ask";
 
 /// `prefix·<text>` at the label cap — the ONE place omp assembles a
