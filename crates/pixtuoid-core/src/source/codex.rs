@@ -151,11 +151,11 @@ pub(crate) fn decode_codex_hook_custom(obj: &HookObject) -> Result<Option<Vec<Ag
 /// The shared arms detail only CC's dispatch as a Task.
 fn dispatched(event: AgentEvent) -> AgentEvent {
     match event {
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id,
             tool_use_id,
             ..
-        } => AgentEvent::ActivityStart {
+        } => AgentEvent::ToolUseStart {
             agent_id,
             tool_use_id,
             detail: Some(ToolDetail::Task),
@@ -229,7 +229,7 @@ pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Vec<A
         .and_then(|s| s.as_str())
         .unwrap_or("");
 
-    let start = || AgentEvent::ActivityStart {
+    let start = || AgentEvent::ToolUseStart {
         agent_id,
         tool_use_id: None,
         detail: None,
@@ -241,7 +241,7 @@ pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Vec<A
         // what a modern session serializes — `a_custom_tool_call_is_a_tool_call`.
         (RESPONSE_ITEM, i) if RI_TOOL_START.contains(&i) => {
             if function_call_needs_approval(payload) {
-                vec![AgentEvent::Waiting {
+                vec![AgentEvent::UserActionRequest {
                     agent_id,
                     reason: "permission".to_string(),
                     tool_use_id: None,
@@ -251,7 +251,7 @@ pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Vec<A
             }
         }
         // Resume signals: a command/patch finished, or a call was refused. Each
-        // is an ActivityStart, which answers a permission request holding no
+        // is a ToolUseStart, which answers a permission request holding no
         // call. A call's output also ENDS that call, answering a request that
         // holds it: a refused call gets no `PostToolUse`, so this is its only end.
         (RESPONSE_ITEM, i) if RI_RESUME.contains(&i) => {
@@ -262,7 +262,7 @@ pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Vec<A
             if call.is_none() && i == RI_CUSTOM_OUTPUT {
                 crate::source::drift::missing_field(SOURCE_NAME, i, CALL_ID);
             }
-            call.map(|c| AgentEvent::ActivityEnd {
+            call.map(|c| AgentEvent::ToolUseEnd {
                 agent_id,
                 tool_use_id: Some(c.to_owned()),
             })
@@ -273,7 +273,7 @@ pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Vec<A
         (EVENT_MSG, i) if EM_RESUME.contains(&i) => vec![start()],
         // Web/tool search are turn-INTERNAL work pulses that keep the agent
         // Active; only task_complete / turn_aborted end the turn. Searching is
-        // never permission-prompted — no Waiting branch.
+        // never permission-prompted — no UserActionRequest branch.
         (RESPONSE_ITEM, i) if RI_SEARCH.contains(&i) => vec![start()],
         (EVENT_MSG, i) if EM_SEARCH.contains(&i) => vec![start()],
         (EVENT_MSG, i) if EM_TURN_END.contains(&i) => vec![AgentEvent::turn_end(agent_id)],
@@ -333,7 +333,7 @@ pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Vec<A
 
 /// A Codex `function_call` requesting escalated sandbox permissions
 /// (`arguments` is a JSON string carrying `sandbox_permissions:
-/// "require_escalated"`) is an approval gate → Waiting. A bare `justification`
+/// "require_escalated"`) is an approval gate → [`AgentEvent::UserActionRequest`]. A bare `justification`
 /// is intentionally NOT a signal: Codex emits it on auto-approved commands too,
 /// so keying on it would false-Wait.
 /// Codex has TWO tool surfaces and only this one marks escalation in the
@@ -371,7 +371,7 @@ fn codex_tool_start(agent_id: AgentId, payload: Option<&Map<String, Value>>) -> 
             crate::source::drift::missing_field(SOURCE_NAME, "tool call", "name");
             "tool"
         });
-    AgentEvent::ActivityStart {
+    AgentEvent::ToolUseStart {
         agent_id,
         tool_use_id: None,
         detail: Some(if name == DISPATCH_TOOL {
@@ -624,7 +624,7 @@ mod tests {
         for child in [false, true] {
             let evs = hook("PreToolUse", child, spawn.clone());
             assert!(
-                evs.iter().any(|e| matches!(e, AgentEvent::ActivityStart {
+                evs.iter().any(|e| matches!(e, AgentEvent::ToolUseStart {
                     detail: Some(d), tool_use_id: Some(_), .. } if d.is_task())),
                 "child={child}: {evs:?}"
             );
@@ -634,7 +634,7 @@ mod tests {
             "arguments": "{\"message\":\"CHILD-TASK\"}", "call_id": "call_Fxnld0qmszdIwSfB"}});
         let evs = decode_codex_line("/p/rollout-2026-10-18T01-52-34-x.jsonl", "codex", line);
         assert!(
-            evs.iter().any(|e| matches!(e, AgentEvent::ActivityStart {
+            evs.iter().any(|e| matches!(e, AgentEvent::ToolUseStart {
                 detail: Some(d), .. } if d.is_task())),
             "{evs:?}"
         );
@@ -645,7 +645,7 @@ mod tests {
                                                     "tool_input": {"command": "ls"}}),
         );
         assert!(
-            !other.iter().any(|e| matches!(e, AgentEvent::ActivityStart {
+            !other.iter().any(|e| matches!(e, AgentEvent::ToolUseStart {
                 detail: Some(d), .. } if d.is_task())),
             "{other:?}"
         );
@@ -685,9 +685,9 @@ mod tests {
     }
 
     #[test]
-    fn task_started_is_activity_start() {
+    fn task_started_is_tool_use_start() {
         let out = ev(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}));
-        assert!(matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]));
+        assert!(matches!(out.as_slice(), [AgentEvent::ToolUseStart { .. }]));
     }
 
     /// codex's serde aliases are read-only (`codex-rs/protocol/src/protocol.rs`
@@ -711,7 +711,7 @@ mod tests {
             "type":"custom_tool_call","call_id":"call_x","name":"exec","input":"ls"}}));
         match out.as_slice() {
             [
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     detail: Some(d), ..
                 },
             ] => {
@@ -720,14 +720,14 @@ mod tests {
                     "tool name must reach the detail: {d:?}"
                 )
             }
-            other => panic!("expected an ActivityStart carrying the tool, got {other:?}"),
+            other => panic!("expected a ToolUseStart carrying the tool, got {other:?}"),
         }
         let resumed = ev(json!({"type":"response_item","payload":{
             "type":"custom_tool_call_output","call_id":"call_x","output":"ok"}}));
         assert!(
             matches!(resumed.as_slice(), [
-                AgentEvent::ActivityEnd { tool_use_id: Some(c), .. },
-                AgentEvent::ActivityStart { .. },
+                AgentEvent::ToolUseEnd { tool_use_id: Some(c), .. },
+                AgentEvent::ToolUseStart { .. },
             ] if c == "call_x"),
             "its output must end its call and resume work like function_call_output does"
         );
@@ -739,8 +739,8 @@ mod tests {
             json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"ok"}}),
         );
         assert!(matches!(out.as_slice(), [
-            AgentEvent::ActivityEnd { tool_use_id: Some(c), .. },
-            AgentEvent::ActivityStart { .. },
+            AgentEvent::ToolUseEnd { tool_use_id: Some(c), .. },
+            AgentEvent::ToolUseStart { .. },
         ] if c == "c"));
         let logs = crate::test_capture::capture_logs(|| {
             let unpaired = ev(
@@ -748,7 +748,7 @@ mod tests {
             );
             assert!(matches!(
                 unpaired.as_slice(),
-                [AgentEvent::ActivityStart { .. }]
+                [AgentEvent::ToolUseStart { .. }]
             ));
         });
         assert!(
@@ -763,7 +763,7 @@ mod tests {
                 }
                 assert!(matches!(
                     ev(line).as_slice(),
-                    [AgentEvent::ActivityStart { .. }]
+                    [AgentEvent::ToolUseStart { .. }]
                 ));
             });
             assert!(
@@ -775,8 +775,8 @@ mod tests {
             let keyed = ev(json!({"type":"response_item","payload":{
                 "type":"custom_tool_call_output","call_id":"call_x","output":"ok"}}));
             assert!(matches!(keyed.as_slice(), [
-                AgentEvent::ActivityEnd { tool_use_id: Some(c), .. },
-                AgentEvent::ActivityStart { .. },
+                AgentEvent::ToolUseEnd { tool_use_id: Some(c), .. },
+                AgentEvent::ToolUseStart { .. },
             ] if c == "call_x"));
         });
         assert!(
@@ -789,7 +789,7 @@ mod tests {
     fn patch_apply_end_resumes_work() {
         let out =
             ev(json!({"type":"event_msg","payload":{"type":"patch_apply_end","success":true}}));
-        assert!(matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]));
+        assert!(matches!(out.as_slice(), [AgentEvent::ToolUseStart { .. }]));
     }
 
     #[test]
@@ -802,14 +802,14 @@ mod tests {
         ] {
             let out = ev(line.clone());
             assert!(
-                matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]),
+                matches!(out.as_slice(), [AgentEvent::ToolUseStart { .. }]),
                 "search event {line} must keep the agent Active"
             );
         }
     }
 
     #[test]
-    fn escalated_function_call_is_waiting() {
+    fn escalated_function_call_is_user_action_request() {
         let args = format!(
             r#"{{"cmd":"date","{SANDBOX_PERMISSIONS_FIELD}":"{REQUIRE_ESCALATED}","justification":"allow?"}}"#
         );
@@ -817,26 +817,29 @@ mod tests {
         let out = ev(
             json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":args}}),
         );
-        assert!(matches!(out.as_slice(), [AgentEvent::Waiting { .. }]));
+        assert!(matches!(
+            out.as_slice(),
+            [AgentEvent::UserActionRequest { .. }]
+        ));
     }
 
     #[test]
-    fn plain_function_call_is_activity_start() {
+    fn plain_function_call_is_tool_use_start() {
         let args = r#"{"cmd":"ls"}"#;
         let out = ev(
             json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":args}}),
         );
-        assert!(matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]));
+        assert!(matches!(out.as_slice(), [AgentEvent::ToolUseStart { .. }]));
     }
 
     #[test]
-    fn justification_without_escalation_is_not_waiting() {
+    fn justification_without_escalation_is_not_user_action_request() {
         let args = r#"{"cmd":"ls","justification":"because"}"#;
         let out = ev(
             json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":args}}),
         );
         assert!(
-            matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]),
+            matches!(out.as_slice(), [AgentEvent::ToolUseStart { .. }]),
             "{out:?}"
         );
     }
@@ -846,7 +849,7 @@ mod tests {
         let out = ev(
             json!({"type":"response_item","payload":{"type":"function_call","name":"x","arguments":"{not json"}}),
         );
-        assert!(matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]));
+        assert!(matches!(out.as_slice(), [AgentEvent::ToolUseStart { .. }]));
     }
 
     #[test]
@@ -964,13 +967,13 @@ mod tests {
     }
 
     #[test]
-    fn function_call_without_arguments_starts_work_not_waiting() {
+    fn function_call_without_arguments_starts_work_not_user_action_request() {
         let out = ev(json!({
             "type": "response_item",
             "payload": { "type": "function_call", "name": "x" }
         }));
         assert!(
-            matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]),
+            matches!(out.as_slice(), [AgentEvent::ToolUseStart { .. }]),
             "{out:?}"
         );
     }
@@ -978,7 +981,7 @@ mod tests {
     #[test]
     fn function_call_without_name_falls_back_to_tool_label() {
         // The `arguments` must stay non-escalated so routing reaches
-        // codex_tool_start rather than the Waiting arm.
+        // codex_tool_start rather than the UserActionRequest arm.
         use crate::source::ToolDetail;
         let out = ev(json!({
             "type": "response_item",
@@ -986,12 +989,12 @@ mod tests {
         }));
         match out.as_slice() {
             [
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     detail: Some(ToolDetail::Generic { display }),
                     ..
                 },
             ] => assert_eq!(display, "tool"),
-            other => panic!("expected one Generic-detail ActivityStart, got {other:?}"),
+            other => panic!("expected one Generic-detail ToolUseStart, got {other:?}"),
         }
     }
 

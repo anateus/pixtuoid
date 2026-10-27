@@ -224,7 +224,7 @@ impl Refusal {
 #[must_use]
 enum Preprocessed {
     /// An unnamed child's hook activity, a hook-wins duplicate, or a Start or
-    /// Waiting whose call's End already landed (#242).
+    /// [`AgentEvent::UserActionRequest`] whose call's End already landed (#242).
     Drop,
     /// Survived the pre-pass; carries what task tracking already applied, so
     /// the general arms can skip work the tracker has done.
@@ -232,9 +232,9 @@ enum Preprocessed {
 }
 
 struct TaskTracking {
-    /// An `ActivityEnd` drained a tracked Task, applying its transition.
+    /// A `ToolUseEnd` drained a tracked Task, applying its transition.
     handled_by_task_tracking: bool,
-    /// An `ActivityStart` was a Task dispatch, which the tracker owns — replays
+    /// A `ToolUseStart` was a Task dispatch, which the tracker owns — replays
     /// included.
     handled_by_task_start: bool,
 }
@@ -340,18 +340,18 @@ impl Reducer {
                 now,
             ),
             // The tracker owns every Task-dispatch Start, replays included.
-            AgentEvent::ActivityStart { .. } if tracking.handled_by_task_start => {}
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart { .. } if tracking.handled_by_task_start => {}
+            AgentEvent::ToolUseStart {
                 agent_id,
                 tool_use_id,
                 detail,
-            } => self.apply_activity_start(scene, agent_id, tool_use_id, detail, from, now),
+            } => self.apply_tool_use_start(scene, agent_id, tool_use_id, detail, from, now),
             // The pre-pass tracker already drained a tracked Task with this End:
             // the drain applied the transition itself, so re-running it would
             // restart Delegating — resetting `state_started_at` — whenever
             // parallel Tasks remain.
-            AgentEvent::ActivityEnd { .. } if tracking.handled_by_task_tracking => {}
-            AgentEvent::ActivityEnd {
+            AgentEvent::ToolUseEnd { .. } if tracking.handled_by_task_tracking => {}
+            AgentEvent::ToolUseEnd {
                 agent_id,
                 tool_use_id,
             } => {
@@ -361,12 +361,19 @@ impl Reducer {
             AgentEvent::TurnEnd { agent_id } => {
                 self.apply_end(scene, agent_id, Ended::Turn, from, now);
             }
-            AgentEvent::Waiting {
+            AgentEvent::UserActionRequest {
                 agent_id,
                 reason,
                 tool_use_id,
             } => {
-                self.apply_waiting(scene, agent_id, &reason, tool_use_id.as_deref(), from, now);
+                self.apply_user_action_request(
+                    scene,
+                    agent_id,
+                    &reason,
+                    tool_use_id.as_deref(),
+                    from,
+                    now,
+                );
             }
             AgentEvent::Rename { agent_id, label } => {
                 Self::apply_rename(scene, agent_id, &label, now);
@@ -471,7 +478,7 @@ impl Reducer {
         // Per-connection hook delivery can decode a call's End before its Start
         // (#242); that Start would open a call that already returned.
         if from == Transport::Hook
-            && let AgentEvent::ActivityStart {
+            && let AgentEvent::ToolUseStart {
                 tool_use_id: Some(tuid),
                 detail,
                 ..
@@ -489,7 +496,7 @@ impl Reducer {
 
         // Likewise a wait for a call whose hook End already landed, from a
         // reordered hook (#242) or a lagging watcher: its answer came first.
-        if let AgentEvent::Waiting {
+        if let AgentEvent::UserActionRequest {
             tool_use_id: Some(tuid),
             ..
         } = event
@@ -520,13 +527,13 @@ impl Reducer {
         Preprocessed::Dispatch(tracking)
     }
 
-    /// The `ActivityStart` arm, for a Start the pre-pass tracker left to it.
+    /// The `ToolUseStart` arm, for a Start the pre-pass tracker left to it.
     /// A start the agent's action request holds back
     /// ([`ActionRequests::start`](crate::state::requests::ActionRequests::start))
     /// only counts: a Waiting slot shows no call, and the hook resume
     /// re-labels from the wire's `toolName` (a label-only cost, pinned by
     /// `the_approval_resume_labels_from_the_wire_tool_name`).
-    fn apply_activity_start(
+    fn apply_tool_use_start(
         &mut self,
         scene: &mut SceneState,
         agent_id: AgentId,
@@ -593,7 +600,7 @@ impl Reducer {
         }
     }
 
-    /// The `ActivityEnd` arm, for an End the pre-pass tracker left to it, and
+    /// The `ToolUseEnd` arm, for an End the pre-pass tracker left to it, and
     /// the `TurnEnd` arm. It settles the slot when it answers its request, or
     /// ends the call the slot shows: the one it names, or any when either side
     /// names none.
@@ -639,7 +646,7 @@ impl Reducer {
         }
     }
 
-    fn apply_waiting(
+    fn apply_user_action_request(
         &mut self,
         scene: &mut SceneState,
         agent_id: AgentId,
@@ -1114,7 +1121,7 @@ impl Reducer {
     }
 
     /// Hook transport only, on a source whose child hooks arrive unnamed under
-    /// the parent's key: with any Task in flight, a hook ActivityStart/End or
+    /// the parent's key: with any Task in flight, a hook ToolUseStart/End or
     /// TurnEnd for this AgentId is the child's work, so it is dropped. Two
     /// exemptions: the Task's own PostToolUse (its tool_use_id matches), and a
     /// request member's Start/End — the parent's own approval round (#951),
@@ -1135,8 +1142,8 @@ impl Reducer {
                 .is_some_and(|t| self.corr.action_requests.is_member(&id, t))
         };
         let suppress = match event {
-            AgentEvent::ActivityStart { tool_use_id, .. } => in_task && !is_member(tool_use_id),
-            AgentEvent::ActivityEnd { tool_use_id, .. } => {
+            AgentEvent::ToolUseStart { tool_use_id, .. } => in_task && !is_member(tool_use_id),
+            AgentEvent::ToolUseEnd { tool_use_id, .. } => {
                 let is_task_self_end = tool_use_id
                     .as_ref()
                     .is_some_and(|t| tasks.is_some_and(|s| s.contains(t)));
@@ -1174,7 +1181,7 @@ impl Reducer {
         let mut handled_by_task_tracking = false;
         let mut handled_by_task_start = false;
         match event {
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id,
                 tool_use_id: Some(tuid),
                 detail: Some(d),
@@ -1205,7 +1212,7 @@ impl Reducer {
                     fsm::enter_delegating(slot, Some(Arc::<str>::from(tuid.as_str())), now);
                 }
             }
-            AgentEvent::ActivityEnd {
+            AgentEvent::ToolUseEnd {
                 agent_id,
                 tool_use_id: Some(tuid),
             } => {
@@ -1395,10 +1402,10 @@ fn is_waiting(scene: &SceneState, id: AgentId) -> bool {
 
 fn event_tool_use_id(ev: &AgentEvent) -> Option<(ToolEventKind, &str)> {
     match ev {
-        AgentEvent::ActivityStart { tool_use_id, .. } => {
+        AgentEvent::ToolUseStart { tool_use_id, .. } => {
             tool_use_id.as_deref().map(|t| (ToolEventKind::Start, t))
         }
-        AgentEvent::ActivityEnd { tool_use_id, .. } => {
+        AgentEvent::ToolUseEnd { tool_use_id, .. } => {
             tool_use_id.as_deref().map(|t| (ToolEventKind::End, t))
         }
         _ => None,

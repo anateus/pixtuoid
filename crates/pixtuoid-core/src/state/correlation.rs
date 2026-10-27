@@ -23,7 +23,7 @@ pub const HOOK_WINS_WINDOW: Duration = Duration::from_millis(500);
 /// How long the trailing events of a life a hook ended, or of a child's
 /// [`ChildEnd::Reported`] end, are refused (#242, either transport), and how long a top-level life a hook
 /// ended revives only on a hook start. Hook connections are per-connection
-/// spawned tasks, so a session's SessionEnd and a trailing TurnEnd/ActivityEnd can
+/// spawned tasks, so a session's SessionEnd and a trailing TurnEnd/ToolUseEnd can
 /// be DELIVERED reordered, and the straggler would otherwise synthesize a blank
 /// Idle ghost with NO SessionEnd left to remove it. 5s covers same-machine
 /// scheduling jitter while never visibly delaying a genuine revival.
@@ -143,7 +143,7 @@ pub(super) struct Correlation {
     /// lagged JSONL pair-replay after the drain re-inserts the tuid as a
     /// FRESH first insert (set empty, dedup record GC'd), so the tracker's
     /// first-insert gate alone can't stop `enter_delegating` from clobbering
-    /// a Waiting raised since.
+    /// a [`AgentEvent::UserActionRequest`](crate::AgentEvent::UserActionRequest) raised since.
     pub(super) recent_task_drains: HashMap<(AgentId, String), SystemTime>,
     /// Sweep-exemption timestamps from [`AgentEvent::ProofOfLife`](crate::AgentEvent::ProofOfLife) (#220):
     /// a slot vouched for within [`PROOF_OF_LIFE_TTL`] is skipped by

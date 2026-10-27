@@ -141,7 +141,7 @@ pub(crate) fn decode_grok_hook_payload(obj: &HookObject) -> Result<Vec<AgentEven
                 });
             Ok(vec![
                 identity(),
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id,
                     tool_use_id: tool_use_id(),
                     detail: Some(grok_tool_detail(tool, obj.get("toolInput"))),
@@ -151,11 +151,11 @@ pub(crate) fn decode_grok_hook_payload(obj: &HookObject) -> Result<Vec<AgentEven
         // A FAILED tool fires `post_tool_use_failure` INSTEAD OF
         // `post_tool_use`; a DENIED one fires `permission_denied` and never
         // runs at all. All three close the activity, which also resolves a
-        // permission `Waiting` gated on this tool — right for the denied case:
+        // permission `UserActionRequest` gated on this tool — right for the denied case:
         // the prompt is answered, so the sprite must not stay Waiting.
         "post_tool_use" | "post_tool_use_failure" | "permission_denied" => Ok(vec![
             identity(),
-            AgentEvent::ActivityEnd {
+            AgentEvent::ToolUseEnd {
                 agent_id,
                 tool_use_id: tool_use_id(),
             },
@@ -184,7 +184,7 @@ pub(crate) fn decode_grok_hook_payload(obj: &HookObject) -> Result<Vec<AgentEven
                         .unwrap_or(kind);
                     Ok(vec![
                         identity(),
-                        AgentEvent::Waiting {
+                        AgentEvent::UserActionRequest {
                             agent_id,
                             reason: ellipsize(msg, MAX_DECODED_FIELD_CHARS),
                             tool_use_id: None,
@@ -727,33 +727,35 @@ mod tests {
         v["toolName"] = json!("read_file");
         v["toolInput"] = json!({"path": "src/lib.rs"});
         assert!(
-            matches!(decode(v), AgentEvent::ActivityStart { detail: Some(d), .. }
+            matches!(decode(v), AgentEvent::ToolUseStart { detail: Some(d), .. }
             if d.display() == "read_file: src/lib.rs")
         );
     }
 
     #[test]
-    fn permission_and_elicitation_notifications_are_waiting() {
+    fn permission_and_elicitation_notifications_are_user_action_requests() {
         for kind in ["permission_prompt", "elicitation_dialog"] {
             let mut v = envelope("notification");
             v["notificationType"] = json!(kind);
             v["message"] = json!("Tool permission requested");
             let evs = decode_all(v);
-            assert_eq!(evs.len(), 2, "{kind}: Identity + Waiting");
+            assert_eq!(evs.len(), 2, "{kind}: Identity + UserActionRequest");
             assert!(
-                matches!(&evs[1], AgentEvent::Waiting { reason, .. }
+                matches!(&evs[1], AgentEvent::UserActionRequest { reason, .. }
                     if reason == "Tool permission requested"),
-                "{kind} must decode to Waiting"
+                "{kind} must decode to UserActionRequest"
             );
         }
     }
 
     #[test]
-    fn waiting_reason_falls_back_to_the_notification_type() {
+    fn user_action_request_reason_falls_back_to_the_notification_type() {
         let mut v = envelope("notification");
         v["notificationType"] = json!("permission_prompt");
-        assert!(matches!(decode(v), AgentEvent::Waiting { reason, .. }
-            if reason == "permission_prompt"));
+        assert!(
+            matches!(decode(v), AgentEvent::UserActionRequest { reason, .. }
+            if reason == "permission_prompt")
+        );
     }
 
     /// Zero events is the SAME observable for a knowingly-ignored type and an
@@ -962,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_tool_call_line_is_activity_start_keyed_by_path() {
+    fn fresh_tool_call_line_is_tool_use_start_keyed_by_path() {
         // A FRESH tool_call OMITS `status` (Pending is the ACP schema's serde
         // skip-default) and its `title` is the RAW tool name.
         let evs = decode_line(acp_line(json!({
@@ -974,7 +976,7 @@ mod tests {
         })));
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id,
                 tool_use_id,
                 detail,
@@ -991,7 +993,7 @@ mod tests {
                     "title IS the display (ACP carries no tool name)"
                 );
             }
-            other => panic!("expected ActivityStart, got {other:?}"),
+            other => panic!("expected ToolUseStart, got {other:?}"),
         }
     }
 
@@ -1004,7 +1006,7 @@ mod tests {
                 "status": status
             })));
             assert!(
-                matches!(&evs[..], [AgentEvent::ActivityEnd { tool_use_id: Some(id), .. }]
+                matches!(&evs[..], [AgentEvent::ToolUseEnd { tool_use_id: Some(id), .. }]
                     if id == "call_42"),
                 "{status} must end call_42"
             );
@@ -1029,7 +1031,7 @@ mod tests {
                          "description": "Reply with single word", "prompt": "reply done"}
         })));
         assert!(
-            matches!(&blocking[..], [AgentEvent::ActivityStart { detail: Some(d), .. }] if d.is_task())
+            matches!(&blocking[..], [AgentEvent::ToolUseStart { detail: Some(d), .. }] if d.is_task())
         );
         let background = decode_line(acp_line(json!({
             "sessionUpdate": "tool_call", "toolCallId": "call-0b8fe95b-2070-4e76-a5c7-036d4ad88f12-1",
@@ -1038,7 +1040,7 @@ mod tests {
                          "description": "Reply with single word", "prompt": "reply done"}
         })));
         assert!(
-            matches!(&background[..], [AgentEvent::ActivityStart { detail: Some(d), .. }] if !d.is_task()),
+            matches!(&background[..], [AgentEvent::ToolUseStart { detail: Some(d), .. }] if !d.is_task()),
             "default (background) spawn must NOT be Task — b1 would evict the live child"
         );
     }
