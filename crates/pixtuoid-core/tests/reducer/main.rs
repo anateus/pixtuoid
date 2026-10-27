@@ -143,7 +143,7 @@ fn user_action_request(
         scene,
         AgentEvent::UserActionRequest {
             agent_id: id,
-            reason: reason.into(),
+            reason: Some(reason.into()),
             tool_use_id: None,
         },
         at,
@@ -165,7 +165,7 @@ fn user_action_request_for(
         scene,
         AgentEvent::UserActionRequest {
             agent_id: id,
-            reason: reason.into(),
+            reason: Some(reason.into()),
             tool_use_id: tool_use_id.map(Into::into),
         },
         at,

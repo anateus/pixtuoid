@@ -86,19 +86,19 @@ fn office_scene(n: usize, max_desks: usize, base: SystemTime, busy: bool) -> Sce
     // deep-idle poses a real overnight office shows.
     let idle_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     // At n=12 this is exactly the 6/2/4 split the size cases have measured since #900.
-    let active = n / 2;
-    let waiting = active + n / 6;
+    let n_running = n / 2;
+    let requires_action_end = n_running + n / 6;
     for i in 0..n {
         let id = AgentId::from_transcript_path(&format!("/p/{i}.jsonl"));
         let state = match i {
-            _ if !busy || i >= waiting => ActivityState::Idle,
-            _ if i < active => ActivityState::Active {
+            _ if !busy || i >= requires_action_end => ActivityState::Idle,
+            _ if i < n_running => ActivityState::Running {
                 tool_use_id: Some(Arc::from(format!("t{i}").as_str())),
                 detail: Some(Arc::from("cargo test")),
                 kind: kinds[i % kinds.len()],
             },
-            _ => ActivityState::Waiting {
-                reason: Arc::from("permission"),
+            _ => ActivityState::RequiresAction {
+                reason: Some(Arc::from("permission")),
             },
         };
         let stamp = if busy {
@@ -123,7 +123,7 @@ fn office_scene(n: usize, max_desks: usize, base: SystemTime, busy: bool) -> Sce
                 desk_index: GlobalDeskIndex(i),
                 floor_idx,
                 tool_call_count: if busy { i as u32 * 7 } else { 0 },
-                active_ms: 0,
+                running_ms: 0,
                 unknown_cwd: false,
                 parent_id: None,
                 pid: None,

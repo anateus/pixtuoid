@@ -17,10 +17,10 @@ use crate::{
 #[track_caller]
 fn assert_delegating(scene: &SceneState, id: AgentId, msg: &str) {
     match &scene.agents.get(&id).unwrap().state {
-        ActivityState::Active { detail, .. } => {
+        ActivityState::Running { detail, .. } => {
             assert_eq!(detail.as_deref(), Some("Delegating"), "{msg}");
         }
-        other => panic!("expected Active(Delegating), got {other:?} — {msg}"),
+        other => panic!("expected Running(Delegating), got {other:?} — {msg}"),
     }
 }
 
@@ -55,10 +55,10 @@ fn hook_activity_during_a_task_in_flight_is_suppressed() {
 
     let slot = scene.agents.get(&parent).unwrap();
     match &slot.state {
-        ActivityState::Active { detail, .. } => {
+        ActivityState::Running { detail, .. } => {
             assert_eq!(detail.as_deref(), Some("Delegating"));
         }
-        other => panic!("expected Active(Delegating), got {other:?}"),
+        other => panic!("expected Running(Delegating), got {other:?}"),
     }
 
     tool_use_end(
@@ -119,7 +119,10 @@ fn a_hook_turn_end_during_a_task_is_suppressed() {
     let end = t0 + Duration::from_millis(100);
     turn_end(&mut r, &mut scene, parent, end, Transport::Hook);
     assert!(
-        matches!(scene.agents[&parent].state, ActivityState::Waiting { .. }),
+        matches!(
+            scene.agents[&parent].state,
+            ActivityState::RequiresAction { .. }
+        ),
         "got {:?}",
         scene.agents[&parent].state
     );
@@ -169,14 +172,14 @@ fn tasks_in_flight_drained_by_jsonl_end_even_if_hook_end_arrived_first() {
     );
 
     match &scene.agents.get(&id).unwrap().state {
-        ActivityState::Active { detail, .. } => {
+        ActivityState::Running { detail, .. } => {
             assert_eq!(
                 detail.as_deref(),
                 Some("Bash: ls"),
                 "tasks_in_flight must drain so subsequent hook events apply"
             );
         }
-        other => panic!("expected Active(Bash: ls), got {other:?}"),
+        other => panic!("expected Running(Bash: ls), got {other:?}"),
     }
 }
 
@@ -210,12 +213,12 @@ fn jsonl_event_after_dedup_window_is_applied() {
 
     let slot = scene.agents.get(&id).unwrap();
     match &slot.state {
-        ActivityState::Active { detail, .. } => assert_eq!(
+        ActivityState::Running { detail, .. } => assert_eq!(
             detail.as_deref(),
             Some("jsonl-side"),
             "JSONL event outside the dedup window must be applied"
         ),
-        other => panic!("expected Active, got {other:?}"),
+        other => panic!("expected Running, got {other:?}"),
     }
 }
 
@@ -255,10 +258,10 @@ fn hook_wins_dedup_drops_jsonl_duplicate_within_window() {
         "JSONL duplicate inside hook-wins window must be dropped"
     );
     match &scene.agents.get(&id).unwrap().state {
-        ActivityState::Active { detail, .. } => {
+        ActivityState::Running { detail, .. } => {
             assert_eq!(detail.as_deref(), Some("Edit: hook.rs"));
         }
-        other => panic!("expected Active from hook, got {other:?}"),
+        other => panic!("expected Running from hook, got {other:?}"),
     }
 }
 
@@ -566,9 +569,9 @@ fn a_task_end_decoded_before_its_start_does_not_reopen_the_call() {
         let own_end = own + Duration::from_secs(1);
         tool_use_end(&mut r, &mut scene, id, None, own_end, Transport::Hook);
         let shown = match &scene.agents[&id].state {
-            ActivityState::Active { detail, .. } => detail.as_deref(),
+            ActivityState::Running { detail, .. } => detail.as_deref(),
             ActivityState::Idle => None,
-            other => panic!("expected Active or Idle, got {other:?}"),
+            other => panic!("expected Running or Idle, got {other:?}"),
         };
         let want = (!dropped).then_some("Delegating");
         assert_eq!(shown, want, "{after_end:?} after the End");
@@ -803,7 +806,7 @@ fn second_drain_inside_grace_restarts_the_cascade_clock() {
 }
 
 #[test]
-fn late_jsonl_replay_of_drained_task_end_does_not_false_resolve_waiting() {
+fn late_jsonl_replay_of_drained_task_end_does_not_false_resolve_requires_action() {
     let mut scene = SceneState::uniform(8);
     let mut r = Reducer::new();
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -846,9 +849,9 @@ fn late_jsonl_replay_of_drained_task_end_does_not_false_resolve_waiting() {
     assert!(
         matches!(
             scene.agents.get(&parent).unwrap().state,
-            ActivityState::Waiting { .. }
+            ActivityState::RequiresAction { .. }
         ),
-        "a late JSONL replay of the drained Task END must not match a stale member and false-resolve a still-pending permission Waiting"
+        "a late JSONL replay of the drained Task END must not match a stale member and false-resolve a still-pending permission RequiresAction"
     );
 }
 
@@ -905,7 +908,7 @@ fn task_drain_keeps_parallel_ordinary_tool_member() {
     assert_eq!(
         scene.agents.get(&parent).unwrap().state,
         ActivityState::Idle,
-        "the kept member must let the ordinary tool's END resolve the Waiting"
+        "the kept member must let the ordinary tool's END resolve the RequiresAction"
     );
 }
 
@@ -956,9 +959,9 @@ fn suppressed_child_event_keeps_parents_own_parallel_tool_member() {
     assert!(
         matches!(
             scene.agents.get(&parent).unwrap().state,
-            ActivityState::Waiting { .. }
+            ActivityState::RequiresAction { .. }
         ),
-        "a suppressed child event must not hide the parent's own still-pending permission Waiting"
+        "a suppressed child event must not hide the parent's own still-pending permission RequiresAction"
     );
     tool_use_end(
         &mut r,
@@ -971,9 +974,9 @@ fn suppressed_child_event_keeps_parents_own_parallel_tool_member() {
     assert!(
         !matches!(
             scene.agents.get(&parent).unwrap().state,
-            ActivityState::Waiting { .. }
+            ActivityState::RequiresAction { .. }
         ),
-        "the kept member must let the own tool's END resolve the Waiting"
+        "the kept member must let the own tool's END resolve the RequiresAction"
     );
 }
 
@@ -1121,7 +1124,7 @@ fn a_task_drain_leaves_the_parents_own_call_shown() {
     );
     r.tick(&mut scene, drained + Duration::from_secs(2));
     match &scene.agents[&parent].state {
-        ActivityState::Active { detail, .. } => assert_eq!(detail.as_deref(), Some("Bash: ls")),
+        ActivityState::Running { detail, .. } => assert_eq!(detail.as_deref(), Some("Bash: ls")),
         other => panic!("expected the parent's own call, got {other:?}"),
     }
     tool_use_end(
@@ -1173,7 +1176,7 @@ fn a_drain_of_the_shown_task_shows_one_still_in_flight() {
     );
     let slot = &scene.agents[&parent];
     match &slot.state {
-        ActivityState::Active { tool_use_id, .. } => {
+        ActivityState::Running { tool_use_id, .. } => {
             assert_eq!(tool_use_id.as_deref(), Some("task-a"));
         }
         other => panic!("expected Delegating on task-a, got {other:?}"),
@@ -1182,10 +1185,10 @@ fn a_drain_of_the_shown_task_shows_one_still_in_flight() {
 }
 
 /// A Task dispatched while a prompt holds another call only counts: the slot
-/// keeps Waiting with the Task tracked, and the prompt's answer lands on
+/// keeps RequiresAction with the Task tracked, and the prompt's answer lands on
 /// Delegating.
 #[test]
-fn a_task_dispatch_over_a_prompt_holding_another_call_keeps_waiting() {
+fn a_task_dispatch_over_a_prompt_holding_another_call_keeps_requires_action() {
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/dispatch-held.jsonl");
@@ -1218,7 +1221,10 @@ fn a_task_dispatch_over_a_prompt_holding_another_call_keeps_waiting() {
         Transport::Hook,
     );
     assert!(
-        matches!(scene.agents[&id].state, ActivityState::Waiting { .. }),
+        matches!(
+            scene.agents[&id].state,
+            ActivityState::RequiresAction { .. }
+        ),
         "got {:?}",
         scene.agents[&id].state
     );
@@ -1302,7 +1308,7 @@ fn a_task_dispatch_outside_a_wait_moots_queued_members() {
         Transport::Jsonl,
     );
     match &scene.agents[&id].state {
-        ActivityState::Active { detail, .. } => assert_eq!(detail.as_deref(), Some("bash: b")),
+        ActivityState::Running { detail, .. } => assert_eq!(detail.as_deref(), Some("bash: b")),
         other => panic!("x2's start was held as a queued member: {other:?}"),
     }
 }
@@ -1373,7 +1379,7 @@ fn late_batched_jsonl_pair_after_delivered_hook_end_is_fully_dropped() {
 }
 
 #[test]
-fn jsonl_task_start_duplicate_does_not_clobber_waiting_parent() {
+fn jsonl_task_start_duplicate_does_not_clobber_requires_action_parent() {
     let mut scene = SceneState::uniform(8);
     let mut r = Reducer::new();
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -1409,14 +1415,14 @@ fn jsonl_task_start_duplicate_does_not_clobber_waiting_parent() {
     assert!(
         matches!(
             scene.agents.get(&parent).unwrap().state,
-            ActivityState::Waiting { .. }
+            ActivityState::RequiresAction { .. }
         ),
-        "a dedup-dropped JSONL duplicate of the dispatch must not clobber the parent's pending permission Waiting"
+        "a dedup-dropped JSONL duplicate of the dispatch must not clobber the parent's pending permission RequiresAction"
     );
 }
 
 #[test]
-fn jsonl_task_start_replay_outside_dedup_window_does_not_clobber_waiting_parent() {
+fn jsonl_task_start_replay_outside_dedup_window_does_not_clobber_requires_action_parent() {
     let mut scene = SceneState::uniform(8);
     let mut r = Reducer::new();
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -1452,14 +1458,14 @@ fn jsonl_task_start_replay_outside_dedup_window_does_not_clobber_waiting_parent(
     assert!(
         matches!(
             scene.agents.get(&parent).unwrap().state,
-            ActivityState::Waiting { .. }
+            ActivityState::RequiresAction { .. }
         ),
-        "an out-of-dedup-window JSONL replay of an already-tracked dispatch must not clobber the parent's pending permission Waiting"
+        "an out-of-dedup-window JSONL replay of an already-tracked dispatch must not clobber the parent's pending permission RequiresAction"
     );
 }
 
 #[test]
-fn lagged_jsonl_task_pair_after_drain_does_not_clobber_waiting_parent() {
+fn lagged_jsonl_task_pair_after_drain_does_not_clobber_requires_action_parent() {
     let mut scene = SceneState::uniform(8);
     let mut r = Reducer::new();
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -1505,9 +1511,9 @@ fn lagged_jsonl_task_pair_after_drain_does_not_clobber_waiting_parent() {
     assert!(
         matches!(
             scene.agents.get(&parent).unwrap().state,
-            ActivityState::Waiting { .. }
+            ActivityState::RequiresAction { .. }
         ),
-        "a replayed Start of an already-drained Task must not re-enter Delegating over a pending Waiting"
+        "a replayed Start of an already-drained Task must not re-enter Delegating over a pending RequiresAction"
     );
 
     tool_use_end(
@@ -1521,9 +1527,9 @@ fn lagged_jsonl_task_pair_after_drain_does_not_clobber_waiting_parent() {
     assert!(
         matches!(
             scene.agents.get(&parent).unwrap().state,
-            ActivityState::Waiting { .. }
+            ActivityState::RequiresAction { .. }
         ),
-        "the replayed pair must leave the still-pending permission Waiting, got {:?}",
+        "the replayed pair must leave the still-pending permission RequiresAction, got {:?}",
         scene.agents.get(&parent).unwrap().state
     );
 }
@@ -1675,19 +1681,19 @@ fn jsonl_task_self_end_drains_when_hook_end_drops() {
         Transport::Hook,
     );
     match &scene.agents.get(&parent).unwrap().state {
-        ActivityState::Active { detail, .. } => {
+        ActivityState::Running { detail, .. } => {
             assert_eq!(
                 detail.as_deref(),
                 Some("Bash: ls"),
                 "suppression must release once the Task drained via JSONL"
             );
         }
-        other => panic!("expected Active(Bash: ls), got {other:?}"),
+        other => panic!("expected Running(Bash: ls), got {other:?}"),
     }
 }
 
 #[test]
-fn parent_waiting_on_subagent_permission_resolves_when_the_subagent_resumes() {
+fn parent_requires_action_on_subagent_permission_resolves_when_the_subagent_resumes() {
     let mut scene = SceneState::uniform(8);
     let mut r = Reducer::new();
     let parent = AgentId::from_parts(UNNAMED_CHILD_HOOKS, "orch");
@@ -1738,9 +1744,9 @@ fn parent_waiting_on_subagent_permission_resolves_when_the_subagent_resumes() {
     assert!(
         matches!(
             scene.agents.get(&parent).unwrap().state,
-            ActivityState::Waiting { .. }
+            ActivityState::RequiresAction { .. }
         ),
-        "parent goes Waiting on the subagent's permission"
+        "the parent requires action on the subagent's permission"
     );
 
     tool_use_start(
@@ -1756,15 +1762,15 @@ fn parent_waiting_on_subagent_permission_resolves_when_the_subagent_resumes() {
     assert!(
         matches!(
             scene.agents.get(&parent).unwrap().state,
-            ActivityState::Active { .. }
+            ActivityState::Running { .. }
         ),
-        "parent resumes Active(Delegating) once the subagent works again — no stale Waiting"
+        "parent resumes Running(Delegating) once the subagent works again — no stale RequiresAction"
     );
     assert!(scene.agents.get(&child).unwrap().exiting_at.is_none());
 }
 
 #[test]
-fn parent_waiting_on_subagent_permission_resolves_when_the_subagent_ends_a_tool() {
+fn parent_requires_action_on_subagent_permission_resolves_when_the_subagent_ends_a_tool() {
     let mut scene = SceneState::uniform(8);
     let mut r = Reducer::new();
     let parent = AgentId::from_parts(UNNAMED_CHILD_HOOKS, "orch2");
@@ -1814,9 +1820,9 @@ fn parent_waiting_on_subagent_permission_resolves_when_the_subagent_ends_a_tool(
     assert!(
         matches!(
             scene.agents.get(&parent).unwrap().state,
-            ActivityState::Waiting { .. }
+            ActivityState::RequiresAction { .. }
         ),
-        "parent goes Waiting on the subagent's permission"
+        "the parent requires action on the subagent's permission"
     );
     tool_use_end(
         &mut r,
@@ -1829,14 +1835,14 @@ fn parent_waiting_on_subagent_permission_resolves_when_the_subagent_ends_a_tool(
     assert!(
         matches!(
             scene.agents.get(&parent).unwrap().state,
-            ActivityState::Active { .. }
+            ActivityState::Running { .. }
         ),
-        "a suppressed child END must ALSO restore Active(Delegating), not leave a stale Waiting"
+        "a suppressed child END must ALSO restore Running(Delegating), not leave a stale RequiresAction"
     );
 }
 
 #[test]
-fn task_drain_while_parent_waiting_keeps_waiting() {
+fn task_drain_while_parent_requires_action_keeps_requires_action() {
     use pixtuoid_core::source::ToolDetail;
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
@@ -1864,7 +1870,7 @@ fn task_drain_while_parent_waiting_keeps_waiting() {
     );
     assert!(matches!(
         scene.agents[&id].state,
-        ActivityState::Waiting { .. }
+        ActivityState::RequiresAction { .. }
     ));
 
     tool_use_end(
@@ -1876,8 +1882,11 @@ fn task_drain_while_parent_waiting_keeps_waiting() {
         Transport::Hook,
     );
     assert!(
-        matches!(scene.agents[&id].state, ActivityState::Waiting { .. }),
-        "parent's permission must stay Waiting through a Task drain, got {:?}",
+        matches!(
+            scene.agents[&id].state,
+            ActivityState::RequiresAction { .. }
+        ),
+        "parent's permission must stay RequiresAction through a Task drain, got {:?}",
         scene.agents[&id].state
     );
 }
@@ -1969,7 +1978,7 @@ fn ending_one_of_two_parallel_tasks_does_not_restart_the_parents_delegating_cloc
 
     let slot = &scene.agents[&parent];
     assert!(
-        matches!(slot.state, ActivityState::Active { .. }),
+        matches!(slot.state, ActivityState::Running { .. }),
         "one of two parallel Tasks ending must leave the parent Delegating"
     );
     assert_eq!(
@@ -2078,7 +2087,7 @@ fn a_named_childs_parent_shows_its_own_tool_during_a_task() {
         Transport::Hook,
     );
     match &scene.agents[&parent].state {
-        ActivityState::Active { detail, .. } => assert_eq!(detail.as_deref(), Some("Bash: ls")),
+        ActivityState::Running { detail, .. } => assert_eq!(detail.as_deref(), Some("Bash: ls")),
         other => panic!("expected the parent's own tool, got {other:?}"),
     }
 }

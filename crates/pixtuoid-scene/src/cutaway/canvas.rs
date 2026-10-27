@@ -1095,11 +1095,11 @@ mod tests {
             .filter_map(|&s| on_buffer(s, h.scale, size))
             .collect();
         assert_eq!(dirty, Dirty::within(want));
-        let mut waiting = seated.clone();
-        waiting.agents[0].state = pixtuoid_core::state::ActivityState::Waiting {
-            reason: "permission?".into(),
+        let mut requires_action = seated.clone();
+        requires_action.agents[0].state = pixtuoid_core::state::ActivityState::RequiresAction {
+            reason: Some("permission?".into()),
         };
-        let (was, now) = (plate(seated), plate(&waiting));
+        let (was, now) = (plate(seated), plate(&requires_action));
         assert_eq!(was.0, now.0, "the plate stays put");
         assert_ne!(was.1, now.1, "its tone is in its fingerprint");
     }
@@ -1170,7 +1170,7 @@ mod tests {
         let seated = h.frames.last().expect("a seated frame");
         let quiet = crate::display::compose::tests::showing(clear_ground(), Hovering::now());
         let counts = crate::tally::StateCounts {
-            active: 3,
+            running: 3,
             total: 3,
             ..crate::tally::StateCounts::default()
         };
