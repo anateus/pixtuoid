@@ -30,8 +30,9 @@ use pixtuoid_scene::audio::OneShotPool;
 use pixtuoid_scene::audio::mixer::LoopStem;
 use pixtuoid_scene::floor::{FloorInputs, FloorMeta, FloorSession, PetInputs, floor_capacity};
 use pixtuoid_scene::layout::Size;
-use pixtuoid_scene::look::{Look, Place, RenderInputs};
+use pixtuoid_scene::look::{Place, RenderInputs, WorldText};
 use pixtuoid_scene::pack::load_bundled_pack;
+use pixtuoid_scene::render_scale::PixelFit;
 use pixtuoid_scene::screen::{Screen, ScreenClock};
 use pixtuoid_scene::sky::WeatherPolicy;
 use pixtuoid_scene::theme::{NORMAL, Theme};
@@ -140,6 +141,8 @@ pub struct Office {
     /// view into wasm memory, so blitting is zero-copy on the JS side.
     rgba: Vec<u8>,
     theme: &'static Theme,
+    /// The cutaway at the pack's densest art, which the browser upscales.
+    fit: PixelFit,
     seed: u64,
     reducer: Reducer,
     beats: Vec<Beat>,
@@ -154,9 +157,9 @@ pub struct Office {
     /// The clock of the most recent `step` — `hire()` has no clock parameter, so
     /// it schedules relative to this.
     last_now: Option<SystemTime>,
-    /// The buffer size `floor_capacities` was last synced for — lets
+    /// The units `floor_capacities` was last synced for — lets
     /// `sync_capacity` skip the layout recompute on every other frame.
-    caps_size: Option<(u16, u16)>,
+    caps_units: Option<(u16, u16)>,
     weather: WeatherPolicy,
     /// What the page shows: the frame `step` leaves is the one it draws.
     screen: Screen<(u16, u16), ()>,
@@ -182,6 +185,10 @@ impl Office {
     pub fn new(seed: u32) -> Result<Office, JsError> {
         let pack =
             std::sync::Arc::new(load_bundled_pack().map_err(|e| JsError::new(&format!("{e:#}")))?);
+        let density = pack.max_density_variant();
+        // The browser upscales the frame, so it renders at the art's own
+        // density; `step` takes the surface in units.
+        let fit = PixelFit::at_least_density(density.get(), density, Size { w: 0, h: 0 });
         Ok(Office {
             // Capacity starts empty and is synced from the CANVAS's own layout
             // on every `step` before any beat fires, so the reducer only admits
@@ -190,6 +197,7 @@ impl Office {
             session: FloorSession::new(pack),
             rgba: Vec::new(),
             theme: &NORMAL,
+            fit,
             seed: u64::from(seed),
             reducer: Reducer::new(),
             beats: hero_script(),
@@ -199,7 +207,7 @@ impl Office {
             epoch: None,
             hires: VisitorHires::default(),
             last_now: None,
-            caps_size: None,
+            caps_units: None,
             weather: WeatherPolicy::Clock,
             screen: Screen::on(page_clock()),
             shown_badges: Vec::new(),
@@ -208,9 +216,9 @@ impl Office {
         })
     }
 
-    /// Advance to `now_ms` and render at `w`×`h` pixels into the RGBA staging
-    /// buffer, which keeps the last frame while the flash hold keeps this one
-    /// back.
+    /// Advance to `now_ms` and render an office `w`×`h` layout units big into
+    /// the RGBA staging buffer, [`Office::scale`] pixels per unit. While the
+    /// flash hold keeps this frame back, the buffer keeps the last one.
     ///
     /// CONTRACT: `now_ms` must be UNIX-epoch milliseconds — `Date.now()`, NOT
     /// `performance.now()` and NOT a `requestAnimationFrame` timestamp: those are
@@ -218,11 +226,11 @@ impl Office {
     pub fn step(&mut self, now_ms: f64, w: u32, h: u32) {
         let now = pixtuoid_scene::anim::from_epoch_ms(now_ms);
         self.last_now = Some(now);
-        let buf_w = w.clamp(1, u32::from(u16::MAX)) as u16;
-        let buf_h = h.clamp(1, u32::from(u16::MAX)) as u16;
+        let (units_w, units_h) = self.units(w, h);
+        let px = self.frame_size(w, h);
         // Capacity BEFORE the script advances: the SessionStarts due this
         // frame must allocate desks against the canvas this frame renders.
-        self.sync_capacity(buf_w, buf_h);
+        self.sync_capacity(units_w, units_h);
         self.advance_script(now);
         self.reducer.tick(&mut self.scene, now);
         // The DAEMON sweep the app's reducer task runs: without it a `Down` row
@@ -235,15 +243,18 @@ impl Office {
         // `render` evicts per-agent render state for the agents the sweep removed
         // — load-bearing: the looped script REUSES agent ids, and a returning cast
         // member with stale walk legs teleports in.
-        self.render(now, buf_w, buf_h);
+        self.render(now, units_w, units_h);
         let Some(picture) = self.session.picture() else {
             // Too small to lay out: the canvas still takes a frame its size,
-            // the raster's backdrop.
-            self.screen.blank((buf_w, buf_h));
+            // in the background the engine fills a too-small classic with.
+            self.screen.blank(px);
             self.shown_badges.clear();
-            if let Some(backdrop) = self.session.floor().raster.pixels() {
-                expand_rgba(&mut self.rgba, backdrop);
-            }
+            let bg = pixtuoid_core::sprite::RgbBuffer::filled(
+                px.0,
+                px.1,
+                self.theme.surface.bg_fallback,
+            );
+            expand_rgba(&mut self.rgba, &bg);
             self.screen.landed();
             return;
         };
@@ -251,11 +262,7 @@ impl Office {
             .text
             .map_or_else(Vec::new, |text| text.badges.to_vec());
         let picture = pixtuoid_scene::look::Picture::Floor(picture);
-        if !self
-            .screen
-            .admit(&picture, (buf_w, buf_h), (), None)
-            .written()
-        {
+        if !self.screen.admit(&picture, px, (), None).written() {
             return;
         }
         expand_rgba(&mut self.rgba, picture.pixels());
@@ -264,7 +271,8 @@ impl Office {
         self.screen.landed();
     }
 
-    /// Pointer to the RGBA frame in wasm linear memory (`w*h*4` bytes).
+    /// Pointer to the RGBA frame in wasm linear memory ([`Office::frame_len`]
+    /// bytes).
     ///
     /// CONTRACT: re-read this (and rebuild any `Uint8ClampedArray` view) after
     /// EVERY `step` — a canvas resize reallocates the staging buffer, and any
@@ -274,9 +282,14 @@ impl Office {
         self.rgba.as_ptr()
     }
 
-    /// Byte length of the RGBA frame (`w*h*4`).
+    /// Byte length of the RGBA frame: `w`×`h` units × [`Office::scale`]² × 4.
     pub fn frame_len(&self) -> usize {
         self.rgba.len()
+    }
+
+    /// Frame pixels per layout unit `step` takes.
+    pub fn scale(&self) -> u32 {
+        u32::from(self.fit.scale().get())
     }
 
     /// Hire one more agent: a new coworker walks into the background office,
@@ -318,7 +331,7 @@ impl Office {
     /// The wasm office renders at a SMALL buffer that CSS upscales with
     /// `image-rendering: pixelated`, so anti-aliased text CANNOT be baked into the
     /// pixels — the site lays crisp DOM spans over the canvas from this model
-    /// instead. Coordinates are OFFICE-BUFFER px (a label's `x` is the sprite
+    /// instead. Coordinates are the LAYOUT units `step` takes (a label's `x` is the sprite
     /// CENTER, `y` its head-top; the board `rect` is the neon-panel interior).
     /// Colors are RESOLVED against the CURRENT theme. Call right after `step` (it
     /// reads the step's clock).
@@ -591,7 +604,7 @@ fn oneshot_wires() -> Vec<u8> {
 const GAIN_DEZIPPER: Duration = Duration::from_millis(30);
 
 impl Office {
-    /// The rendered RGBA frame (`w*h*4`, opaque alpha) — the safe NATIVE accessor
+    /// The rendered RGBA frame ([`Office::frame_len`] bytes, opaque alpha) — the safe NATIVE accessor
     /// for rlib consumers; the wasm-JS boundary keeps the zero-copy
     /// [`Office::frame_ptr`]/[`Office::frame_len`] pair instead, because a
     /// `&[u8]` doesn't cross wasm-bindgen without copying.
@@ -599,21 +612,37 @@ impl Office {
         &self.rgba
     }
 
+    /// The frame `step(_, w, h)` renders, in pixels: the units it lays out
+    /// at [`Office::scale`].
+    pub fn frame_size(&self, w: u32, h: u32) -> (u16, u16) {
+        let scale = self.fit.scale();
+        let (w, h) = self.units(w, h);
+        (scale.to_buffer(w), scale.to_buffer(h))
+    }
+
+    /// The layout units `step(_, w, h)` lays out: at least one each, and few
+    /// enough that the frame's pixels fit the buffer's u16.
+    fn units(&self, w: u32, h: u32) -> (u16, u16) {
+        let max = self.fit.scale().logical(u16::MAX);
+        let units = |n: u32| u16::try_from(n).unwrap_or(u16::MAX).clamp(1, max);
+        (units(w), units(h))
+    }
+
     /// Keep the reducer's desk capacity in lockstep with the office actually
-    /// rendered at this buffer size. Without it an admitted agent's desk index
+    /// rendered at these units. Without it an admitted agent's desk index
     /// can exceed the canvas layout's desk count, so it paints NOWHERE (its
     /// anchors return `None`) while staying alive in the scene. A shrink lowers
     /// capacity for FUTURE admissions only; already-seated excess agents stay
     /// alive-but-offscreen, same as the TUI on terminal shrink.
-    fn sync_capacity(&mut self, buf_w: u16, buf_h: u16) {
-        if self.caps_size == Some((buf_w, buf_h)) {
+    fn sync_capacity(&mut self, units_w: u16, units_h: u16) {
+        if self.caps_units == Some((units_w, units_h)) {
             return;
         }
         // The SAME (size, cap=None, seed) computation `render` lays out, so
         // reducer capacity and painted layout can't drift.
-        let cap = floor_capacity(buf_w, buf_h, self.seed);
+        let cap = floor_capacity(units_w, units_h, self.seed);
         self.scene.floor_capacities = std::array::from_fn(|i| if i == 0 { cap } else { 0 });
-        self.caps_size = Some((buf_w, buf_h));
+        self.caps_units = Some((units_w, units_h));
     }
 
     /// Fire every scripted beat due by `now`, each applied at its SCHEDULED time
@@ -678,11 +707,11 @@ impl Office {
         .with_weather(self.weather)
     }
 
-    fn render(&mut self, now: SystemTime, buf_w: u16, buf_h: u16) {
-        // Too-small layouts leave the cleared buffer; never panics.
+    fn render(&mut self, now: SystemTime, units_w: u16, units_h: u16) {
+        // Too small to lay out: draws nothing, and `step` fills the frame; never panics.
         let floor_meta = self.floor_meta();
         self.session.render(
-            Look::Classic,
+            self.fit.look(WorldText::Host),
             RenderInputs {
                 world: FloorInputs {
                     scene: &self.scene,
@@ -691,7 +720,10 @@ impl Office {
                     pets: PetInputs::default(),
                 },
                 theme: self.theme,
-                size: Size { w: buf_w, h: buf_h },
+                size: Size {
+                    w: units_w,
+                    h: units_h,
+                },
                 place: Place::default(),
                 debug_walkable: false,
                 dim: pixtuoid_scene::look::Dim::NONE,
@@ -884,7 +916,12 @@ mod tests {
         let mut o = office();
         let (w, h) = (160u32, 96u32);
         o.step(T0_MS, w, h);
-        assert_eq!(o.frame_len(), (w * h * 4) as usize, "len is w*h*4");
+        let s = o.scale();
+        assert_eq!(
+            o.frame_len(),
+            (w * s * h * s * 4) as usize,
+            "len is w*h*scale²*4"
+        );
         let frame = &o.rgba;
         assert!(
             frame.iter().skip(3).step_by(4).all(|&a| a == 255),
@@ -1043,11 +1080,12 @@ mod tests {
         step_at(&mut o, &screen, first - 2 * FLOOR_MS);
         step_at(&mut o, &screen, second - FLOOR_MS / 4);
         screen.at(SystemTime::UNIX_EPOCH + Duration::from_millis(second - FLOOR_MS / 8));
+        let s = o.scale() as usize;
         o.step((second - FLOOR_MS / 8) as f64, 8, 8);
-        assert_eq!(o.frame_len(), 8 * 8 * 4, "premise: the backdrop");
+        assert_eq!(o.frame_len(), 8 * s * 8 * s * 4, "premise: the backdrop");
         screen.at(SystemTime::UNIX_EPOCH + Duration::from_millis(second));
         o.step(second as f64, 160, 96);
-        assert_eq!(o.frame_len(), 160 * 96 * 4);
+        assert_eq!(o.frame_len(), 160 * s * 96 * s * 4);
     }
 
     /// A phase holds the floor from when its frame is written, not from the
@@ -1095,13 +1133,47 @@ mod tests {
     #[test]
     fn resize_reshapes_the_frame_and_a_tiny_canvas_never_panics() {
         let mut o = office();
+        let s = o.scale() as usize;
         o.step(T0_MS, 320, 180);
-        assert_eq!(o.frame_len(), 320 * 180 * 4);
+        assert_eq!(o.frame_len(), 320 * s * 180 * s * 4);
         o.step(T0_MS + 100.0, 480, 270);
-        assert_eq!(o.frame_len(), 480 * 270 * 4);
+        assert_eq!(o.frame_len(), 480 * s * 270 * s * 4);
         // Too small for any layout: render early-returns, still a valid frame.
         o.step(T0_MS + 200.0, 8, 8);
-        assert_eq!(o.frame_len(), 8 * 8 * 4);
+        assert_eq!(o.frame_len(), 8 * s * 8 * s * 4);
+        let bg = NORMAL.surface.bg_fallback;
+        assert!(
+            o.frame()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [bg.r, bg.g, bg.b, 255]),
+            "the theme's background"
+        );
+    }
+
+    /// The browser upscales the frame, so the office renders at the bundled
+    /// art's own density.
+    #[test]
+    fn the_office_renders_at_the_arts_own_density() {
+        let density = load_bundled_pack()
+            .expect("the bundled pack parses")
+            .max_density_variant()
+            .get();
+        assert_eq!(office().scale(), u32::from(density));
+    }
+
+    /// `hero_still` sizes its PNG by `frame_size`: each axis the units `step`
+    /// lays out, at most what the buffer's u16 holds and at least one.
+    #[test]
+    fn frame_size_is_the_frame_step_renders() {
+        let mut o = office();
+        let s = u16::try_from(o.scale()).expect("a u16 scale");
+        assert_eq!(o.frame_size(160, 96), (160 * s, 96 * s));
+        assert_eq!(o.frame_size(u32::MAX, 0), ((u16::MAX / s) * s, s));
+        o.step(T0_MS, 160, 96);
+        let (fw, fh) = o.frame_size(160, 96);
+        assert_eq!(o.frame_len(), usize::from(fw) * usize::from(fh) * 4);
     }
 
     #[test]
@@ -1377,9 +1449,9 @@ mod tests {
     #[test]
     fn capacity_tracks_the_canvas_layout_so_no_agent_is_stranded_unpainted() {
         use pixtuoid_scene::layout::SceneLayout;
-        // The site renders `BUF_H` rows; this width seats the full cast plus at
-        // least one spare. The free-desk count is DERIVED, not a size literal —
-        // the density pass re-tunes desks-per-buffer out from under a literal.
+        // The site renders `UNITS_H` units tall; this width seats the full cast
+        // plus at least one spare. The free-desk count is DERIVED, not a size
+        // literal — the density pass re-tunes desks-per-floor out from under a literal.
         let (w, h) = (192u32, 130u32);
         let mut o = office();
         let mut t = 0u64;
