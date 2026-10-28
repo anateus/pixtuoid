@@ -10,12 +10,21 @@ use super::format::{DENSITY_VARIANT_SEP, Material, PACK_MANIFEST};
 #[non_exhaustive]
 pub enum PackError {
     /// `pack.toml` is not valid TOML, or does not match the manifest schema.
+    #[cfg(feature = "pack-toml")]
     #[error("parsing {PACK_MANIFEST}")]
     #[non_exhaustive]
     Manifest {
         /// The parser's diagnostic.
         #[source]
         source: toml::de::Error,
+    },
+    /// A manifest's JSON transcode is not valid JSON, or does not match the manifest schema.
+    #[error("parsing the JSON transcode of {PACK_MANIFEST}: {message}")]
+    #[non_exhaustive]
+    JsonManifest {
+        /// The parser's diagnostic, as text: `serde_json::Error` would cost
+        /// the error `UnwindSafe`.
+        message: String,
     },
     /// An in-memory pack names a frame it was not given.
     #[error("missing embedded frame {file}")]
