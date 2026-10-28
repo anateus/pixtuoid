@@ -50,8 +50,10 @@ const PERMISSION_ASKED: &str = "permission.asked";
 
 /// The envelope's turn: an execution start's durable `seq`, which the plugin
 /// also stamps on that execution's settle; one whose start it never saw names
-/// none.
-const TURN: &str = "turn";
+/// none. Pinned to the plugin's key by its selftest, through
+/// `the_plugin_contract_is_the_committed_file`.
+#[doc(hidden)]
+pub const TURN: &str = "turn";
 
 /// The subagent dispatch tool (`packages/core/src/tool/plugin/subagent.ts:17`
 /// at v2.0.32).
@@ -59,7 +61,7 @@ const DISPATCH_TOOL: &str = "subagent";
 
 /// The event types this decoder turns into events. Pinned to the arms below
 /// by `every_exported_set_is_exactly_its_dispatch_arms`, and to the plugin's
-/// `FORWARD` set by `the_plugin_forwards_exactly_what_the_decoder_reads`.
+/// forwarding by its selftest, through `the_plugin_contract_is_the_committed_file`.
 #[cfg(any(test, feature = "harness"))]
 #[doc(hidden)]
 pub const DECODED_EVENTS: &[&str] = &[
@@ -76,8 +78,8 @@ pub const DECODED_EVENTS: &[&str] = &[
 
 /// Every `data` path `field` reads, dotted, pinned by
 /// `every_decoded_data_field_is_read`. The plugin's `allowlisted` copies these
-/// and nothing more, pinned by
-/// `the_plugin_copies_exactly_the_fields_the_decoder_reads`.
+/// and nothing more, which its selftest holds it to through
+/// `the_plugin_contract_is_the_committed_file`.
 #[cfg(any(test, feature = "harness"))]
 #[doc(hidden)]
 pub const DECODED_DATA_FIELDS: &[&str] = &[

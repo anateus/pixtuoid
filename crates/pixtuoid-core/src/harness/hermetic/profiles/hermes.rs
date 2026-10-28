@@ -34,6 +34,7 @@ pub(crate) const PROFILE: Profile = Profile {
     // would rewrite the operator's shell rc files and run `sudo -n -v`
     // (`scripts/install.sh:1032`, `:1076-1090`).
     package: Package::UvLocked("NousResearch/hermes-agent"),
+    plugin_types: &[],
     // `-z` is one turn that approves every tool (`hermes_cli/gateway_chat_view.py:52`, `:307`).
     invocation: &["hermes", "-z", Placeholder::Prompt.as_str()],
     second_turn: None,

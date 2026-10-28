@@ -391,6 +391,10 @@ pub struct Profile {
     pub source: &'static str,
     /// How users install it.
     pub package: Package,
+    /// The npm packages publishing the API its plugin is type-checked against,
+    /// which `just plugin-types` installs at its registry row's
+    /// `verified_version`.
+    pub plugin_types: &'static [&'static str],
     /// The headless invocation: [`Placeholder::Prompt`] expands to the
     /// scenario's prompt in the runner, else to [`crate::harness::plan::DEFAULT_PROMPT`], and
     /// [`Placeholder::Port`], [`Placeholder::Key`] and [`Placeholder::DaemonPort`] too.

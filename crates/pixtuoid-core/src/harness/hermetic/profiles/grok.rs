@@ -58,6 +58,7 @@ fn event(v: &Value) -> Option<Cow<'_, str>> {
 pub(crate) const PROFILE: Profile = Profile {
     source: crate::source::grok::SOURCE_NAME,
     package: Package::Npm("@xai-official/grok"),
+    plugin_types: &[],
     // Headless automation runs always-approve
     // (`crates/codegen/xai-grok-pager/docs/user-guide/22-permissions-and-safety.md:76-94`),
     // which a blocking spawn needs: `-p` cancels every prompt

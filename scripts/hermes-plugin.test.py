@@ -1,14 +1,13 @@
-"""Contract test for `crates/pixtuoid/src/install/hermes_plugin.py`. The Rust side
-can only grep the template as a string; this loads the RENDERED plugin the way
-hermes's loader does (`register(ctx)`) and drives its callbacks against fake shims,
-so what keeps hermes's `pre_tool_call` from failing closed is executed, not read."""
+"""Contract test for `crates/pixtuoid/src/install/hermes_plugin.py`: loads the
+RENDERED plugin the way hermes's loader does (`register(ctx)`) and drives its
+callbacks against fake shims, holding it to `plugin-contract.json`, so what keeps
+hermes's `pre_tool_call` from failing closed is executed, not read."""
 
 from __future__ import annotations
 
 import importlib.util
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -18,28 +17,15 @@ from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PLUGIN_SOURCE = (
-    REPO_ROOT / "crates" / "pixtuoid" / "src" / "install" / "hermes_plugin.py"
+INSTALL_DIR = REPO_ROOT / "crates" / "pixtuoid" / "src" / "install"
+CONTRACT = json.loads(
+    (INSTALL_DIR / "plugin-contract.json").read_text(encoding="utf-8")
 )
-# Must match `HOOK_PLACEHOLDER` in `crates/pixtuoid/src/install/hermes.rs`.
-HOOK_PLACEHOLDER = '"{{HOOK_PATH_JSON}}"'
+ROW = next(p for p in CONTRACT["plugins"] if p["source"] == "hermes")
+PLUGIN_SOURCE = INSTALL_DIR / ROW["file"]
+HOOK_PLACEHOLDER = CONTRACT["hook_placeholder"]
 POSIX = os.name == "posix"
 JITTER_S = 1.5
-
-
-def _shim_bound_s():
-    """The real shim's own bound, read from its authority."""
-    transport = REPO_ROOT / "crates" / "pixtuoid-hook" / "src" / "transport.rs"
-    found = re.search(
-        r"WRITE_TIMEOUT_MS: u64 = (\d+);", transport.read_text(encoding="utf-8")
-    )
-    if found is None:
-        raise AssertionError(f"{transport} declares no WRITE_TIMEOUT_MS")
-    return int(found.group(1)) / 1000
-
-
-# A fake stands in for a shim that spends all of it.
-SHIM_BOUND_S = _shim_bound_s()
 
 
 class FakeCtx:
@@ -102,9 +88,36 @@ class PluginTest(unittest.TestCase):
         lines = self.out.read_text().splitlines()
         return [(lines[i], json.loads(lines[i + 1])) for i in range(0, len(lines), 2)]
 
-    def test_it_registers_exactly_its_forward_set(self):
-        module, ctx = self.plugin(self.dir / "absent")
-        self.assertEqual(set(ctx.hooks), set(module.FORWARD))
+    def test_it_registers_exactly_the_contracts_events(self):
+        _, ctx = self.plugin(self.dir / "absent")
+        self.assertEqual(set(ctx.hooks), set(ROW["registers"]))
+
+    def test_it_copies_the_contracts_fields_and_nothing_more(self):
+        # The plugin's own allowlists, so a name the fixtures never pass is held
+        # too: `cwd` comes from the session, not the kwargs.
+        module, _ = self.plugin(self.dir / "absent")
+        self.assertEqual(set(module.FIELDS) | {"cwd"}, set(ROW["fields"]))
+        self.assertEqual(set(module.ARGS), set(ROW["detail_keys"]))
+
+    @unittest.skipUnless(POSIX, "the fake shims are sh scripts")
+    def test_each_event_sends_exactly_the_contracts_fields(self):
+        _, ctx = self.plugin(self.recorder())
+        fields = {name: name for name in ROW["fields"] if name != "cwd"}
+        args = {name: name for name in ROW["detail_keys"]}
+        for event in ROW["registers"]:
+            ctx.hooks[event](
+                **fields, args={**args, "content": "SECRET"}, user_message="SECRET"
+            )
+        for event, (argv, payload) in zip(ROW["registers"], self.sent(), strict=True):
+            with self.subTest(event=event):
+                self.assertEqual(argv, f"{CONTRACT['source_flag']} {ROW['source']}")
+                self.assertEqual(payload.pop(CONTRACT["pid_key"]), os.getpid())
+                self.assertEqual(payload.pop("hook_event_name"), event)
+                self.assertEqual(set(payload.pop("args")), set(ROW["detail_keys"]))
+                outside = event in ROW["outside_a_turn"]
+                self.assertEqual(
+                    set(payload), set(ROW["fields"]) - ({"cwd"} if outside else set())
+                )
 
     @unittest.skipUnless(POSIX, "the fake shims are sh scripts")
     def test_it_forwards_the_allowlist_and_no_prompt_tool_output_or_other_argument(
@@ -123,13 +136,13 @@ class PluginTest(unittest.TestCase):
         )
         self.assertIsNone(returned)
         [(argv, payload)] = self.sent()
-        self.assertEqual(argv, "--source hermes")
+        self.assertEqual(argv, f"{CONTRACT['source_flag']} {ROW['source']}")
         self.assertEqual(
             payload,
             {
                 "hook_event_name": "pre_tool_call",
                 "cwd": "/w",
-                "_pid": os.getpid(),
+                CONTRACT["pid_key"]: os.getpid(),
                 "session_id": "s1",
                 "tool_name": "write_file",
                 "tool_call_id": "c1",
@@ -167,18 +180,18 @@ class PluginTest(unittest.TestCase):
         )
 
     @unittest.skipUnless(POSIX, "the fake shims are sh scripts")
-    def test_a_shim_that_spends_its_bound_and_leaves_a_process_behind_blocks_no_longer(
+    def test_a_process_the_shim_leaves_behind_holds_the_hook_no_longer_than_the_shim(
         self,
     ):
         # The leftover holds whatever stdio it inherited: a pipe there would make
         # the plugin wait on it, long past the shim's own exit.
-        hook = self.hook(f"cat >/dev/null\n(sleep 5 &)\nsleep {SHIM_BOUND_S}\nexit 0\n")
+        hook = self.hook("cat >/dev/null\n(sleep 5 &)\nexit 0\n")
         _, ctx = self.plugin(hook)
         start = time.monotonic()
         self.assertIsNone(
             ctx.hooks["pre_tool_call"](session_id="s1", tool_name="terminal")
         )
-        self.assertLess(time.monotonic() - start, SHIM_BOUND_S + JITTER_S)
+        self.assertLess(time.monotonic() - start, JITTER_S)
 
     def test_an_absent_shim_neither_raises_nor_waits(self):
         _, ctx = self.plugin(self.dir / "absent")

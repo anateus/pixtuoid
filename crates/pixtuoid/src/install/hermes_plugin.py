@@ -9,11 +9,19 @@
 # the one wait is the shim's exit, which its write-timeout watchdog bounds
 # (`transport::WRITE_TIMEOUT`, invariant #5).
 #
-# HOOK_PATH is baked in at install time (a JSON-encoded absolute path).
+# HOOK_PATH is baked in at install time (a JSON-encoded absolute path). The
+# host types are a stub only the type check imports (`hermes_host.pyi`).
+from __future__ import annotations
+
 import contextlib
 import json
 import os
 import subprocess
+from collections.abc import Callable
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from hermes_host import PluginContext
 
 HOOK_PATH = "{{HOOK_PATH_JSON}}"
 
@@ -34,20 +42,23 @@ FIELDS = ("session_id", "tool_name", "tool_call_id", "description", "model")
 ARGS = ("command", "file_path", "path", "pattern", "url")
 
 
-def _payload(event, cwd, kwargs):
-    payload = {"hook_event_name": event, "_pid": os.getpid()}
+def _payload(
+    event: str, cwd: str | None, kwargs: dict[str, object]
+) -> dict[str, object]:
+    payload: dict[str, object] = {"hook_event_name": event, "_pid": os.getpid()}
     if cwd is not None:
         payload["cwd"] = cwd
     payload.update((name, kwargs[name]) for name in FIELDS if name in kwargs)
     args = kwargs.get("args")
     if isinstance(args, dict):
-        payload["args"] = {name: args[name] for name in ARGS if name in args}
+        given = cast("dict[object, object]", args)
+        payload["args"] = {name: given[name] for name in ARGS if name in given}
     return payload
 
 
 # Returns once the shim exits, so hermes fires an event's successor only after
 # the shim delivered it: a call's start always reaches pixtuoid before its end.
-def _send(payload):
+def _send(payload: dict[str, object]) -> None:
     subprocess.run(
         [HOOK_PATH, "--source", "hermes"],
         input=json.dumps(payload, default=str).encode(),
@@ -61,8 +72,8 @@ def _send(payload):
     )
 
 
-def _forwarder(ctx, event):
-    def forward(**kwargs):
+def _forwarder(ctx: PluginContext, event: str) -> Callable[..., None]:
+    def forward(**kwargs: object) -> None:
         with contextlib.suppress(Exception):
             cwd = None if event in OUTSIDE_A_TURN else ctx.session_cwd()
             _send(_payload(event, cwd, kwargs))
@@ -70,6 +81,6 @@ def _forwarder(ctx, event):
     return forward
 
 
-def register(ctx):
+def register(ctx: PluginContext) -> None:
     for event in FORWARD:
         ctx.register_hook(event, _forwarder(ctx, event))

@@ -106,6 +106,24 @@ updates:
       default-days: 7
 
   - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      checkers:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: npm
+    directory: /crates/pixtuoid/src/install
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: npm
     directory: /site
     schedule:
       interval: weekly

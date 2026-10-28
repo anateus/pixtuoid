@@ -26,6 +26,11 @@ fn event(v: &Value) -> Option<Cow<'_, str>> {
 pub(crate) const PROFILE: Profile = Profile {
     source: crate::source::dsh::SOURCE_NAME,
     package: Package::Npm("@deepseek-ai/dsh"),
+    plugin_types: &[
+        "@deepseek-ai/dsh-agent",
+        "@deepseek-ai/dsh-session",
+        "@deepseek-ai/dsh-user-approval",
+    ],
     invocation: &["dsh", "--profile", "headless", Placeholder::Prompt.as_str()],
     second_turn: None,
     // The Messages endpoint and key come from the launch environment

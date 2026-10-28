@@ -42,8 +42,6 @@ const CLI: io::HostCli = io::HostCli { command: "hermes" };
 /// a foreign or removed file is a clean no-op.
 const SENTINEL: &str = "@pixtuoid-hermes-plugin";
 
-const HOOK_PLACEHOLDER: &str = "\"{{HOOK_PATH_JSON}}\"";
-
 /// The template's shim declaration, as [`crate::install::verify::baked_hook_path_after`]
 /// finds it.
 const HOOK_DECL: &str = "HOOK_PATH =";
@@ -68,23 +66,10 @@ pub(crate) const REMOVED_STUB: &str = "# pixtuoid hermes plugin removed by disco
 
 const PLUGIN: SentinelPlugin = SentinelPlugin {
     sentinel: SENTINEL,
-    placeholder: HOOK_PLACEHOLDER,
     removed_stub: REMOVED_STUB,
     what: "the Hermes plugin",
     cli: "Hermes Agent",
 };
-
-/// The events the plugin forwards: its `FORWARD` tuple.
-#[cfg(test)]
-pub(crate) fn plugin_events() -> Vec<&'static str> {
-    template_tuple("FORWARD")
-}
-
-/// The items of the template's `<name> = ( … )` tuple.
-#[cfg(test)]
-fn template_tuple(name: &str) -> Vec<&'static str> {
-    crate::install::template_list(PLUGIN_TEMPLATE, &format!("\n{name} = ("), ")")
-}
 
 fn home() -> Result<PathBuf> {
     pixtuoid_core::source::hermes::hermes_home()
@@ -114,7 +99,7 @@ pub(crate) fn hook_command(resolved: &Path, _explicit: bool) -> Result<String> {
 }
 
 pub(crate) fn render_plugin(hook_path: &str) -> Result<String> {
-    merge::bake_hook_path(PLUGIN_TEMPLATE, HOOK_PLACEHOLDER, hook_path, "hermes")
+    merge::bake_hook_path(PLUGIN_TEMPLATE, hook_path, "hermes")
 }
 
 pub(crate) fn installed_shim(content: &str) -> ShimRef {
@@ -295,6 +280,7 @@ pub(crate) fn strip_shell_hooks(content: &str) -> Result<MergeOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::install::merge::HOOK_PLACEHOLDER;
 
     /// What an older pixtuoid merged, beside a user's own hook and key.
     const LEGACY: &str = "model: gpt\nhooks:\n  pre_tool_call:\n    - command: my-guard.sh\n    - command: \"'/opt/pixtuoid-hook' --source hermes\"\n      timeout: 5\n      _pixtuoid: true\n  on_session_finalize:\n    - command: \"'/opt/pixtuoid-hook' --source hermes\"\n      timeout: 5\n      _pixtuoid: true\n";
@@ -332,48 +318,6 @@ mod tests {
         assert!(!strip_shell_hooks("").unwrap().changed);
         let refused = strip_shell_hooks("- 1\n- 2\n").unwrap_err();
         assert!(format!("{refused:#}").contains("refusing to overwrite"));
-    }
-
-    /// The plugin forwards EXACTLY what the decoder reads: two lists in two
-    /// languages no compiler sees across, bound through core's `DECODED_EVENTS`.
-    /// Forward one the decoder bails on and every event of it is a decode error;
-    /// miss one it reads and that signal never arrives.
-    #[test]
-    fn the_plugin_forwards_exactly_what_the_decoder_reads() {
-        let forwarded: std::collections::BTreeSet<&str> = plugin_events().into_iter().collect();
-        let decoded: std::collections::BTreeSet<&str> =
-            pixtuoid_core::source::hermes::DECODED_EVENTS
-                .iter()
-                .copied()
-                .collect();
-        assert_eq!(forwarded, decoded);
-    }
-
-    /// The plugin copies kwargs by name and the decoder's own tests build their
-    /// payloads inline, so the two field lists are pinned here. `cwd` is the one
-    /// field hermes's kwargs never carry: the plugin asks the session for it.
-    #[test]
-    fn the_plugin_copies_exactly_the_fields_the_decoder_reads() {
-        use pixtuoid_core::source::hermes::{DECODED_FIELDS, DETAIL_KEYS};
-        let mut copied = template_tuple("FIELDS");
-        copied.push("cwd");
-        copied.sort_unstable();
-        let mut decoded = DECODED_FIELDS.to_vec();
-        decoded.sort_unstable();
-        assert_eq!(copied, decoded);
-        assert_eq!(template_tuple("ARGS"), DETAIL_KEYS);
-        assert_eq!(
-            template_tuple("OUTSIDE_A_TURN"),
-            pixtuoid_core::source::hermes::OUTSIDE_A_TURN,
-            "an event outside a turn has no cwd to send, and no arm reads one"
-        );
-    }
-
-    #[test]
-    fn the_plugin_runs_the_shim_with_the_flag_its_writers_share() {
-        let flag = crate::install::hook_cmd::SOURCE_FLAG.trim();
-        let source = pixtuoid_core::source::hermes::SOURCE_NAME;
-        assert!(PLUGIN_TEMPLATE.contains(&format!(r#"[HOOK_PATH, "{flag}", "{source}"]"#)));
     }
 
     #[test]
@@ -431,22 +375,6 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let bad = Path::new(std::ffi::OsStr::from_bytes(b"/x/\xff/pixtuoid-hook"));
         assert!(hook_command(bad, false).is_err());
-    }
-
-    #[test]
-    fn the_plugins_forward_set_is_pinned() {
-        crate::install::assert_event_roster(
-            "the plugin's FORWARD",
-            &plugin_events(),
-            &[
-                "on_session_start",
-                "pre_tool_call",
-                "pre_approval_request",
-                "on_session_finalize",
-                "post_tool_call",
-                "on_session_end",
-            ],
-        );
     }
 
     #[test]

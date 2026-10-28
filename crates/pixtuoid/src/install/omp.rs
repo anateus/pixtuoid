@@ -25,8 +25,6 @@ use crate::install::target::MergeOutcome;
 /// of a foreign/removed file is a clean no-op.
 const SENTINEL: &str = "@pixtuoid-omp-extension";
 
-const HOOK_PLACEHOLDER: &str = "\"{{HOOK_PATH_JSON}}\"";
-
 pub(crate) const EXTENSION_TEMPLATE: &str = include_str!("omp_extension.ts");
 
 /// A valid empty ES module WITHOUT the sentinel, so a re-uninstall is a no-op.
@@ -34,7 +32,6 @@ const REMOVED_STUB: &str = "// pixtuoid omp extension removed by disconnecting o
 
 const EXTENSION: SentinelPlugin = SentinelPlugin {
     sentinel: SENTINEL,
-    placeholder: HOOK_PLACEHOLDER,
     removed_stub: REMOVED_STUB,
     what: "the omp extension",
     cli: "omp",
@@ -85,114 +82,20 @@ pub(crate) fn verify_schema(content: &str) -> crate::install::verify::SchemaPars
 }
 
 pub(crate) fn render_extension(hook_path: &str) -> Result<String> {
-    crate::install::merge::bake_hook_path(EXTENSION_TEMPLATE, HOOK_PLACEHOLDER, hook_path, "omp")
+    crate::install::merge::bake_hook_path(EXTENSION_TEMPLATE, hook_path, "omp")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn extension_forward_set() -> std::collections::BTreeSet<&'static str> {
-        crate::install::forward_set(EXTENSION_TEMPLATE)
-    }
-
-    /// The extension registers EXACTLY what the decoder reads. Two lists in
-    /// two languages — a TS `FORWARD` set here, `match ty` arms in
-    /// `pixtuoid-core` — and no compiler can see across that gap, so they are
-    /// bound through core's `DECODED_HOOK_EVENTS` instead. Register one the decoder
-    /// ignores and we spawn a shim per event for nothing; miss one it reads and
-    /// that signal never arrives.
-    #[test]
-    fn the_extension_forwards_exactly_what_the_decoder_reads() {
-        let decoded: std::collections::BTreeSet<&str> =
-            pixtuoid_core::source::omp::DECODED_HOOK_EVENTS
-                .iter()
-                .copied()
-                .collect();
-
-        assert_eq!(extension_forward_set(), decoded);
-    }
-
-    /// The registered set is a TS `Set`, not a Rust const, so the `*_EVENTS`
-    /// membership pins cannot reach it. The binding test above catches a
-    /// one-sided drop; this pin is what stops a SYMMETRIC one — extension and
-    /// decoder deleted together — from shipping silently, the hole opencode's
-    /// `permission.v2.asked` demonstrated.
-    #[test]
-    fn omp_extension_forward_set_is_pinned() {
-        use std::collections::BTreeSet;
-        assert_eq!(
-            extension_forward_set(),
-            BTreeSet::from([
-                "session_start",
-                "session_switch",
-                "session_branch",
-                "session_shutdown",
-                "tool_approval_requested",
-                "tool_approval_resolved",
-            ]),
-            "omp_extension.ts FORWARD changed — update the decoder and this pin together"
-        );
-    }
-
-    /// Every event the EXTENSION registers must decode to something — driven
-    /// off the template's own set, so a new `FORWARD` entry with no decoder
-    /// arm fails here rather than silently arriving as an unmapped event.
-    #[test]
-    fn every_forwarded_omp_event_decodes() {
-        use pixtuoid_core::source::decoder::decode_hook_payload;
-        const FILE: &str = "/h/.omp/agent/sessions/-r/2026-08-31T06-00-52-863Z_01a05668-057f-7559-8fed-f28ff062e3ca.jsonl";
-        let payloads = [
-            serde_json::json!({"type": "session_start", "sessionFile": FILE,
-                "sessionId": "u", "cwd": "/r", "_pixtuoid_source": "omp"}),
-            serde_json::json!({"type": "session_switch", "sessionFile": FILE,
-                "previousSessionFile": "/h/.omp/agent/sessions/-r/2026-08-30T01-00-00-000Z_01a00000-0000-7000-8000-000000000009.jsonl",
-                "sessionId": "u", "cwd": "/r", "_pixtuoid_source": "omp"}),
-            serde_json::json!({"type": "session_branch", "sessionFile": FILE,
-                "previousSessionFile": FILE,
-                "sessionId": "u", "cwd": "/r", "_pixtuoid_source": "omp"}),
-            serde_json::json!({"type": "session_shutdown", "sessionFile": FILE,
-                "sessionId": "u", "cwd": "/r", "_pixtuoid_source": "omp"}),
-            serde_json::json!({"type": "tool_approval_requested", "sessionFile": FILE,
-                "sessionId": "u", "cwd": "/r", "toolCallId": "c1", "toolName": "bash",
-                "_pixtuoid_source": "omp"}),
-            serde_json::json!({"type": "tool_approval_resolved", "sessionFile": FILE,
-                "sessionId": "u", "cwd": "/r", "toolCallId": "c1", "toolName": "bash",
-                "approved": true, "_pixtuoid_source": "omp"}),
-        ];
-        let covered: std::collections::BTreeSet<&str> = payloads
-            .iter()
-            .map(|p| p["type"].as_str().unwrap())
-            .collect();
-        for ev in extension_forward_set() {
-            assert!(
-                covered.contains(ev),
-                "extension forwards `{ev}` but this test has no payload for it — the \
-                 hand-listed fixtures drifted from omp_extension.ts"
-            );
-        }
-        for p in payloads {
-            let ty = p["type"].clone();
-            let evs = decode_hook_payload(p).unwrap();
-            assert!(
-                !evs.is_empty(),
-                "forwarded omp event {ty} decoded to NOTHING — add an arm in source/omp.rs"
-            );
-        }
-    }
+    use crate::install::merge::HOOK_PLACEHOLDER;
 
     /// The bridge must never hold a gate: omp's `tool_call` handlers fail
     /// CLOSED (a throw/timeout blocks the user's tool), so the extension may
-    /// only ever observe. Anchored on `pi.on(name, …)` being the SOLE
-    /// registration shape — a literal `pi.on("tool_call"` (or any name outside
-    /// FORWARD) cannot appear.
+    /// only ever observe, and its selftest holds what it registers to
+    /// `DECODED_HOOK_EVENTS`.
     #[test]
     fn the_extension_registers_no_gating_handlers_and_awaits_nothing() {
-        assert!(
-            !EXTENSION_TEMPLATE.contains("pi.on(\""),
-            "every registration must go through the FORWARD loop, so the pin \
-             on FORWARD covers the whole registered set"
-        );
         // The one awaited thing is the shim, bounded by its own
         // `transport::WRITE_TIMEOUT_MS` watchdog.
         assert_eq!(
@@ -208,7 +111,9 @@ mod tests {
         );
         for gate in ["tool_call", "tool_result", "input", "session_before"] {
             assert!(
-                !extension_forward_set().iter().any(|e| e.starts_with(gate)),
+                !pixtuoid_core::source::omp::DECODED_HOOK_EVENTS
+                    .iter()
+                    .any(|e| e.starts_with(gate)),
                 "`{gate}*` is a blocking/gating handler class — the bridge is \
                  observe-only"
             );

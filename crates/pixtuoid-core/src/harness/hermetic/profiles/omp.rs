@@ -68,6 +68,7 @@ pub(crate) const PROFILE: Profile = Profile {
         ],
         sums: "SHA256SUMS.txt",
     },
+    plugin_types: &["@oh-my-pi/pi-coding-agent"],
     invocation: &["omp", "-p", "--model", MODEL, Placeholder::Prompt.as_str()],
     // `--resume` opens the session whose file name the session key prefixes,
     // in any case (`src/session/session-listing.ts:980-987` at `v18.13.1`).

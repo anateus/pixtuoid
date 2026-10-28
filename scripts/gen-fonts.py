@@ -108,6 +108,9 @@ def parse_bdf(text):
         elif p[0] == "BITMAP":
             bitmap = []
         elif p[0] == "ENDCHAR":
+            # `fetch` admits only the pinned fonts, which declare all four first.
+            assert ascent is not None and cp is not None
+            assert bbx is not None and bitmap is not None
             w, h, xoff, yoff = bbx
             top = ascent - (h + yoff)
             ink = set()

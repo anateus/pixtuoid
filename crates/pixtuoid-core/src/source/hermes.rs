@@ -218,8 +218,8 @@ const ON_SESSION_END: &str = "on_session_end";
 const ON_SESSION_FINALIZE: &str = "on_session_finalize";
 
 /// The events this decoder turns into events. Pinned to its arms by
-/// `every_exported_set_is_exactly_its_dispatch_arms`, and to the plugin's
-/// `FORWARD` by `the_plugin_forwards_exactly_what_the_decoder_reads`.
+/// `every_exported_set_is_exactly_its_dispatch_arms`, and to what the plugin
+/// registers by its selftest, through `the_plugin_contract_is_the_committed_file`.
 #[cfg(any(test, feature = "harness"))]
 #[doc(hidden)]
 pub const DECODED_EVENTS: &[&str] = &[
@@ -241,7 +241,8 @@ pub const OUTSIDE_A_TURN: &[&str] = &[ON_SESSION_FINALIZE];
 
 /// Every envelope field [`field`] reads, pinned by `every_decoded_field_is_read`.
 /// The plugin sends these and `args` cut to [`DETAIL_KEYS`], nothing more of
-/// hermes's kwargs: `the_plugin_copies_exactly_the_fields_the_decoder_reads`.
+/// hermes's kwargs, which its selftest holds it to through
+/// `the_plugin_contract_is_the_committed_file`.
 #[cfg(any(test, feature = "harness"))]
 #[doc(hidden)]
 pub const DECODED_FIELDS: &[&str] = &[

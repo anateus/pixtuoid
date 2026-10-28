@@ -54,7 +54,7 @@ pub(crate) fn sentinel_plugin_schema(
             plugin.cli
         ));
     }
-    if content.contains(plugin.placeholder) {
+    if content.contains(crate::install::merge::HOOK_PLACEHOLDER) {
         return SchemaParse::broken(format!(
             "{what}'s shim-path placeholder was never substituted"
         ));

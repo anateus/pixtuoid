@@ -779,39 +779,7 @@ pub(crate) fn assert_event_roster<T: Ord + std::fmt::Debug + Copy>(
     );
 }
 
-/// The events a bridge template's `FORWARD` set names, read out of it rather
-/// than hand-copied beside it.
 #[cfg(test)]
-pub(crate) fn forward_set(template: &'static str) -> std::collections::BTreeSet<&'static str> {
-    template_set(template, "FORWARD")
-}
-
-/// The strings a template's `const <name>` set names, a `...OTHER` entry read
-/// out of the template's own `OTHER` set.
-#[cfg(test)]
-fn template_set(template: &'static str, name: &str) -> std::collections::BTreeSet<&'static str> {
-    template_list(template, &format!("const {name} = new Set<string>(["), "])")
-        .into_iter()
-        .flat_map(|s| match s.strip_prefix("...") {
-            Some(other) => template_set(template, other),
-            None => std::collections::BTreeSet::from([s]),
-        })
-        .collect()
-}
-
-/// The quoted strings of the list a template writes between `open` and `close`.
-#[cfg(test)]
-pub(crate) fn template_list(template: &'static str, open: &str, close: &str) -> Vec<&'static str> {
-    template
-        .split_once(open)
-        .and_then(|(_, rest)| rest.split_once(close))
-        .map(|(inner, _)| inner)
-        .unwrap_or_else(|| panic!("the template writes no {open:?} … {close:?} list"))
-        .split(',')
-        .map(|s| s.trim().trim_matches('"'))
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
+mod contract;
 #[cfg(test)]
 pub(crate) mod tests;

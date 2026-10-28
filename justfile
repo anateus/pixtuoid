@@ -3,7 +3,7 @@
 # `workspace-version` names the one exception.
 #
 # Recipes are grouped by intent (see `just --list`):
-#   rust     — build, test and lint the repo (Rust, shell, workflows, Python), plus the
+#   rust     — build, test and lint the repo (Rust, shell, workflows, Python, JS), plus the
 #              on-demand e2e / capture / fixture recipes
 #   site     — the Astro landing page under site/ (npm + the wasm build)
 #   gen      — regenerate + check committed artifacts
@@ -51,6 +51,10 @@ PUBLISHED_CRATES := "pixtuoid-core pixtuoid-scene"
 # `actionlint-composites`. Both are shellcheck-only — shfmt cannot rewrite a
 # scalar in place — so adding a file here is not enough for embedded shell.
 SHELL_SOURCES := "scripts/lib/*.sh .githooks/* policy/ci-observability/*.sh"
+
+# The projects that run their own checkers (site/AGENTS.md,
+# integrations/raycast/AGENTS.md), as git pathspecs.
+SELF_GATED := "':!:site/' ':!:integrations/'"
 
 # The nightly the api-surface goldens are pinned to (rustdoc JSON is
 # nightly-only). Provisioned by `_api-toolchain`, which also fails while it
@@ -219,6 +223,75 @@ ruff:
     ruff check
     ruff format --check
 
+# Every tracked Python file, so none escapes an `include`. The env uv builds
+# out of requirements-dev.txt resolves the scripts' imports.
+[doc('Type-check the Python (pyright, as pyproject.toml configures it)')]
+[group('rust')]
+pyright: (_npm ".")
+    git ls-files -z -- '*.py' '*.pyi' {{ SELF_GATED }} | xargs -0 uv run --no-project --with-requirements requirements-dev.txt -- node_modules/.bin/pyright
+
+[doc('Type-check the JavaScript (tsc --checkJs, as tsconfig.json configures it)')]
+[group('rust')]
+tsc: (_npm ".")
+    node_modules/.bin/tsc -p tsconfig.json
+
+# What each checker reads, by its own account: tsc's program, the files `pyright`
+# is handed and SHELL_SOURCES as the shell expands it for shellcheck. tsc lists
+# the plugins' project without its hosts' types installed, then exits 1.
+[doc('Fail on a tracked JS/TS, Python or shell source no checker reads')]
+[group('rust')]
+lang-census: (_npm ".")
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export LC_ALL=C
+    interpreter='^#!.*[/[:space:]](node|python[0-9.]*|sh|bash)$'
+    read_by=$(
+        {
+            for project in tsconfig.json crates/pixtuoid/src/install; do
+                { node_modules/.bin/tsc -p "$project" --listFilesOnly || true; } | grep "^$PWD/" | cut -c "$((${#PWD} + 2))-"
+            done
+            git ls-files -- '*.py' '*.pyi' {{ SELF_GATED }}
+            printf '%s\n' {{ SHELL_SOURCES }}
+        } | sort -u
+    )
+    unread=$(
+        git ls-files -z -- {{ SELF_GATED }} | while IFS= read -r -d '' f; do
+            case ${f##*/} in
+                (*.py | *.pyi | *.js | *.mjs | *.cjs | *.ts | *.mts | *.cts | *.sh) ;;
+                (*.*) continue ;;
+                (*)
+                    [[ -f $f && ! -L $f ]] || continue
+                    shebang=$(head -n 1 "$f")
+                    [[ $shebang =~ $interpreter ]] || continue
+                    ;;
+            esac
+            printf '%s\n' "$f"
+        done | sort | comm -23 - <(printf '%s\n' "$read_by")
+    )
+    if [[ -n $unread ]]; then
+        echo "no checker reads these: give an extensionless script its extension, else name it in a tsconfig.json include or SHELL_SOURCES" >&2
+        printf '%s\n' "$unread" >&2
+        exit 1
+    fi
+
+# Each host's own published types at its `verified_version`, the one pin, on top
+# of the committed runtime types: an install too heavy for `lint`, so CI's
+# hygiene job runs it when an input changes.
+[doc("Type-check each shipped plugin against its host's own published API")]
+[group('rust')]
+plugin-types: (_npm ".") (_npm "crates/pixtuoid/src/install")
+    #!/usr/bin/env bash
+    set -euo pipefail
+    read -ra hosts <<<"$(cargo run -q -p pixtuoid-core --example bump -- plugin-types | tr '\n' ' ')"
+    npm install --prefix crates/pixtuoid/src/install --no-save --no-audit --no-fund "${hosts[@]}"
+    node_modules/.bin/tsc -p crates/pixtuoid/src/install
+
+# An install older than its lockfile is redone; `dir`'s .npmrc fails it on any
+# install script its `allowScripts` hasn't reviewed.
+[private]
+_npm dir:
+    @[ "$1/node_modules/.package-lock.json" -nt "$1/package-lock.json" ] || npm ci --prefix "$1" --no-audit --no-fund
+
 # Clippy across the workspace, warnings denied.
 [group('rust')]
 clippy:
@@ -265,7 +338,7 @@ arch:
 
 # Fast, independent lint checks in parallel.
 [group('rust')]
-lint:
+lint: (_npm ".")
     #!/usr/bin/env bash
     set -euo pipefail
     # Per-check logs; dump only the failures so a green run stays quiet.
@@ -288,6 +361,9 @@ lint:
     run schemas just json-schemas         & pids+=($!)
     run links   just links               & pids+=($!)
     run ruff    just ruff                & pids+=($!)
+    run pyright just pyright             & pids+=($!)
+    run tsc     just tsc                 & pids+=($!)
+    run census  just lang-census         & pids+=($!)
     run hookscrub just hook-scrub-selftest  & pids+=($!)
     run starhist just star-history-selftest & pids+=($!)
     run bmcbtn  just bmc-button-selftest  & pids+=($!)
@@ -930,21 +1006,13 @@ deb target:
     cargo deb -p pixtuoid --no-build --no-strip --target "$1"
     cargo deb -p pixtuoid-hook --no-build --no-strip --target "$1"
 
-# The repo's NODE-side gate (no cargo): the npm package generator AND the bundled
-# OpenClaw plugin contract.
-#   - npm/generate.test.mjs — the ONLY validation of npm/generate.mjs, run in CI
-#     so a generator regression is caught at review time, not at the tag-push.
-#   - scripts/{openclaw,dsh,opencode}-plugin.test.mjs — drive each RENDERED plugin
-#     the way its CLI's loader does. The Rust side can only grep a template as a
-#     string, so this is where those plugins' runtime contracts (never block the
-#     host / never forward content / openclaw's gateway identity, dsh's emit
-#     order, opencode's turns) are EXECUTED.
-# NOT in preflight: a Rust pre-push shouldn't require a Node toolchain. Needs a
-# Node that imports TypeScript unflagged: opencode's plugin is one.
-[doc('Node gates: the npm package generator + the OpenClaw, dsh and opencode plugin contracts (CI; not in preflight)')]
+# The npm package generator's tests, its only run before a tag-push, and every
+# plugin's selftest, which executes it against `plugin-contract.json`; a
+# selftest is found by its name, the one the census pairs with its plugin.
+[doc('Node tests: the npm package generator and every plugin selftest (CI)')]
 [group('release')]
 npm-check:
-    node --test npm/generate.test.mjs scripts/openclaw-plugin.test.mjs scripts/dsh-plugin.test.mjs scripts/opencode-plugin.test.mjs
+    node --test 'npm/*.test.mjs' 'scripts/*.test.mjs'
 
 # ── meta ──────────────────────────────────────────────────────────
 
@@ -1014,8 +1082,8 @@ star-history-selftest:
 bmc-button-selftest:
     python3 scripts/bmc-button.py --selftest
 
-# The bundled Hermes plugin, driven as hermes's loader drives it: the Rust side
-# only greps the template, so this is where its never-block contract runs.
+# The bundled Hermes plugin, driven as hermes's loader drives it and held to
+# `plugin-contract.json`, like the JS plugins' selftests in `npm-check`.
 [doc("Self-test the Hermes plugin's runtime contract")]
 [group('meta')]
 hermes-plugin-selftest:

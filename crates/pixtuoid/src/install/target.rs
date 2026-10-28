@@ -406,7 +406,7 @@ pub(crate) const OPENCODE: Target = Target {
     #[cfg(test)]
     consumes: &[],
     #[cfg(test)]
-    registers: crate::install::opencode::plugin_events,
+    registers: || pixtuoid_core::source::opencode::DECODED_EVENTS.to_vec(),
 };
 
 pub(crate) const GROK: Target = Target {
@@ -477,7 +477,7 @@ pub(crate) const HERMES: Target = Target {
     #[cfg(test)]
     consumes: &[],
     #[cfg(test)]
-    registers: crate::install::hermes::plugin_events,
+    registers: || pixtuoid_core::source::hermes::DECODED_EVENTS.to_vec(),
 };
 
 pub(crate) const OPENCLAW: Target = Target {
@@ -587,11 +587,7 @@ pub(crate) const OMP: Target = Target {
     #[cfg(test)]
     consumes: &[],
     #[cfg(test)]
-    registers: || {
-        crate::install::forward_set(crate::install::omp::EXTENSION_TEMPLATE)
-            .into_iter()
-            .collect()
-    },
+    registers: || pixtuoid_core::source::omp::DECODED_HOOK_EVENTS.to_vec(),
 };
 
 pub(crate) const ANTIGRAVITY: Target = Target {

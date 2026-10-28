@@ -30,6 +30,7 @@ const TUI: tui::Tui = tui::Tui {
 pub(crate) const PROFILE: Profile = Profile {
     source: crate::source::kimi::SOURCE_NAME,
     package: Package::Npm("@moonshot-ai/kimi-code"),
+    plugin_types: &[],
     invocation: &["kimi", "-p", Placeholder::Prompt.as_str()],
     second_turn: None,
     // `KIMI_MODEL_NAME` builds a provider from the environment
