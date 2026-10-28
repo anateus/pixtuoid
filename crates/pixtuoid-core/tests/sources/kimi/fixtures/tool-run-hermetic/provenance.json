@@ -1,0 +1,17 @@
+{
+  "origin": "recorded",
+  "cli": "kimi",
+  "version": "2.3.3",
+  "captured": "2026-10-28",
+  "command": "just hermetic --record kimi",
+  "deidentified": {
+    "method": "decoder-allowlist",
+    "blanked": 11
+  },
+  "aimock": "1.47.0",
+  "script": "tests/sources/kimi/hermetic/tool-run.json",
+  "dropped": {
+    "os": "macos",
+    "at": {}
+  }
+}

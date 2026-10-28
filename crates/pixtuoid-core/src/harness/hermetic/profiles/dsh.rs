@@ -66,7 +66,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "turn/end",
                 "agent/disposed",
             ],
-            fixture: "fixtures/dsh/tool-run-recorded",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -84,7 +83,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "turn/end",
                 "agent/disposed",
             ],
-            fixture: "fixtures/dsh/permission-recorded",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -100,7 +98,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "turn/end",
                 "agent/disposed",
             ],
-            fixture: "delegation/fixtures/dsh",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -113,7 +110,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "turn/end",
                 "agent/disposed",
             ],
-            fixture: "fixtures/dsh/model-error-hermetic",
             turn: Turn::PROFILE,
         },
     ],

@@ -138,8 +138,8 @@ fn descriptor_relative(source: &str) -> PathBuf {
 
 /// Whether a bump of `p` may change `path`, relative to the repository: the
 /// pin's module, its manifest lock, a file under one of its scenarios' fixtures,
-/// or one of their conformance snapshots, named as insta derives it
-/// (`conformance.rs`).
+/// or one of their conformance snapshots, under its source's home, named as
+/// insta derives it (`conformance.rs`).
 pub fn admits(p: &Profile, path: &Path) -> bool {
     if !path.components().all(|c| matches!(c, Component::Normal(_))) {
         return false;
@@ -149,13 +149,15 @@ pub fn admits(p: &Profile, path: &Path) -> bool {
         || p.manifest_lock()
             .is_some_and(|lock| path == relative(&lock))
         || p.scenarios.iter().any(|s| {
-            let fixture = sources.join(s.fixture);
+            let fixture = sources.join(s.fixture(p.source));
             let snapshot = fixture.file_name().map(|scenario| {
-                sources.join("snapshots").join(format!(
-                    "sources__conformance__{}__{}.snap",
-                    p.source,
-                    scenario.to_string_lossy()
-                ))
+                relative(&crate::harness::source_home(p.source))
+                    .join("snapshots")
+                    .join(format!(
+                        "sources__conformance__{}__{}.snap",
+                        p.source,
+                        scenario.to_string_lossy()
+                    ))
             });
             path.starts_with(&fixture) || snapshot.is_some_and(|s| path == s)
         })
@@ -369,7 +371,7 @@ mod tests {
     fn a_bump_admits_its_pin_fixtures_and_snapshots_alone() {
         let p = codex();
         let sources = relative(&sources_root());
-        let fixture = sources.join(p.scenarios[0].fixture);
+        let fixture = sources.join(p.scenarios[0].fixture(p.source));
         let name = fixture.file_name().expect("a name").to_string_lossy();
         assert!(descriptor_relative(p.source).is_relative());
         assert_eq!(
@@ -380,16 +382,17 @@ mod tests {
         assert!(!admits(p, &descriptor_relative("claude-code")));
         assert!(admits(p, &fixture.join("provenance.json")));
         let snap = format!("sources__conformance__codex__{name}.snap");
-        assert!(admits(p, &sources.join("snapshots").join(&snap)));
+        let snapshots = relative(&crate::harness::source_home("codex")).join("snapshots");
+        assert!(admits(p, &snapshots.join(&snap)));
         let other = profile("claude-code").expect("claude-code's profile");
         assert!(!admits(
             p,
             &sources
-                .join(other.scenarios[0].fixture)
+                .join(other.scenarios[0].fixture(other.source))
                 .join("provenance.json")
         ));
         let theirs = format!("sources__conformance__claude-code__{name}.snap");
-        assert!(!admits(p, &sources.join("snapshots").join(theirs)));
+        assert!(!admits(p, &snapshots.join(theirs)));
         assert!(!admits(p, &fixture.join("..").join("..").join("build.rs")));
         assert!(!admits(p, Path::new("justfile")));
         assert!(!admits(
@@ -410,15 +413,23 @@ mod tests {
     #[test]
     fn every_profile_with_a_conformance_scenario_admits_the_snapshot_insta_wrote() {
         let root = repo_root();
-        let snapshots: Vec<PathBuf> = std::fs::read_dir(sources_root().join("snapshots"))
-            .expect("the snapshots")
-            .map(|e| relative(&e.expect("an entry").path()))
+        let snapshots: Vec<PathBuf> = PROFILES
+            .iter()
+            .flat_map(|p| {
+                std::fs::read_dir(crate::harness::source_home(p.source).join("snapshots"))
+                    .into_iter()
+                    .flatten()
+                    .map(|e| relative(&e.expect("an entry").path()))
+            })
             .collect();
-        let conformance = sources_root().join("fixtures");
         let scanned = |p: &&Profile| {
-            p.scenarios
-                .iter()
-                .any(|s| sources_root().join(s.fixture).starts_with(&conformance))
+            p.scenarios.iter().any(|s| {
+                crate::harness::Capture {
+                    dir: s.fixture(p.source),
+                    source: p.source.to_string(),
+                }
+                .in_conformance()
+            })
         };
         let skipped: Vec<_> = PROFILES
             .iter()
@@ -426,7 +437,7 @@ mod tests {
             .map(|p| p.source)
             .collect();
         // omp's rounds fold their hook keys per platform, so no conformance
-        // golden holds them (`tests/sources/omp/mod.rs`).
+        // golden holds them (`tests/sources/omp.rs`).
         assert_eq!(skipped, ["omp"], "a profile left conformance");
         for p in PROFILES.iter().filter(scanned) {
             assert!(
@@ -466,7 +477,11 @@ mod tests {
     }
 
     fn fixture_path(name: &str) -> PathBuf {
-        relative(&sources_root().join(codex().scenarios[0].fixture).join(name))
+        relative(
+            &sources_root()
+                .join(codex().scenarios[0].fixture("codex"))
+                .join(name),
+        )
     }
 
     #[test]

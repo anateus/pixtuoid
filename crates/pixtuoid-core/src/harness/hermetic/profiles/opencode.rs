@@ -126,7 +126,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "session.tool.success",
                 "session.execution.succeeded",
             ],
-            fixture: "fixtures/opencode/tool-run-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -139,7 +138,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "session.tool.success",
                 "session.execution.succeeded",
             ],
-            fixture: "opencode/fixtures/subagent-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -147,7 +145,6 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::ModelError,
             surface: Surface::Headless,
             expects: &["session.execution.started", "session.execution.failed"],
-            fixture: "fixtures/opencode/model-error-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -161,7 +158,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "session.tool.failed",
                 "session.execution.succeeded",
             ],
-            fixture: "fixtures/opencode/permission-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -175,7 +171,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "session.execution.succeeded",
                 "session.deleted",
             ],
-            fixture: "fixtures/opencode/delete-hermetic",
             turn: Turn {
                 second: Some(Second::Bare),
                 ..Turn::PROFILE
@@ -186,7 +181,6 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::Cancel,
             surface: Surface::Tui { row: &TUI },
             expects: &["session.execution.started", "session.execution.interrupted"],
-            fixture: "fixtures/opencode/cancel-hermetic",
             turn: Turn::PROFILE,
         },
     ],

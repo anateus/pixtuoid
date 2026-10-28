@@ -62,7 +62,6 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::ToolRun,
             surface: Surface::Headless,
             expects: &[],
-            fixture: "fixtures/copilot/tool-run-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -70,7 +69,6 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::ToolRun,
             surface: Surface::Headless,
             expects: &[],
-            fixture: "fixtures/copilot/resume-hermetic",
             turn: Turn {
                 second: Some(Second::Prompt("Say done.")),
                 ..Turn::PROFILE
@@ -81,7 +79,6 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::ToolRun,
             surface: Surface::Headless,
             expects: &[],
-            fixture: "fixtures/copilot/autopilot-hermetic",
             // `--autopilot`: "Start in autopilot mode" (`copilot --help` at
             // 1.0.98), which offers the `task_complete` tool plain `-p` does not.
             turn: Turn {
@@ -94,7 +91,6 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::Permission,
             surface: Surface::Headless,
             expects: &[],
-            fixture: "fixtures/copilot/permission-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -102,7 +98,6 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::Subagent,
             surface: Surface::Headless,
             expects: &[],
-            fixture: "delegation/fixtures/copilot",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -110,7 +105,6 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::ChildError,
             surface: Surface::Headless,
             expects: &[],
-            fixture: "copilot/fixtures/child-error-hermetic",
             turn: Turn::PROFILE,
         },
     ],
