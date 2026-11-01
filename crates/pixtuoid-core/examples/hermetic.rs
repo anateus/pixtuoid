@@ -3595,6 +3595,8 @@ mod run {
             }
         }
 
+        // GNU tar reads an archive path's `C:` as a remote host.
+        #[cfg(unix)]
         #[test]
         fn release_payload_installs_raw_binaries_and_only_the_named_archive_member() {
             let dir = tempfile::tempdir().expect("sandbox");
