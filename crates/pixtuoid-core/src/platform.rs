@@ -109,7 +109,8 @@ pub(crate) fn warn_if_relative_override(var: &str, dir: PathBuf) -> PathBuf {
 ///   $USERPROFILE ?? os.homedir()`.
 ///
 /// Every OTHER CLI uses its language stdlib (all `USERPROFILE`-first/only on
-/// Windows), so they correctly use the generic `user_home`, NOT this.
+/// Windows), so they correctly use the generic `user_home`, NOT this; one on the
+/// `dirs` crate uses `profile_dir`.
 pub fn home_first_dir() -> Option<PathBuf> {
     resolve_home_first(cfg!(windows), path_env("HOME"), path_env("USERPROFILE"))
 }

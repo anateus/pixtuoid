@@ -216,9 +216,6 @@ mod tests {
             );
             assert!(detect_installed());
         });
-        temp_env::with_var("JCODE_HOME", Some(""), || {
-            assert_ne!(default_config_path().unwrap(), PathBuf::from("config.toml"));
-        });
         #[cfg(unix)]
         for unset in [None, Some("".as_ref())] {
             temp_env::with_vars(

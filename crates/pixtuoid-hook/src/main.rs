@@ -197,7 +197,7 @@ fn flag_from_argv(args: &[String], flag: &str) -> Option<String> {
 }
 
 /// CodeWhale's env-mode trigger. Absent → the shim reads its payload from stdin
-/// (the CC/Codex/Reasonix path).
+/// (the CC/Codex/Reasonix path), unless the source is Jcode's.
 fn event_from_argv(args: &[String]) -> Option<String> {
     flag_from_argv(args, "--event")
 }
