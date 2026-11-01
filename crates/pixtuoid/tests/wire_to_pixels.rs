@@ -259,9 +259,9 @@ fn agent_cases() -> Vec<WireCase> {
         WireCase {
             name: "jcode",
             source: "jcode",
-            fixture: "fixtures/jcode/tool-run-hermetic/hook-payloads.jsonl",
+            fixture: "jcode/fixtures/tool-run-hermetic/hook-payloads.jsonl",
             wire: Wire::Hooks,
-            must_reach: &[Reach::Active],
+            must_reach: &[Reach::Running],
         },
         WireCase {
             name: "opencode",

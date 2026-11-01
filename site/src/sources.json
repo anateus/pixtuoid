@@ -191,7 +191,7 @@
     "transport": "hooks only (~/.jcode/config.toml [hooks], session-id-keyed)",
     "platforms": {
       "macos": "yes",
-      "linux": "experimental",
+      "linux": "yes",
       "windows": "experimental"
     }
   },

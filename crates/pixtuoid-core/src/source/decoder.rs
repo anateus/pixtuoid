@@ -1538,8 +1538,8 @@ mod tests {
             (
                 jcode::SOURCE_NAME,
                 Box::new(|| {
-                    jcode::decode_jcode_hook_payload(&json!({
-                        "event":"pre_tool","session_id":"session_fox_123_a","tool_name":name}))
+                    jcode::decode_jcode_hook_payload(test_obj(&json!({
+                        "event":"pre_tool","session_id":"session_fox_123_a","tool_name":name})))
                     .expect("jcode decodes")
                 }),
             ),
@@ -1793,11 +1793,11 @@ mod tests {
             ),
             (
                 jcode::SOURCE_NAME,
-                ReasonKind::NoWaiting,
+                ReasonKind::NoReason,
                 Box::new(|| {
-                    jcode::decode_jcode_hook_payload(&json!({
+                    jcode::decode_jcode_hook_payload(test_obj(&json!({
                         "event":"pre_tool","session_id":"session_fox_123_a",
-                        "tool_name":"bash","message":raw}))
+                        "tool_name":"bash","message":raw})))
                     .expect("jcode decodes")
                 }),
             ),

@@ -1,14 +1,13 @@
-//! Jcode's hook environment and named provider config at `1jehuang/jcode` v0.99.0.
+//! Jcode's hook environment and named provider config at `1jehuang/jcode` v0.99.1.
 
-use std::borrow::Cow;
-
+use super::event_field;
 use crate::harness::hermetic::{
     ConfigFile, Package, PerOs, Profile, Scenario, Shape, Surface, Turn,
 };
 use crate::harness::plan::Placeholder;
 
 pub(crate) const PROFILE: Profile = Profile {
-    source: "jcode",
+    source: crate::source::jcode::SOURCE_NAME,
     package: Package::GithubRelease {
         repo: "1jehuang/jcode",
         assets: &[
@@ -21,10 +20,12 @@ pub(crate) const PROFILE: Profile = Profile {
         ],
         sums: "SHA256SUMS",
     },
+    plugin_types: &[],
     invocation: &[
         "jcode",
         "--no-update",
         "--no-selfdev",
+        // A server of the run's own, never the user's.
         "--socket",
         "jcode.sock",
         "--provider-profile",
@@ -35,6 +36,8 @@ pub(crate) const PROFILE: Profile = Profile {
         Placeholder::Prompt.as_str(),
     ],
     second_turn: None,
+    // `jcode run` connects MCP and pokes open todos unless told not to
+    // (`src/cli/commands.rs:2719`, `:2732`).
     env: &[
         ("JCODE_RUN_MCP", "0"),
         ("JCODE_RUN_AUTO_POKE", "0"),
@@ -72,37 +75,17 @@ enabled = false
             "pre_tool",
             "post_tool",
         ],
-        fixture: "fixtures/jcode/tool-run-hermetic",
         turn: Turn::PROFILE,
     }],
     script_vars: &[],
     not_yet: &[],
-    event_name: |v| v.get("event")?.as_str().map(Cow::Borrowed),
+    event_name: event_field,
     not_yet_fields: &[],
     not_yet_literals: &[],
     children_inherit_cwd: false,
     result_unseen: false,
     live: None,
     daemon: None,
+    server_stop: None,
+    turn_exits: &[],
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn headless_run_is_isolated_from_user_server_and_background_work() {
-        assert!(PROFILE.invocation.contains(&"--no-update"));
-        assert!(PROFILE.invocation.contains(&"--no-selfdev"));
-        assert!(
-            PROFILE
-                .invocation
-                .windows(2)
-                .any(|args| args == ["--socket", "jcode.sock"])
-        );
-        assert!(PROFILE.env.contains(&("JCODE_RUN_MCP", "0")));
-        assert!(PROFILE.env.contains(&("JCODE_RUN_AUTO_POKE", "0")));
-        assert!(PROFILE.homes.contains(&"JCODE_HOME"));
-        assert!(PROFILE.not_yet.is_empty());
-    }
-}

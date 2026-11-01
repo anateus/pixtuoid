@@ -261,13 +261,9 @@ async fn jcode_env_mode_ignores_stdin_and_forwards_only_identity_metadata() {
     let mut bytes = Vec::new();
     server.read_to_end(&mut bytes).await.unwrap();
     let mut payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(
-        payload
-            .as_object_mut()
-            .unwrap()
-            .remove("_shim_ts_ms")
-            .is_some()
-    );
+    let stamped = payload.as_object_mut().unwrap();
+    assert!(stamped.remove("_shim_ts_ms").is_some());
+    stamped.remove("_pid");
     assert_eq!(
         payload,
         serde_json::json!({

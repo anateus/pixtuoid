@@ -34,37 +34,12 @@ fn jcode_home() -> Option<PathBuf> {
         .or_else(|| native_home().map(|home| home.join(".jcode")))
 }
 
-#[cfg(not(windows))]
+/// `dirs::home_dir`, Jcode's resolver, which no `USERPROFILE` moves on Windows.
 fn native_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    return pixtuoid_core::platform::profile_dir();
+    #[cfg(not(windows))]
     std::env::home_dir().filter(|home| !home.as_os_str().is_empty())
-}
-
-#[cfg(windows)]
-fn native_home() -> Option<PathBuf> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath};
-
-    let mut raw = std::ptr::null_mut();
-    // SAFETY: the API returns a terminated wide allocation, owned until CoTaskMemFree.
-    // https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetknownfolderpath
-    unsafe {
-        let status = SHGetKnownFolderPath(&FOLDERID_Profile, 0, std::ptr::null_mut(), &mut raw);
-        let home = if status >= 0 && !raw.is_null() {
-            let mut len = 0;
-            while *raw.add(len) != 0 {
-                len += 1;
-            }
-            Some(PathBuf::from(OsString::from_wide(
-                std::slice::from_raw_parts(raw, len),
-            )))
-        } else {
-            None
-        };
-        CoTaskMemFree(raw.cast());
-        home
-    }
 }
 
 pub(crate) fn detect_installed() -> bool {

@@ -121,8 +121,6 @@ Then:
 
 **→ [Every tool × OS on the site](https://pixtuoid.dev/#tools)**
 
-_Linux support is experimental for some tools — limited testing, unsigned binaries._
-
 _Windows support is experimental — limited testing, unsigned binaries._
 <!-- tools:end -->
 

@@ -310,13 +310,9 @@ fn jcode_env_mode_ignores_stdin_and_forwards_only_identity_metadata() {
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
     let mut payload = recv_delivered_json(&listener);
-    assert!(
-        payload
-            .as_object_mut()
-            .unwrap()
-            .remove("_shim_ts_ms")
-            .is_some()
-    );
+    let stamped = payload.as_object_mut().unwrap();
+    assert!(stamped.remove("_shim_ts_ms").is_some());
+    stamped.remove("_pid");
     assert_eq!(
         payload,
         serde_json::json!({

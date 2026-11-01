@@ -3,75 +3,70 @@ source: crates/pixtuoid-core/tests/sources/conformance.rs
 expression: events
 ---
 - SessionStart:
-    agent_id: 7191791799597382602
+    agent_id: 17185590619536396164
     source: jcode
-    session_id: session_macaque_1792631959254_39469b413fdd3297
+    session_id: session_cactus_1793519989598_2715055e34e24620
     cwd: /private/tmp/pixtuoid-capture/proj
     parent_id: ~
 - Rename:
-    agent_id: 7191791799597382602
-    label: jc·macaque
+    agent_id: 17185590619536396164
+    label: jc·cactus
 - ModelInfo:
-    agent_id: 7191791799597382602
+    agent_id: 17185590619536396164
     model: hermetic
     effort: ~
 - SessionStart:
-    agent_id: 7191791799597382602
+    agent_id: 17185590619536396164
     source: jcode
-    session_id: session_macaque_1792631959254_39469b413fdd3297
+    session_id: session_cactus_1793519989598_2715055e34e24620
     cwd: /private/tmp/pixtuoid-capture/proj
     parent_id: ~
 - Rename:
-    agent_id: 7191791799597382602
-    label: jc·macaque
+    agent_id: 17185590619536396164
+    label: jc·cactus
 - ModelInfo:
-    agent_id: 7191791799597382602
+    agent_id: 17185590619536396164
     model: hermetic
     effort: ~
-- ActivityStart:
-    agent_id: 7191791799597382602
-    tool_use_id: ~
-    detail: ~
 - Identity:
-    agent_id: 7191791799597382602
+    agent_id: 17185590619536396164
     source: jcode
-    session_id: session_macaque_1792631959254_39469b413fdd3297
+    session_id: session_cactus_1793519989598_2715055e34e24620
     cwd: /private/tmp/pixtuoid-capture/proj
 - Rename:
-    agent_id: 7191791799597382602
-    label: jc·macaque
-- ActivityStart:
-    agent_id: 7191791799597382602
+    agent_id: 17185590619536396164
+    label: jc·cactus
+- ToolUseStart:
+    agent_id: 17185590619536396164
     tool_use_id: ~
     detail:
       Generic:
         display: read
 - Identity:
-    agent_id: 7191791799597382602
+    agent_id: 17185590619536396164
     source: jcode
-    session_id: session_macaque_1792631959254_39469b413fdd3297
+    session_id: session_cactus_1793519989598_2715055e34e24620
     cwd: /private/tmp/pixtuoid-capture/proj
 - Rename:
-    agent_id: 7191791799597382602
-    label: jc·macaque
-- ActivityEnd:
-    agent_id: 7191791799597382602
+    agent_id: 17185590619536396164
+    label: jc·cactus
+- ToolUseEnd:
+    agent_id: 17185590619536396164
     tool_use_id: ~
 - Identity:
-    agent_id: 7191791799597382602
+    agent_id: 17185590619536396164
     source: jcode
-    session_id: session_macaque_1792631959254_39469b413fdd3297
+    session_id: session_cactus_1793519989598_2715055e34e24620
     cwd: /private/tmp/pixtuoid-capture/proj
 - Rename:
-    agent_id: 7191791799597382602
-    label: jc·macaque
+    agent_id: 17185590619536396164
+    label: jc·cactus
 - ModelInfo:
-    agent_id: 7191791799597382602
+    agent_id: 17185590619536396164
     model: hermetic
     effort: ~
-- ActivityEnd:
-    agent_id: 7191791799597382602
-    tool_use_id: ~
+- TurnEnd:
+    agent_id: 17185590619536396164
 - SessionEnd:
-    agent_id: 7191791799597382602
+    agent_id: 17185590619536396164
     as_child: false

@@ -114,6 +114,13 @@ pub fn home_first_dir() -> Option<PathBuf> {
     resolve_home_first(cfg!(windows), path_env("HOME"), path_env("USERPROFILE"))
 }
 
+/// `FOLDERID_Profile`: `~` for a CLI on the `dirs` crate, which reads no variable
+/// on Windows.
+#[cfg(windows)]
+pub fn profile_dir() -> Option<PathBuf> {
+    crate::win32::known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Profile).ok()
+}
+
 /// Pure precedence core (`HOME`-first, then `USERPROFILE` on Windows), separated
 /// so the Windows arm is unit-testable on any host. Unix with no `HOME` →
 /// `None`: we deliberately don't reach for `dirs::home_dir`'s getpwuid fallback.
