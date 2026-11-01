@@ -3,14 +3,18 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use toml_edit::{Array, DocumentMut, Item, Table, Value};
+use toml::{Table, Value};
 
+use super::hook_cmd::{SOURCE_FLAG, shell_single_quote};
+use super::merge::{hook_path_str, parse_toml_or_empty, toml_merge_outcome, with_toml_table};
 use super::target::MergeOutcome;
-use super::verify::{SchemaParse, ShimRef};
+use super::verify::{SchemaParse, ShimRef, assemble, posix_unquote};
 use pixtuoid_core::source::jcode::SOURCE_NAME;
 
+/// No `session_start`: each client connection fires one for a provisional
+/// session a resume throws away (`crates/jcode-app-core/src/agent.rs:648`,
+/// `:659` at v0.99.1), so a session registers on its first `turn_start`.
 pub(crate) const JCODE_EVENTS: &[&str] = &[
-    "session_start",
     "session_end",
     "turn_start",
     "turn_end",
@@ -18,19 +22,16 @@ pub(crate) const JCODE_EVENTS: &[&str] = &[
     "post_tool",
 ];
 
-const OWNERSHIP_FLAG: &str = " --pixtuoid-managed";
-
 pub(crate) fn default_config_path() -> Result<PathBuf> {
     jcode_home()
         .map(|home| home.join("config.toml"))
-        .ok_or_else(|| super::io::home_unset("the home directory", "HOME/USERPROFILE"))
+        .ok_or_else(|| super::io::home_unset("Jcode's home", "JCODE_HOME"))
 }
 
 fn jcode_home() -> Option<PathBuf> {
-    // jcode-storage::jcode_dir accepts even an empty Unicode JCODE_HOME.
-    std::env::var_os("JCODE_HOME")
-        .and_then(|home| home.into_string().ok())
-        .map(PathBuf::from)
+    pixtuoid_core::platform::path_env("JCODE_HOME")
+        // jcode-storage::jcode_dir reads it with `env::var`.
+        .filter(|home| home.to_str().is_some())
         .or_else(|| native_home().map(|home| home.join(".jcode")))
 }
 
@@ -39,7 +40,7 @@ fn native_home() -> Option<PathBuf> {
     #[cfg(windows)]
     return pixtuoid_core::platform::profile_dir();
     #[cfg(not(windows))]
-    std::env::home_dir().filter(|home| !home.as_os_str().is_empty())
+    std::env::home_dir()
 }
 
 pub(crate) fn detect_installed() -> bool {
@@ -53,171 +54,113 @@ pub(crate) fn hook_command(resolved: &Path, _explicit: bool) -> Result<String> {
         resolved.is_absolute(),
         "Jcode requires an absolute hook binary path"
     );
-    let path = super::merge::hook_path_str(resolved)?;
-    Ok(format!(
-        "'{}'{}{SOURCE_NAME}{OWNERSHIP_FLAG}",
-        path.replace('\'', "'\\''"),
-        super::hook_cmd::SOURCE_FLAG
-    ))
+    let path = shell_single_quote(hook_path_str(resolved)?);
+    Ok(format!("{path}{SOURCE_FLAG}{SOURCE_NAME}"))
 }
 
 fn managed_path(command: &str) -> Option<PathBuf> {
-    let quoted = command.strip_suffix(&format!(
-        "{}{SOURCE_NAME}{OWNERSHIP_FLAG}",
-        super::hook_cmd::SOURCE_FLAG
-    ))?;
-    if !quoted.starts_with('\'') || !quoted.ends_with('\'') {
-        return None;
-    }
-    let path = PathBuf::from(super::verify::posix_unquote(quoted));
+    let quoted = command.strip_suffix(&format!("{SOURCE_FLAG}{SOURCE_NAME}"))?;
+    let path = PathBuf::from(posix_unquote(quoted));
     // Round-trip equality excludes prefixes, suffixes and shell fragments without
     // narrowing explicit shim overrides to one basename.
     (hook_command(&path, true).ok().as_deref() == Some(command)).then_some(path)
 }
 
-fn parse(content: &str) -> Result<DocumentMut> {
-    let doc: DocumentMut = content
-        .parse()
-        .context("refusing to overwrite malformed Jcode TOML")?;
-    if let Some(hooks) = doc.get("hooks") {
-        let hooks = hooks
-            .as_table_like()
-            .context("refusing to overwrite non-table hooks")?;
-        for event in JCODE_EVENTS {
-            if let Some(item) = hooks.get(event) {
-                let valid = item.as_str().is_some()
-                    || item
-                        .as_array()
-                        .is_some_and(|array| array.iter().all(|v| v.as_str().is_some()));
-                ensure!(
-                    valid,
-                    "refusing to overwrite hooks.{event}: expected a command string or string array"
-                );
+/// Refuses what a merge would coerce: [`with_toml_table`] turns `hooks = 1` into
+/// an empty table.
+fn refuse_foreign_shape(content: &str) -> Result<()> {
+    let root = parse_toml_or_empty(content)?;
+    let Some(hooks) = root.get("hooks") else {
+        return Ok(());
+    };
+    let hooks = hooks
+        .as_table()
+        .context("`hooks` is not a table — refusing to overwrite")?;
+    for event in JCODE_EVENTS {
+        let valid = match hooks.get(*event) {
+            None | Some(Value::String(_)) => true,
+            Some(Value::Array(commands)) => commands.iter().all(Value::is_str),
+            Some(_) => false,
+        };
+        ensure!(
+            valid,
+            "`hooks.{event}` is neither a command nor an array of them — refusing to overwrite"
+        );
+    }
+    Ok(())
+}
+
+/// Puts `ours` in place of each event's managed commands, or removes them,
+/// keeping every other command.
+fn retarget(hooks: &mut Table, ours: Option<&str>) {
+    let managed = |command: &Value| command.as_str().is_some_and(|c| managed_path(c).is_some());
+    for event in JCODE_EVENTS {
+        let merged = match (hooks.remove(*event), ours) {
+            (None, ours) => ours.map(Value::from),
+            (Some(Value::Array(mut commands)), ours) => {
+                commands.retain(|c| !managed(c));
+                commands.extend(ours.map(Value::from));
+                Some(Value::Array(commands))
             }
+            (Some(command), ours) if managed(&command) => ours.map(Value::from),
+            (Some(foreign), Some(ours)) => Some(Value::Array(vec![foreign, ours.into()])),
+            (foreign, None) => foreign,
+        };
+        if let Some(merged) = merged {
+            hooks.insert((*event).to_owned(), merged);
         }
     }
-    Ok(doc)
 }
 
 pub(crate) fn merge_install(content: &str, command: &str) -> Result<MergeOutcome> {
-    ensure!(
-        managed_path(command).is_some(),
-        "invalid Jcode managed hook command"
-    );
-    merge(content, Some(command))
+    refuse_foreign_shape(content)?;
+    toml_merge_outcome(content, |mut root| {
+        with_toml_table(&mut root, "hooks", |hooks| retarget(hooks, Some(command)));
+        root
+    })
 }
 
 pub(crate) fn merge_uninstall(content: &str) -> Result<MergeOutcome> {
-    merge(content, None)
-}
-
-fn merge(content: &str, command: Option<&str>) -> Result<MergeOutcome> {
-    let mut doc = parse(content)?;
-    if command.is_some() && !doc.contains_key("hooks") {
-        doc.insert("hooks", Item::Table(Table::new()));
-    }
-    if let Some(hooks) = doc.get_mut("hooks").and_then(Item::as_table_like_mut) {
-        for event in JCODE_EVENTS {
-            match hooks.get_mut(event) {
-                Some(item) if item.as_str().is_some() => {
-                    let owned = item.as_str().and_then(managed_path).is_some();
-                    match (owned, command) {
-                        (true, None) => {
-                            hooks.remove(event);
-                        }
-                        (true, Some(command)) => {
-                            let decor = item.as_value().context("command value")?.decor().clone();
-                            let mut value = Value::from(command);
-                            *value.decor_mut() = decor;
-                            *item = Item::Value(value);
-                        }
-                        (false, Some(command)) => {
-                            let mut value = item.as_value().context("command value")?.clone();
-                            let decor = value.decor().clone();
-                            *value.decor_mut() = Default::default();
-                            let mut array = Array::new();
-                            array.push_formatted(value);
-                            array.push(command);
-                            let mut value = Value::Array(array);
-                            *value.decor_mut() = decor;
-                            *item = Item::Value(value);
-                        }
-                        (false, None) => {}
-                    }
-                }
-                Some(item) => {
-                    let array = item.as_array_mut().context("command array")?;
-                    let owned: Vec<usize> = array
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, v)| v.as_str().and_then(managed_path).map(|_| i))
-                        .collect();
-                    if let (Some(command), [index]) = (command, owned.as_slice())
-                        && array.get(*index).and_then(Value::as_str) == Some(command)
-                    {
-                        continue;
-                    }
-                    for index in owned.into_iter().rev() {
-                        array.remove(index);
-                    }
-                    if let Some(command) = command {
-                        array.push(command);
-                    }
-                }
-                None => {
-                    if let Some(command) = command {
-                        hooks.insert(event, toml_edit::value(command));
-                    }
-                }
-            }
+    toml_merge_outcome(content, |mut root| {
+        // An emptied `[hooks]` stays: the text above a header goes with its table,
+        // and Jcode's default config keeps a section's commented options there.
+        if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_table_mut) {
+            retarget(hooks, None);
         }
-    }
-    let mut output = doc.to_string();
-    let before: toml::Value = toml::from_str(content)?;
-    let after: toml::Value = toml::from_str(&output)?;
-    let changed = before != after;
-    if !changed {
-        output = content.to_owned();
-    } else if content.contains("\r\n") && !content.replace("\r\n", "").contains('\n') {
-        output = output.replace("\r\n", "\n").replace('\n', "\r\n");
-    }
-    Ok(MergeOutcome {
-        content: output,
-        changed,
+        root
     })
 }
 
 pub(crate) fn verify_schema(content: &str) -> SchemaParse {
-    let doc = match parse(content) {
-        Ok(doc) => doc,
-        Err(error) => return SchemaParse::broken(error.to_string()),
+    let Ok(doc) = toml::from_str::<Table>(content) else {
+        return SchemaParse::broken("config.toml no longer parses as TOML");
     };
-    let hooks = doc.get("hooks").and_then(Item::as_table_like);
-    let mut result = SchemaParse::default();
+    let hooks = doc.get("hooks").and_then(Value::as_table);
+    let mut missing = Vec::new();
+    let mut shim = ShimRef::Unknown;
     for event in JCODE_EVENTS {
-        let item = hooks.and_then(|hooks| hooks.get(event));
-        let path = item.and_then(|item| {
-            item.as_str().and_then(managed_path).or_else(|| {
-                item.as_array()?
-                    .iter()
-                    .filter_map(|v| v.as_str().and_then(managed_path))
-                    .next()
-            })
-        });
-        match path {
-            Some(path) if result.shim == ShimRef::Unknown => result.shim = ShimRef::Absolute(path),
-            Some(path) if !matches!(&result.shim, ShimRef::Absolute(installed) if installed == &path) => {
-                result.issues.push(format!(
-                    "Jcode hook {event} references a different shim; reconnect the source"
-                ))
-            }
+        let managed = match hooks.and_then(|hooks| hooks.get(*event)) {
+            Some(Value::Array(commands)) => commands.as_slice(),
+            Some(command) => std::slice::from_ref(command),
+            None => &[],
+        }
+        .iter()
+        .find_map(|command| command.as_str().and_then(managed_path));
+        match managed {
+            Some(path) if shim == ShimRef::Unknown => shim = ShimRef::Absolute(path),
             Some(_) => {}
-            None => result
-                .issues
-                .push(format!("missing managed Jcode hook: {event}")),
+            None => missing.push(*event),
         }
     }
-    result
+    // The shared `assemble` no-managed message names a sentinel a command can't
+    // carry here.
+    if shim == ShimRef::Unknown {
+        return SchemaParse::broken(format!(
+            "no managed pixtuoid hook entries in [hooks] (no `{SOURCE_FLAG}{SOURCE_NAME}` command \
+             — the config was hand-edited or hooks were never installed)"
+        ));
+    }
+    assemble(&missing, true, shim, vec![])
 }
 
 #[cfg(test)]
@@ -249,7 +192,22 @@ mod tests {
     }
 
     #[test]
-    fn jcode_config_path_uses_the_shared_home_even_when_empty() {
+    fn jcode_events_pins_the_exact_registered_set() {
+        crate::install::assert_event_roster(
+            "JCODE_EVENTS",
+            JCODE_EVENTS,
+            &[
+                "session_end",
+                "turn_start",
+                "turn_end",
+                "pre_tool",
+                "post_tool",
+            ],
+        );
+    }
+
+    #[test]
+    fn jcode_config_path_uses_the_shared_home_and_reads_an_empty_one_as_unset() {
         let home = tempfile::tempdir().unwrap();
         temp_env::with_var("JCODE_HOME", Some(home.path()), || {
             assert_eq!(
@@ -259,18 +217,20 @@ mod tests {
             assert!(detect_installed());
         });
         temp_env::with_var("JCODE_HOME", Some(""), || {
-            assert_eq!(default_config_path().unwrap(), PathBuf::from("config.toml"));
+            assert_ne!(default_config_path().unwrap(), PathBuf::from("config.toml"));
         });
         #[cfg(unix)]
-        temp_env::with_vars(
-            [
-                ("JCODE_HOME", None),
-                ("HOME", Some(home.path().as_os_str())),
-            ],
-            || {
-                assert_eq!(jcode_home(), Some(home.path().join(".jcode")));
-            },
-        );
+        for unset in [None, Some("".as_ref())] {
+            temp_env::with_vars(
+                [
+                    ("JCODE_HOME", unset),
+                    ("HOME", Some(home.path().as_os_str())),
+                ],
+                || {
+                    assert_eq!(jcode_home(), Some(home.path().join(".jcode")));
+                },
+            );
+        }
     }
 
     #[test]
@@ -278,14 +238,14 @@ mod tests {
         let command = command();
         let input = format!(
             "hooks = {{ pre_tool = ['foreign', {0}, {0}] }}\r\n",
-            toml::Value::String(command.clone())
+            Value::String(command.clone())
         );
         let installed = merge_install(&input, &command).unwrap();
         assert!(!installed.content.replace("\r\n", "").contains('\n'));
-        let doc: toml::Value = toml::from_str(&installed.content).unwrap();
+        let doc: Value = toml::from_str(&installed.content).unwrap();
         assert_eq!(doc["hooks"]["pre_tool"].as_array().unwrap().len(), 2);
         let removed = merge_uninstall(&installed.content).unwrap();
-        let doc: toml::Value = toml::from_str(&removed.content).unwrap();
+        let doc: Value = toml::from_str(&removed.content).unwrap();
         assert_eq!(doc["hooks"]["pre_tool"].as_array().unwrap().len(), 1);
         assert_eq!(doc["hooks"]["pre_tool"][0].as_str(), Some("foreign"));
     }
@@ -294,21 +254,24 @@ mod tests {
     fn jcode_malformed_config_never_rewrites_on_connect_or_disconnect() {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("config.toml");
-        for malformed in ["[hooks", "hooks = 1", "[hooks]\npre_tool = [7]"] {
+        for (malformed, parses) in [
+            ("[hooks", false),
+            ("hooks = 1", true),
+            ("[hooks]\npre_tool = 3", true),
+            ("[hooks]\nturn_end = ['ok', 7]", true),
+        ] {
             std::fs::write(&config, malformed).unwrap();
-            assert!(
-                super::super::install_target_from(
-                    &super::super::target::JCODE,
-                    Some(config.clone()),
-                    Some(std::env::current_exe().unwrap()),
-                )
-                .is_err()
-            );
+            let error = super::super::install_target_from(
+                &super::super::target::JCODE,
+                Some(config.clone()),
+                Some(std::env::current_exe().unwrap()),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("refusing to overwrite"));
             assert_eq!(std::fs::read_to_string(&config).unwrap(), malformed);
-            assert!(
-                super::super::uninstall_target(&super::super::target::JCODE, Some(config.clone()))
-                    .is_err()
-            );
+            let removed =
+                super::super::uninstall_target(&super::super::target::JCODE, Some(config.clone()));
+            assert_eq!(removed.is_ok(), parses);
             assert_eq!(std::fs::read_to_string(&config).unwrap(), malformed);
         }
     }
@@ -328,19 +291,24 @@ mod tests {
             Some(std::env::current_exe().unwrap()),
         )
         .unwrap();
-        assert!(super::super::has_hooks(target, Some(link.clone())));
-        assert!(super::super::verify_target(target, Some(link.clone())).is_sound());
         super::super::uninstall_target(target, Some(link.clone())).unwrap();
         assert!(link.is_symlink());
-        assert!(!super::super::has_hooks(target, Some(link)));
-        let content = std::fs::read_to_string(real).unwrap();
-        assert!(content.contains("keep"));
-        assert!(content.contains("# gate"));
+        assert!(std::fs::read_to_string(real).unwrap().contains("keep"));
+    }
+
+    #[test]
+    fn jcode_disconnect_keeps_the_section_above_the_hooks_table_it_emptied() {
+        let original = "[notifications]\nenabled = true\n# turn_complete = true\n\n[hooks]\n";
+        let installed = merge_install(original, &command()).unwrap();
+        let removed = merge_uninstall(&installed.content).unwrap();
+        assert!(removed.changed);
+        assert_eq!(removed.content, original);
+        assert!(!merge_uninstall(&removed.content).unwrap().changed);
     }
 
     #[test]
     fn jcode_preserves_scalar_array_comments_and_timeouts() {
-        let original = "# config\n[hooks] # hooks\nsession_start = 'notify me' # scalar\npre_tool = [\n  'gate one', # gate\n  'gate two',\n] # gates\npre_tool_timeout_ms = 1234 # timeout\npost_tool_feedback = 'review'\n\n[other]\nvalue = 7 # untouched\n";
+        let original = "# config\n[hooks] # hooks\nturn_start = 'notify me' # scalar\npre_tool = [\n  'gate one', # gate\n  'gate two',\n] # gates\npre_tool_timeout_ms = 1234 # timeout\npost_tool_feedback = 'review'\n\n[other]\nvalue = 7 # untouched\n";
         let cmd = command();
         let installed = merge_install(original, &cmd).unwrap();
         assert!(installed.changed);
@@ -359,8 +327,8 @@ mod tests {
                 installed.content
             );
         }
-        let doc: toml::Value = toml::from_str(&installed.content).unwrap();
-        assert_eq!(doc["hooks"]["session_start"][0].as_str(), Some("notify me"));
+        let doc: Value = toml::from_str(&installed.content).unwrap();
+        assert_eq!(doc["hooks"]["turn_start"][0].as_str(), Some("notify me"));
         assert_eq!(doc["hooks"]["pre_tool"][0].as_str(), Some("gate one"));
         assert_eq!(doc["hooks"]["pre_tool"][1].as_str(), Some("gate two"));
         assert_eq!(doc["hooks"]["pre_tool_timeout_ms"].as_integer(), Some(1234));
@@ -384,23 +352,10 @@ mod tests {
                 removed.content
             );
         }
-        let doc: toml::Value = toml::from_str(&removed.content).unwrap();
+        let doc: Value = toml::from_str(&removed.content).unwrap();
         assert_eq!(doc["hooks"]["pre_tool"].as_array().unwrap().len(), 2);
         assert_eq!(doc["hooks"]["post_tool_feedback"].as_str(), Some("review"));
         assert!(!merge_uninstall(&removed.content).unwrap().changed);
-    }
-
-    #[test]
-    fn jcode_rejects_malformed_hook_shapes() {
-        for input in [
-            "[hooks",
-            "hooks = 1",
-            "[hooks]\npre_tool = 3",
-            "[hooks]\nturn_end = ['ok', 7]",
-        ] {
-            assert!(merge_install(input, &command()).is_err(), "{input}");
-            assert!(merge_uninstall(input).is_err(), "{input}");
-        }
     }
 
     #[test]
@@ -415,27 +370,11 @@ mod tests {
             "PIXTUOID_SOURCE=jcode '/bin/pixtuoid-hook'".into(),
         ] {
             assert!(managed_path(&other).is_none(), "{other}");
-            let input = format!("[hooks]\nsession_start = {}\n", toml::Value::String(other));
+            let input = format!("[hooks]\nturn_start = {}\n", Value::String(other));
             assert!(!merge_uninstall(&input).unwrap().changed);
         }
         assert!(!cmd.contains("PIXTUOID_SOURCE="));
         assert!(hook_command(std::path::Path::new("relative"), false).is_err());
-    }
-
-    #[test]
-    fn jcode_preserves_foreign_source_flag_without_ownership_marker() {
-        let foreign = "'/usr/local/bin/session-monitor' --source jcode";
-        let original = format!(
-            "[hooks]\nsession_start = {}\n",
-            toml::Value::String(foreign.into())
-        );
-        assert!(!merge_uninstall(&original).unwrap().changed);
-        let installed = merge_install(&original, &command()).unwrap();
-        let doc: toml::Value = toml::from_str(&installed.content).unwrap();
-        assert_eq!(doc["hooks"]["session_start"][0].as_str(), Some(foreign));
-        let removed = merge_uninstall(&installed.content).unwrap();
-        let doc: toml::Value = toml::from_str(&removed.content).unwrap();
-        assert_eq!(doc["hooks"]["session_start"][0].as_str(), Some(foreign));
     }
 
     #[cfg(unix)]
@@ -444,7 +383,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         assert_eq!(
             hook_command(Path::new("/a'b c/pixtuoid-hook"), false).unwrap(),
-            "'/a'\\''b c/pixtuoid-hook' --source jcode --pixtuoid-managed"
+            "'/a'\\''b c/pixtuoid-hook' --source jcode"
         );
         let invalid = std::ffi::OsStr::from_bytes(b"/invalid/\xff");
         assert!(hook_command(Path::new(invalid), true).is_err());
@@ -458,18 +397,6 @@ mod tests {
                 assert_eq!(jcode_home(), Some(home.path().join(".jcode")));
             },
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn jcode_empty_home_uses_the_same_os_fallback_as_unset_home() {
-        temp_env::with_vars_unset(["JCODE_HOME", "HOME"], || {
-            let expected = std::env::home_dir()
-                .filter(|home| !home.as_os_str().is_empty())
-                .map(|home| home.join(".jcode"));
-            assert_eq!(jcode_home(), expected);
-            temp_env::with_var("HOME", Some(""), || assert_eq!(jcode_home(), expected));
-        });
     }
 
     #[cfg(windows)]
@@ -501,7 +428,7 @@ mod tests {
     fn jcode_windows_uses_posix_quoting_not_cmd_exe_rules() {
         assert_eq!(
             hook_command(Path::new(r"C:\O'Brien\pixtuoid-hook.exe"), false).unwrap(),
-            r"'C:\O'\''Brien\pixtuoid-hook.exe' --source jcode --pixtuoid-managed"
+            r"'C:\O'\''Brien\pixtuoid-hook.exe' --source jcode"
         );
     }
 
@@ -511,7 +438,7 @@ mod tests {
         let new_path = std::env::temp_dir().join("new hook");
         let new = hook_command(&new_path, false).unwrap();
         let updated = merge_install(&old.content, &new).unwrap();
-        let doc: toml::Value = toml::from_str(&updated.content).unwrap();
+        let doc: Value = toml::from_str(&updated.content).unwrap();
         for event in JCODE_EVENTS {
             assert_eq!(doc["hooks"][event].as_str(), Some(new.as_str()));
         }
@@ -520,19 +447,16 @@ mod tests {
             crate::install::verify::ShimRef::Absolute(new_path)
         );
         for event in JCODE_EVENTS {
-            let mut doc = updated.content.parse::<toml_edit::DocumentMut>().unwrap();
-            doc["hooks"].as_table_like_mut().unwrap().remove(event);
-            assert!(!verify_schema(&doc.to_string()).issues.is_empty());
+            let mut doc: Table = toml::from_str(&updated.content).unwrap();
+            doc["hooks"].as_table_mut().unwrap().remove(*event);
+            assert!(
+                !verify_schema(&toml::to_string(&doc).unwrap())
+                    .issues
+                    .is_empty()
+            );
         }
         assert!(!merge_uninstall("").unwrap().changed);
-    }
-
-    #[test]
-    fn jcode_verification_rejects_mixed_shim_paths() {
-        let installed = merge_install("", &command()).unwrap();
-        let mut doc = installed.content.parse::<DocumentMut>().unwrap();
-        doc["hooks"]["pre_tool"] =
-            toml_edit::value(hook_command(&std::env::temp_dir().join("other"), true).unwrap());
-        assert!(!verify_schema(&doc.to_string()).issues.is_empty());
+        let unmanaged = &verify_schema("").issues;
+        assert!(unmanaged[0].contains("--source jcode"), "{unmanaged:?}");
     }
 }

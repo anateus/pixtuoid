@@ -68,7 +68,6 @@ enabled = false
         shape: Shape::ToolRun,
         surface: Surface::Headless,
         expects: &[
-            "session_start",
             "session_end",
             "turn_start",
             "turn_end",

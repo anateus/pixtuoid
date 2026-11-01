@@ -61,13 +61,13 @@ fn main() {
         .collect();
 
     // Source precedence: the `--source <name>` argv flag (the Windows install
-    // form) wins over the `PIXTUOID_SOURCE` env var (the Unix env-prefix
+    // form, and Jcode's everywhere) wins over the `PIXTUOID_SOURCE` env var (the Unix env-prefix
     // form; grok delivers the same var via its handler `env` map, so this arm
     // serves both). `--event` is orthogonal and never implies a source.
     let source = source_from_argv(&args)
         .or_else(|| std::env::var_os("PIXTUOID_SOURCE").and_then(|v| v.into_string().ok()));
     let mut payload: Value = match event_from_argv(&args) {
-        _ if source.as_deref() == Some("jcode") => {
+        _ if source.as_deref() == Some(keys::JCODE_SOURCE) => {
             let Some(payload) = jcode_payload_from(|k| std::env::var_os(k)) else {
                 return;
             };
@@ -208,10 +208,10 @@ fn hook_event_from_argv(args: &[String]) -> Option<String> {
     flag_from_argv(args, "--hook-event")
 }
 
-/// The trusted CLI source, in its Windows install form: the hook command runs
-/// under `cmd.exe /C`, which has no inline `VAR=value cmd` env-prefix syntax (it
-/// would try to exec a program literally named `PIXTUOID_SOURCE=codex`), so the
-/// source rides as a flag. Absent → the caller falls back to `PIXTUOID_SOURCE`.
+/// The trusted CLI source, as a flag where no env prefix can carry it: `cmd.exe
+/// /C` has no inline `VAR=value cmd` syntax (it would try to exec a program
+/// literally named `PIXTUOID_SOURCE=codex`), and Jcode execs its hooks directly.
+/// Absent → the caller falls back to `PIXTUOID_SOURCE`.
 fn source_from_argv(args: &[String]) -> Option<String> {
     flag_from_argv(args, "--source")
 }

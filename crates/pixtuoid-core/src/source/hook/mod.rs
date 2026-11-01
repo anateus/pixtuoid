@@ -382,7 +382,14 @@ mod tests {
 
     #[test]
     fn patch_identity_pids_stamps_only_a_focus_target() {
-        for source in ["claude-code", "codex", "copilot", "opencode", "hermes"] {
+        for source in [
+            "claude-code",
+            "codex",
+            "copilot",
+            "opencode",
+            "hermes",
+            "jcode",
+        ] {
             let mut evs = vec![AgentEvent::Identity {
                 agent_id: AgentId::from_parts(source, "ses_t"),
                 source: source.into(),
@@ -464,6 +471,7 @@ mod tests {
         };
         assert_eq!(target("kimi"), Some(false));
         assert_eq!(target("cursor"), Some(true));
+        assert_eq!(target("jcode"), None);
     }
 
     /// omp is the first decoder that really pairs `SessionStart` + `Identity`

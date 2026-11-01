@@ -1150,6 +1150,7 @@ mod run {
     const CURL: &str = "curl";
     const GIT: &str = "git";
     const TAR: &str = "tar";
+    const TARBALL_SUFFIX: &str = ".tar.gz";
     const UV: &str = "uv";
 
     /// The release a `releases/latest` response's `location` names.
@@ -1172,8 +1173,8 @@ mod run {
             .ok_or_else(|| std::io::Error::other(format!("no release asset for {here:?}")))
     }
 
-    /// Downloads `asset` of `repo`'s `v<version>` release to `to`, holds it to
-    /// the release's `sums` file, and makes it executable. A failure leaves no
+    /// Downloads `asset` of `repo`'s `v<version>` release, holds it to the
+    /// release's `sums` file, and installs its binary at `to`. A failure leaves no
     /// install marker, so [`install_once`] discards the download.
     fn fetch_release(
         repo: &str,
@@ -1197,26 +1198,25 @@ mod run {
                 "{asset} does not match v{version}'s {sums}"
             )));
         }
-        install_release_payload(asset, &payload, to)
+        install_payload(&payload, asset.strip_suffix(TARBALL_SUFFIX), to)
     }
 
-    fn install_release_payload(asset: &str, payload: &Path, to: &Path) -> std::io::Result<()> {
-        if let Some(member) = asset.strip_suffix(".tar.gz") {
-            extract_binary(payload, member, to)?;
-        } else {
-            std::fs::rename(payload, to)?;
+    /// Installs a download's binary at `to`: a tarball's `member`, else the
+    /// download itself.
+    fn install_payload(payload: &Path, member: Option<&str>, to: &Path) -> std::io::Result<()> {
+        match member {
+            Some(member) => {
+                let mut untar = tool(TAR);
+                untar
+                    .args(["-xOzf"])
+                    .arg(payload)
+                    .arg(member)
+                    .stdout(std::fs::File::create(to)?);
+                succeed(untar)?;
+            }
+            None => std::fs::rename(payload, to)?,
         }
         make_executable(to)
-    }
-
-    fn extract_binary(payload: &Path, member: &str, to: &Path) -> std::io::Result<()> {
-        let mut untar = tool(TAR);
-        untar
-            .args(["-xOzf"])
-            .arg(payload)
-            .arg(member)
-            .stdout(std::fs::File::create(to)?);
-        succeed(untar)
     }
 
     fn make_executable(path: &Path) -> std::io::Result<()> {
@@ -1357,12 +1357,11 @@ mod run {
                             build.url
                         )));
                     }
-                    if build.url.ends_with(".tar.gz") {
-                        extract_binary(&payload, member, &program)?;
-                    } else {
-                        std::fs::rename(&payload, &program)?;
-                    }
-                    make_executable(&program)
+                    install_payload(
+                        &payload,
+                        build.url.ends_with(TARBALL_SUFFIX).then_some(member),
+                        &program,
+                    )
                 })?;
                 Ok(Installed {
                     launch: Launch {
@@ -3602,7 +3601,7 @@ mod run {
             let payload = dir.path().join("payload");
             let program = dir.path().join("installed");
             std::fs::write(&payload, b"raw executable").unwrap();
-            install_release_payload("cli.exe", &payload, &program).unwrap();
+            install_payload(&payload, None, &program).unwrap();
             assert_eq!(std::fs::read(&program).unwrap(), b"raw executable");
 
             let member = "cli-macos-aarch64";
@@ -3617,11 +3616,11 @@ mod run {
             succeed(pack).unwrap();
             std::fs::remove_file(dir.path().join(member)).unwrap();
             std::fs::remove_file(dir.path().join("unrelated")).unwrap();
-            install_release_payload("cli-macos-aarch64.tar.gz", &payload, &program).unwrap();
+            install_payload(&payload, Some(member), &program).unwrap();
             assert_eq!(std::fs::read(&program).unwrap(), b"archived executable");
             assert!(!dir.path().join(member).exists());
             assert!(!dir.path().join("unrelated").exists());
-            assert!(install_release_payload("absent.tar.gz", &payload, &program).is_err());
+            assert!(install_payload(&payload, Some("absent"), &program).is_err());
         }
 
         /// Each OS leg of the tier runs every profile on its own host.

@@ -233,7 +233,7 @@ async fn jcode_env_mode_ignores_stdin_and_forwards_only_identity_metadata() {
         .unwrap();
     let shim = std::thread::spawn(move || {
         let mut child = Command::new(shim_bin())
-            .args(["--source", "jcode", "--pixtuoid-managed"])
+            .args(["--source", "jcode"])
             .env("PIXTUOID_SOCKET", &name)
             .env("PIXTUOID_SOURCE", "codex")
             .env("JCODE_HOOK_EVENT", "pre_tool")

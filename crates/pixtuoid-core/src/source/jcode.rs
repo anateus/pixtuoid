@@ -30,7 +30,7 @@ pub(crate) const DESCRIPTOR: SourceDescriptor = SourceDescriptor {
         caps: SourceCaps {
             has_exit_signal: true,
             resurrects_on_prompt: true,
-            // No tool of its own dispatches a child this decoder could mark.
+            // It mints no `Task`, so no slot ever delegates.
             delegations_are_hook_silent: false,
             child_end_inference: ChildEndInference::None,
             child_hooks_unnamed: false,
@@ -57,8 +57,8 @@ pub(crate) fn decode_jcode_hook_payload(obj: &HookObject) -> DecodeResult<Vec<Ag
     let agent_id = AgentId::from_parts(SOURCE_NAME, key);
     let cwd = non_empty(obj, "cwd").map(PathBuf::from);
     let mut events = match event {
-        // `turn_start` is the resurrect path: a swept session walks back in.
-        "session_start" | "turn_start" => vec![AgentEvent::SessionStart {
+        // Its registration, and the resurrect path: a swept session walks back in.
+        "turn_start" => vec![AgentEvent::SessionStart {
             agent_id,
             source: SOURCE_NAME.into(),
             session_id: key.into(),
@@ -124,7 +124,7 @@ fn session_label(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{ToolDetail, Transport, registry};
+    use crate::source::{ToolDetail, Transport};
     use crate::{AgentId, Reducer, SceneState};
     use serde_json::{Value, json};
     use std::time::SystemTime;
@@ -148,7 +148,7 @@ mod tests {
         let mut scene = SceneState::uniform(4);
         let mut reducer = Reducer::new();
         for (event, id, label) in [
-            ("session_start", "session_chipmunk_123_a", "jc·chipmunk"),
+            ("turn_start", "session_chipmunk_123_a", "jc·chipmunk"),
             ("pre_tool", "session_spider_123_b", "jc·spider"),
             ("turn_start", "session_t-rex_123_c", "jc·t-rex"),
             ("turn_start", "session_chipmunk_123_d", "jc·chipmunk"),
@@ -161,20 +161,15 @@ mod tests {
             assert!(slot.pid.is_none());
         }
         assert_eq!(scene.agents.len(), 4);
-        assert_eq!(
-            registry::descriptor_for(SOURCE_NAME).unwrap().label_prefix,
-            "jc"
-        );
     }
 
     #[test]
     fn starts_activity_without_inventing_tool_pairing_or_arguments() {
         let mut input = payload("pre_tool", "session_fox_123_a");
         input["tool_use_id"] = json!("post-only-id");
-        input["_pid"] = json!(42);
         input["tool_input"] = json!({"command":"private"});
         let events = decode(&input).unwrap();
-        assert!(matches!(events[0], AgentEvent::Identity { pid: None, .. }));
+        assert!(matches!(events[0], AgentEvent::Identity { .. }));
         assert!(events.iter().any(|event| matches!(event,
             AgentEvent::ToolUseStart { tool_use_id: None, detail: Some(ToolDetail::Generic {display}), .. } if display == "bash")));
         assert!(!format!("{events:?}").contains("private"));
@@ -247,7 +242,6 @@ mod tests {
     #[test]
     fn registered_events_use_the_registered_decoder_and_optional_model() {
         for event in [
-            "session_start",
             "session_end",
             "turn_start",
             "turn_end",
@@ -277,7 +271,7 @@ mod tests {
             ("imported-session", "jc·imported-session"),
             ("session_fox\u{202e}\n_123_random", "jc·fox"),
         ] {
-            let events = decode(&payload("session_start", id)).unwrap();
+            let events = decode(&payload("turn_start", id)).unwrap();
             assert!(
                 events.iter().any(
                     |event| matches!(event, AgentEvent::Rename {label, ..} if label == expected)
