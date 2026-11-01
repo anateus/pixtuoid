@@ -307,26 +307,11 @@ mod tests {
     }
 
     #[test]
-    fn jcode_preserves_scalar_array_comments_and_timeouts() {
-        let original = "# config\n[hooks] # hooks\nturn_start = 'notify me' # scalar\npre_tool = [\n  'gate one', # gate\n  'gate two',\n] # gates\npre_tool_timeout_ms = 1234 # timeout\npost_tool_feedback = 'review'\n\n[other]\nvalue = 7 # untouched\n";
+    fn jcode_keeps_foreign_commands_and_timeouts() {
+        let original = "[hooks]\nturn_start = 'notify me'\npre_tool = [\n  'gate one',\n  'gate two',\n]\npre_tool_timeout_ms = 1234\npost_tool_feedback = 'review'\n\n[other]\nvalue = 7\n";
         let cmd = command();
         let installed = merge_install(original, &cmd).unwrap();
         assert!(installed.changed);
-        for comment in [
-            "# config",
-            "# hooks",
-            "# scalar",
-            "# gate",
-            "# gates",
-            "# timeout",
-            "# untouched",
-        ] {
-            assert!(
-                installed.content.contains(comment),
-                "lost {comment}: {}",
-                installed.content
-            );
-        }
         let doc: Value = toml::from_str(&installed.content).unwrap();
         assert_eq!(doc["hooks"]["turn_start"][0].as_str(), Some("notify me"));
         assert_eq!(doc["hooks"]["pre_tool"][0].as_str(), Some("gate one"));
@@ -337,21 +322,6 @@ mod tests {
         assert!(!again.changed);
         assert_eq!(again.content, installed.content);
         let removed = merge_uninstall(&installed.content).unwrap();
-        for comment in [
-            "# config",
-            "# hooks",
-            "# scalar",
-            "# gate",
-            "# gates",
-            "# timeout",
-            "# untouched",
-        ] {
-            assert!(
-                removed.content.contains(comment),
-                "lost {comment}: {}",
-                removed.content
-            );
-        }
         let doc: Value = toml::from_str(&removed.content).unwrap();
         assert_eq!(doc["hooks"]["pre_tool"].as_array().unwrap().len(), 2);
         assert_eq!(doc["hooks"]["post_tool_feedback"].as_str(), Some("review"));

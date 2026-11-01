@@ -287,8 +287,7 @@ pub(crate) fn toml_merge_outcome(
 
 /// Rewrite `item` from `old` to `new`, touching only what differs: a table
 /// recurses key by key, an array of tables reuses each entry an equal one
-/// survives as, a plain array keeps its surviving elements, and anything else is
-/// replaced whole, keeping the comment on its line.
+/// survives as, and anything else is replaced whole.
 fn apply_toml(
     item: &mut toml_edit::Item,
     old: &toml::Value,
@@ -346,41 +345,9 @@ fn apply_toml(
             }
             *aot = rebuilt;
         }
-        (
-            toml::Value::Array(old),
-            toml::Value::Array(new),
-            toml_edit::Item::Value(toml_edit::Value::Array(array)),
-        ) => {
-            let mut kept = 0;
-            let dropped: Vec<usize> = (0..old.len())
-                .filter(|&i| {
-                    let survives = new.get(kept) == Some(&old[i]);
-                    kept += usize::from(survives);
-                    !survives
-                })
-                .collect();
-            for i in dropped.into_iter().rev() {
-                array.remove(i);
-            }
-            for value in &new[kept..] {
-                array.push(toml_value(value)?);
-            }
-        }
-        (_, new, toml_edit::Item::Value(was)) => {
-            let decor = was.decor().clone();
-            *was = toml_value(new)?;
-            *was.decor_mut() = decor;
-        }
         (_, new, item) => *item = toml_item(new)?,
     }
     Ok(())
-}
-
-/// [`toml_item`] for a place only a value fits: an inline one, whatever `value`.
-fn toml_value(value: &toml::Value) -> anyhow::Result<toml_edit::Value> {
-    toml_item(value)?
-        .into_value()
-        .map_err(|_| anyhow::anyhow!("a rendered TOML value lost its value"))
 }
 
 /// `value` as a fresh `toml_edit` item, positionless so it lays out after its
@@ -415,40 +382,6 @@ fn clear_table_positions(table: &mut toml_edit::Table) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn toml_merge_keeps_a_changed_values_comments() {
-        let out = toml_merge_outcome(
-            "one = 'a' # scalar\nmany = [\n  'x', # first\n  'y',\n  'z', # last\n] # list\n\
-             inline = { a = 1 } # table\n",
-            |mut d: toml::Table| {
-                d.insert("one".into(), toml::Value::from("b"));
-                d["inline"]
-                    .as_table_mut()
-                    .unwrap()
-                    .insert("b".into(), toml::Value::from(2));
-                let many = d["many"].as_array_mut().unwrap();
-                many.remove(2);
-                many.push(toml::Value::from("new"));
-                d
-            },
-        )
-        .unwrap();
-        for comment in ["# scalar", "# first", "# list", "# table"] {
-            assert!(out.content.contains(comment), "{}", out.content);
-        }
-        let doc: toml::Table = toml::from_str(&out.content).unwrap();
-        assert_eq!(doc["one"].as_str(), Some("b"));
-        assert_eq!(doc["inline"]["b"].as_integer(), Some(2));
-        let many: Vec<_> = doc["many"].as_array().unwrap().iter().collect();
-        assert_eq!(
-            many,
-            ["x", "y", "new"]
-                .map(toml::Value::from)
-                .iter()
-                .collect::<Vec<_>>()
-        );
-    }
 
     #[test]
     fn toml_merge_writes_the_merged_order_and_keeps_empty_arrays() {
