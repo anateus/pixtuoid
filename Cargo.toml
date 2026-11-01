@@ -6,12 +6,12 @@ members  = [
     "crates/pixtuoid",
     "crates/pixtuoid-hook",
     "crates/pixtuoid-web",
+    "crates/pixtuoid-web-music",
 ]
 
 [workspace.package]
-version      = "0.20.0"
+version      = "0.21.0"
 edition      = "2024"
-rust-version = "1.98"
 license      = "MIT"
 repository   = "https://github.com/pixtuoid/pixtuoid"
 authors      = ["Ivan Wang <ivanwng97@icloud.com>"]
@@ -40,12 +40,14 @@ allow_attributes                = "warn"
 allow_attributes_without_reason = "warn"
 undocumented_unsafe_blocks      = "warn"
 # Picked from `pedantic` for the failure each prevents: an overflowing
-# `(a + b) / 2`, a hand-rolled range check before a cast, and an undocumented
-# error or panic contract (the Rust API Guidelines' C-FAILURE).
+# `(a + b) / 2`, a hand-rolled range check before a cast, an undocumented
+# error or panic contract (the Rust API Guidelines' C-FAILURE), and an exported
+# method's dropped `Self`, which leaves a `Copy` or borrowed receiver unchanged.
 manual_midpoint                 = "warn"
 checked_conversions             = "warn"
 missing_errors_doc              = "warn"
 missing_panics_doc              = "warn"
+return_self_not_must_use        = "warn"
 # A widening cast as `T::from`, which can't go silently lossy if a type changes.
 cast_lossless                   = "warn"
 
@@ -61,10 +63,10 @@ codegen-units = 1
 strip         = "debuginfo"
 panic         = "abort"
 
-# The browser engine (`just gen-wasm`). `release` is tuned for the native
-# binary's speed; the wasm is a DOWNLOAD every visitor pays for before the hero
-# goes live, its frame step is a rounding error against a frame budget and its
-# synth runs in a worker — so it trades the other way. `z` vs `s` is empirical,
+# The browser engines (`just gen-wasm`). `release` is tuned for the native
+# binary's speed; the office's wasm is a DOWNLOAD every visitor pays for before
+# the hero goes live, its frame step is a rounding error against a frame budget
+# and its synth runs in a worker — so it trades the other way. `z` vs `s` is empirical,
 # not principled: `just gen-wasm-check` prints the size to re-judge it by.
 [profile.wasm-release]
 inherits  = "release"
@@ -104,10 +106,12 @@ codegen-units = 16
 incremental = true
 
 [workspace.dependencies]
+# ratatui-core's copy, so no second crate.
 lru                = { version = "0.18", default-features = false }
 tokio              = { version = "1", default-features = false }
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
+wasm-bindgen       = "0.2"
 toml               = "1"
 # Format-preserving TOML editing for config.toml saves: comments + unknown keys
 # survive a round-trip.
@@ -117,7 +121,7 @@ thiserror          = "2"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 notify             = "8"
-pixtuoid-lofi      = "0.2"
+pixtuoid-lofi      = "0.3"
 ratatui            = "0.30"
 crossterm          = "0.29"
 # Terminal display-column width — the authority ratatui itself uses, so wide
@@ -146,7 +150,9 @@ semver             = "1"
 # 0.61 to match the major tokio already pulls (via mio) on Windows — a second
 # windows-sys major would double-compile the bindings.
 windows-sys        = "0.61"
-criterion          = { package = "codspeed-criterion-compat", version = "5", default-features = false, features = ["cargo_bench_support"] }
+# Already in the tree through notify's walkdir: a Windows file id.
+winapi-util        = "0.1"
+criterion          = { package = "codspeed-criterion-compat", version = "6", default-features = false, features = ["cargo_bench_support"] }
 insta              = "1"
 schemars           = "1"
 snapbox            = "1"
@@ -160,7 +166,12 @@ temp-env           = "0.3"
 # Dev-only: the hermetic tier's `tui_drive` runs a CLI's TUI under a pty
 # (ConPTY on Windows) and reads the screen it renders.
 portable-pty       = "0.9"
-vt100              = "0.17"
+vt100              = "0.18"
+# Dev-only: `crates/pixtuoid-core/examples/support/bounded.rs`.
+process-wrap       = { version = "10", default-features = false, features = ["std", "process-group", "job-object"] }
+# Not crossterm's copy: holding to it would freeze this dev-only crate behind
+# crossterm, a cost larger than its second compile.
+signal-hook        = "0.4"
 # regex is already built through criterion; sha2 checks the hermetic tier's
 # release downloads, where a platform hasher would need a seam of its own to
 # keep the sums check testable.

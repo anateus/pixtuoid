@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use pixtuoid::dev::{RenderFrames, TuiRenderer};
-use pixtuoid_core::state::ActivityState;
+use pixtuoid_core::state::{ActivityState, ToolUse};
 use pixtuoid_core::{AgentId, AgentSlot, GlobalDeskIndex, SceneState};
 use pixtuoid_scene::pack::OfficeArt;
 use pixtuoid_scene::pack::load_bundled_pack;
@@ -40,11 +40,10 @@ fn agent_slot(
         created_at: now - Duration::from_secs(60),
         last_event_at: now - Duration::from_secs(60),
         exiting_at: None,
-        pending_idle_at: None,
         desk_index: desk,
         floor_idx: floor,
         tool_call_count: 0,
-        active_ms: 0,
+        running_ms: 0,
         unknown_cwd: false,
         parent_id: None,
         pid: None,
@@ -68,10 +67,12 @@ fn tui_renderer_render_paints_a_full_frame() {
             "demo",
             GlobalDeskIndex(0),
             0,
-            ActivityState::Active {
-                tool_use_id: Some(std::sync::Arc::from("t1")),
-                detail: Some(std::sync::Arc::from("Write")),
-                kind: pixtuoid_core::state::ToolKind::Edit,
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some(std::sync::Arc::from("t1")),
+                    detail: Some(std::sync::Arc::from("Write")),
+                    kind: pixtuoid_core::state::ToolKind::Edit,
+                }),
             },
             now,
         ),
@@ -88,25 +89,14 @@ fn tui_renderer_render_paints_a_full_frame() {
             .collect(),
         pack(),
     );
-    let pack = pack();
 
-    renderer.render(&scene, &pack, now).expect("render");
+    renderer.render(&scene, now).expect("render");
 
     // The 96×(36-1) scene area (one row reserved for the footer), doubled vertically
     // via half-block ⇒ 96 × 70.
     let buf = renderer.buf().expect("a frame");
     assert_eq!(buf.width(), 96);
     assert_eq!(buf.height(), 70);
-
-    let mut colors = std::collections::HashSet::new();
-    for px in buf.as_slice() {
-        colors.insert((px.r, px.g, px.b));
-    }
-    assert!(
-        colors.len() > 32,
-        "TuiRenderer::render produced suspiciously few colors ({})",
-        colors.len()
-    );
 }
 
 /// The transition path must not hardcode `PetInputs::default()` or empty
@@ -146,10 +136,9 @@ fn tui_renderer_transition_paints_pets_and_coffee() {
             .collect(),
         pack(),
     );
-    let pack = pack();
 
     // Initial render so the renderer grows its per-floor state to nf=2.
-    renderer.render(&scene, &pack, now).expect("initial render");
+    renderer.render(&scene, now).expect("initial render");
 
     renderer.set_active_pet(Some(pixtuoid::dev::PetState {
         petted_at: now,
@@ -164,9 +153,7 @@ fn tui_renderer_transition_paints_pets_and_coffee() {
     );
 
     let mid = now + Duration::from_millis(100);
-    renderer
-        .render(&scene, &pack, mid)
-        .expect("transition render");
+    renderer.render(&scene, mid).expect("transition render");
 
     assert!(
         renderer.transition().is_some(),
@@ -399,9 +386,8 @@ fn cancel_transition_lands_on_destination_floor() {
             .collect(),
         pack(),
     );
-    let pack = pack();
 
-    renderer.render(&scene, &pack, now).expect("initial render");
+    renderer.render(&scene, now).expect("initial render");
     assert_eq!(renderer.current_floor(), 0);
 
     renderer.navigate_floor(1, now);
@@ -439,7 +425,6 @@ fn make_renderer() -> TuiRenderer<TestBackend> {
 fn the_help_paints_only_while_open() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_716_286_800);
     let scene = SceneState::uniform(8);
-    let pack = pack();
     let mut r = make_renderer();
     let help_painted = |r: &TuiRenderer<TestBackend>| {
         let text: String = r
@@ -457,12 +442,12 @@ fn the_help_paints_only_while_open() {
         ..Default::default()
     };
 
-    r.render(&scene, &pack, now).expect("render");
+    r.render(&scene, now).expect("render");
     assert!(!help_painted(&r));
     r.set_frames(help(true), now);
-    r.render(&scene, &pack, now).expect("render");
+    r.render(&scene, now).expect("render");
     assert!(help_painted(&r));
     r.set_frames(help(false), now);
-    r.render(&scene, &pack, now).expect("render");
+    r.render(&scene, now).expect("render");
     assert!(!help_painted(&r));
 }

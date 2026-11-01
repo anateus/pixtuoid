@@ -9,8 +9,10 @@
 //! installs that release, a bump's planned one. `--record` writes a source's
 //! fixtures, and off the pin moves its pin up to the release recorded.
 //! `--shard <n>` runs the `n`th of `SHARDS`' sources, one CI leg's.
+//! `--freshness` alone runs nothing: it prints each unprofiled source's latest
+//! release (`NOT_HERMETIC`'s feeds) as `issues plan` reads it.
 //!
-//! Exits 0 when every run passed, New findings included (`NEW_TYPES` counts them),
+//! Exits 0 when every run passed, New findings included (`VERDICTS` labels them),
 //! 1 on any other verdict (a recording refused after its runs included), and
 //! anything else when the tier could not run or refused a recording first.
 
@@ -36,15 +38,19 @@ mod run {
     use pixtuoid_core::harness::hermetic::bump::{self, Moved};
     use pixtuoid_core::harness::hermetic::digest;
     use pixtuoid_core::harness::hermetic::dropped::Unjudged;
+    use pixtuoid_core::harness::hermetic::issues::{self, Freshness, RunVerdict, Verdicts};
     use pixtuoid_core::harness::hermetic::pin;
     use pixtuoid_core::harness::hermetic::tui;
     use pixtuoid_core::harness::hermetic::verify::{self, Label, Verdict};
     use pixtuoid_core::harness::hermetic::{
-        self, DUMMY_KEY, HostConfig, LIFECYCLE, LIFECYCLE_RECORD, LIVE_PIXTUOID_ENV,
-        LIVE_PREREQUISITE, Live, MANIFEST, Manifest, NOT_HERMETIC, PROFILES, Package, PerOs,
-        Profile, SCENE_LOG, SHARDS, STEPS, Scenario, Second, Step, StepRecord, Surface, TUI_LOG,
+        self, DUMMY_KEY, Feed, HostConfig, LIFECYCLE, LIFECYCLE_RECORD, LIVE_PIXTUOID_ENV, Live,
+        MANIFEST, Manifest, NOT_HERMETIC, PROFILES, Package, PerOs, Profile, SCENE_LOG, SHARDS,
+        STEPS, Scenario, Second, Step, StepRecord, Surface, TUI_LOG, installer_build,
     };
-    use pixtuoid_core::harness::host::{RELEASE_PATIENCE, hold_lock, remove_once_released};
+    use pixtuoid_core::harness::host::{
+        RELEASE_PATIENCE, SandboxEnv, built, connect, hold_lock, inherited, remove_once_released,
+        warmed_shim_dir,
+    };
     use pixtuoid_core::harness::plan::{
         AbsPath, Argv, CapturePlan, DEFAULT_PROMPT, DaemonPlan, Invocation, Placeholder, Sink, Word,
     };
@@ -67,31 +73,6 @@ mod run {
     const AIMOCK_LOG: &str = "aimock.log";
     /// The scripted model's npm package.
     const AIMOCK_PACKAGE: &str = "@copilotkit/aimock";
-    /// The variables a CLI may inherit from the host, with each platform's own
-    /// in [`PLATFORM_INHERITED`]: everything else is cleared, so an operator's
-    /// provider keys can never reach a CLI whose base-URL wiring slipped and bill
-    /// a real provider.
-    const INHERITED_EVERYWHERE: &[&str] = &["PATH"];
-    const PLATFORM_INHERITED: PerOs<&[&str]> = PerOs {
-        unix: &[
-            "LANG", "LC_ALL", "TERM", "TMPDIR", "SHELL", "USER", "LOGNAME",
-        ],
-        windows: &[
-            // `connect` finds a CLI's `.cmd` through `which`, which reads it
-            // (`which-8.0.6/src/finder.rs:277`).
-            "PATHEXT",
-            // "In order to run a side-by-side assembly the specified env must
-            // include a valid %SystemRoot%" (docs.python.org, subprocess).
-            "SystemRoot",
-            // A CLI's shell: Node falls back to `cmd.exe` without it
-            // (nodejs.org/api/child_process.html, "Default Windows shell").
-            "ComSpec",
-            // TMPDIR's twins: GetTempPath reads TMP, then TEMP, then
-            // USERPROFILE, a sandbox home (learn.microsoft.com, GetTempPath2W).
-            "TMP",
-            "TEMP",
-        ],
-    };
     /// What the tier's tools inherit beyond [`inherited`]: network settings,
     /// with their homes in [`PLATFORM_TOOL_INHERITED`]. A CLI's install scripts
     /// and the npm-installed aimock are untrusted code, so no provider key
@@ -132,14 +113,6 @@ mod run {
                 *k == name
             }
         })
-    }
-
-    /// Every variable a CLI inherits on this platform.
-    fn inherited() -> impl Iterator<Item = &'static str> {
-        INHERITED_EVERYWHERE
-            .iter()
-            .chain(PLATFORM_INHERITED.here().iter())
-            .copied()
     }
 
     /// `program` with the host env cleared to what [`inherited`],
@@ -203,8 +176,8 @@ mod run {
             let Some(source) = self.source.as_deref() else {
                 return Ok(());
             };
-            if let Some((_, why)) = NOT_HERMETIC.iter().find(|(s, _)| *s == source) {
-                return Err(format!("{source} has no hermetic profile: {why:?}"));
+            if let Some(u) = NOT_HERMETIC.iter().find(|u| u.source == source) {
+                return Err(format!("{source} has no hermetic profile: {:?}", u.absence));
             }
             let p = hermetic::profile(source)
                 .ok_or_else(|| format!("{source} is not a registered source"))?;
@@ -291,13 +264,21 @@ mod run {
         }
     }
 
+    /// The flag that asks for [`freshness`] alone, on stdout.
+    const FRESHNESS: &str = "--freshness";
+
     /// Whether every selected run passed.
     pub(crate) fn main() -> std::io::Result<bool> {
-        let args = match parse(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        if argv == [FRESHNESS] {
+            println!("{}", serde_json::to_string(&freshness())?);
+            return Ok(true);
+        }
+        let args = match parse(&argv) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!(
-                    "{e}\nusage: hermetic [--cli pinned|latest|<release>] [--record] [--shard <n>] [<source> [<scenario>]]"
+                    "{e}\nusage: hermetic [--cli pinned|latest|<release>] [--record] [--shard <n>] [<source> [<scenario>]]\n       hermetic {FRESHNESS}"
                 );
                 std::process::exit(2);
             }
@@ -317,8 +298,10 @@ mod run {
         }
         std::fs::create_dir_all(&runs)?;
         let built = Built::find()?;
+        let shim_dir = tier.join("bin");
+        warmed_shim_dir(&shim_dir, &built.shim)?;
         let ctx = Ctx {
-            shim_dir: warmed_shim_dir(&tier, &built.shim)?,
+            shim_dir,
             record: args.record,
             built,
             aimock: Aimock::install(&tier)?,
@@ -341,8 +324,8 @@ mod run {
         std::fs::write(runs.join(REPORT), &report)?;
         std::fs::write(runs.join(bump::MOVED), serde_json::to_string(&moved)?)?;
         std::fs::write(
-            runs.join(hermetic::NEW_TYPES),
-            new_count(&entries).to_string(),
+            runs.join(issues::VERDICTS),
+            serde_json::to_string(&verdicts(args.shard.map(|(n, _)| n), &entries))?,
         )?;
         println!("\n{report}");
         Ok(entries.iter().all(|e| e.verdict.passed()))
@@ -362,16 +345,16 @@ mod run {
         };
         let windows = cfg!(windows);
         let selected = selected(args, p, windows);
-        let lifecycle = lifecycle_turn(args, p);
+        let lifecycle = lifecycle_turn(args, p, windows);
         if selected.is_empty() && lifecycle.is_none() {
             return Ok((entries, None));
         }
         // Once per source, so every scenario runs, and records, one release.
         let installed = resolve(p, &args.versions);
         // Worked out before any CLI runs, so a refusal writes nothing.
-        let registry = match (&installed, args.record) {
+        let repinned = match (&installed, args.record) {
             (Ok(v), true) => {
-                let src = std::fs::read_to_string(pin::registry_path())?;
+                let src = std::fs::read_to_string(pin::descriptor_path(p.source))?;
                 pin::repinned(&src, p.descriptor(), v).map_err(std::io::Error::other)?
             }
             _ => None,
@@ -390,18 +373,19 @@ mod run {
         };
         let (mut judged, mut banners) = (Vec::new(), Vec::new());
         let mut scenarios = selected;
-        if let Some(s) = lifecycle.filter(|s| !scenarios.iter().any(|x| x.fixture == s.fixture)) {
+        if let Some(s) = lifecycle.filter(|s| !scenarios.iter().any(|x| x.name == s.name)) {
             scenarios.insert(0, s);
         }
+        let mut release = Release {
+            installed: &installed,
+            hung: None,
+        };
         for scenario in scenarios {
             let dir = run_dir(runs, p, scenario);
             std::fs::create_dir_all(&dir)?;
             let key = format!("{}/{}", p.source, scenario.name);
             println!("== {key}");
-            let ran = match &installed {
-                Ok(v) => run_one(ctx, p, scenario, v, &dir),
-                Err(e) => Err(std::io::Error::other(e.clone())),
-            };
+            let ran = release.run(p, scenario.name, |v| run_one(ctx, p, scenario, v, &dir));
             let (banner, verdict, run) = match ran {
                 Ok((manifest, run)) => {
                     let verdict = verify::verify(&dir)?;
@@ -418,8 +402,8 @@ mod run {
                 judged.push(dir);
             }
             banners.extend(banner.clone());
-            entries.push(Entry::new(key, banner, verdict));
-            if lifecycle.is_none_or(|l| l.fixture != scenario.fixture) {
+            entries.push(Entry::new(p.source, key, banner, verdict));
+            if lifecycle.is_none_or(|l| l.name != scenario.name) {
                 continue;
             }
             let dir = runs.join(p.source).join(LIFECYCLE);
@@ -427,7 +411,9 @@ mod run {
             let key = format!("{}/{LIFECYCLE}", p.source);
             println!("== {key}");
             let verdict = match run {
-                Some(run) => match run_lifecycle(ctx, p, scenario, &run, &dir) {
+                Some(run) => match release.run(p, LIFECYCLE, |_| {
+                    run_lifecycle(ctx, p, scenario, &run, &dir).map(|m| (m, ()))
+                }) {
                     Ok(_) => verify::verify_lifecycle(&dir)?,
                     // The steps' record is judged though the turn after them failed.
                     Err(e) if dir.join(LIFECYCLE_RECORD).is_file() => {
@@ -437,12 +423,9 @@ mod run {
                     }
                     Err(e) => Verdict::new(vec![(Label::Blocked, e.to_string())]),
                 },
-                None => Verdict::new(vec![(
-                    Label::Blocked,
-                    format!("its {} run was not judged", scenario.name),
-                )]),
+                None => Verdict::new(vec![(Label::Blocked, release.not_run(p, scenario.name))]),
             };
-            entries.push(Entry::new(key, None, verdict));
+            entries.push(Entry::new(p.source, key, None, verdict));
         }
         if !judges_leg(p, &judged, windows) {
             return Ok((entries, None));
@@ -451,7 +434,7 @@ mod run {
             let key = format!("{} (every scenario)", p.source);
             println!("== {key}");
             let verdict = verify::verify_source(p, &judged)?;
-            entries.push(Entry::new(key, None, verdict));
+            entries.push(Entry::new(p.source, key, None, verdict));
         }
         let passed = entries.iter().all(|e| e.verdict.passed());
         let mut moved = None;
@@ -460,8 +443,8 @@ mod run {
                 Ok(()) => {
                     if args.record {
                         record(ctx, p, runs)?;
-                        if let Some(text) = registry {
-                            std::fs::write(pin::registry_path(), text)?;
+                        if let Some(text) = repinned {
+                            std::fs::write(pin::descriptor_path(p.source), text)?;
                         }
                         if let (Some(lock), Some(path)) = (&lock, p.manifest_lock()) {
                             std::fs::write(path, serde_json::to_string_pretty(lock)? + "\n")?;
@@ -475,6 +458,7 @@ mod run {
                     }
                 }
                 Err(why) if args.record => entries.push(Entry::new(
+                    p.source,
                     format!("{} (recording)", p.source),
                     None,
                     Verdict::new(vec![(Label::Fail, why)]),
@@ -494,7 +478,7 @@ mod run {
     /// `p`'s [`Live`] run, when `args` selects it and this leg runs it: its CLI
     /// installed as a scenario's is, then its tier driven against this build. It
     /// records no capture, so no pin moves on it
-    /// (`a_recorded_capture_anchors_its_sources_verified_version`).
+    /// (`every_capture_is_recorded_at_its_sources_pin`).
     fn run_live(
         ctx: &Ctx,
         args: &Args,
@@ -517,18 +501,13 @@ mod run {
             Ok((banner, verdict)) => (Some(banner), verdict),
             Err(e) => (None, Verdict::new(vec![(Label::Blocked, e.to_string())])),
         };
-        Ok(vec![Entry::new(key, banner, verdict)])
+        Ok(vec![Entry::new(p.source, key, banner, verdict)])
     }
 
-    /// What `live`'s exit `code` says: [`LIVE_PREREQUISITE`] is a missing
-    /// prerequisite, which no run of the build caused.
+    /// What `live`'s exit `code` says.
     fn live_verdict(live: &Live, code: Option<i32>) -> Verdict {
         match code {
             Some(0) => Verdict::new(vec![]),
-            Some(LIVE_PREREQUISITE) => Verdict::new(vec![(
-                Label::Blocked,
-                format!("{} found a prerequisite missing ({LIVE_LOG})", live.script),
-            )]),
             _ => Verdict::new(vec![(
                 Label::Fail,
                 format!("{} exited {code:?} ({LIVE_LOG})", live.script),
@@ -573,11 +552,11 @@ mod run {
     /// The scenario `p`'s install lifecycle goes on from and turns under its
     /// last uninstall, when `args` selects the lifecycle. `--record` writes
     /// scenarios alone.
-    fn lifecycle_turn<'a>(args: &Args, p: &'a Profile) -> Option<&'a Scenario> {
+    fn lifecycle_turn(args: &Args, p: &Profile, windows: bool) -> Option<&'static Scenario> {
         if args.record || !args.selects(p.source, LIFECYCLE) {
             return None;
         }
-        headless_first(p.scenarios.iter())
+        p.lifecycle_turn(windows)
     }
 
     /// The sandbox a lifecycle goes on in, when its scenario's `verdict` was
@@ -585,12 +564,6 @@ mod run {
     /// uninstall.
     fn lifecycle_goes_on<T>(verdict: &Verdict, run: T) -> Option<T> {
         verdict.judged().then_some(run)
-    }
-
-    /// The first of `scenarios`, a headless one first, since a TUI's gate waits
-    /// on a hook.
-    fn headless_first<'a>(scenarios: impl Iterator<Item = &'a Scenario>) -> Option<&'a Scenario> {
-        scenarios.min_by_key(|s| !matches!(s.surface, Surface::Headless))
     }
 
     /// Every run of the sources `args` selects that a leg on `windows` never
@@ -677,20 +650,76 @@ mod run {
         judged.len() == scenarios
     }
 
-    /// The run's report, beside the runs; its H1 is the tracking issue's title.
+    /// The run's report, beside the runs, for whoever opens the upload.
     const REPORT: &str = "report.md";
 
-    /// How many New findings `entries` hold.
-    fn new_count(entries: &[Entry]) -> usize {
-        entries
-            .iter()
-            .flat_map(|e| e.verdict.findings())
-            .filter(|(label, _)| *label == Label::New)
-            .count()
+    /// The release a source's runs go on with, until a turn the recorder's
+    /// budget killed hangs it: the rest are skipped, so a hung release costs its
+    /// leg one budget.
+    struct Release<'a> {
+        installed: &'a Result<Version, String>,
+        /// The run whose turn hung it.
+        hung: Option<&'static str>,
+    }
+
+    impl<'a> Release<'a> {
+        /// The run `name` on the release, or why it never ran.
+        fn run<T>(
+            &mut self,
+            p: &Profile,
+            name: &'static str,
+            run: impl FnOnce(&'a Version) -> std::io::Result<(Manifest, T)>,
+        ) -> std::io::Result<(Manifest, T)> {
+            let ran = match (self.hung_in(p), self.installed) {
+                (Some(why), _) => Err(std::io::Error::other(why)),
+                (None, Ok(v)) => run(v),
+                (None, Err(e)) => Err(std::io::Error::other(e.clone())),
+            };
+            if ran
+                .as_ref()
+                .is_ok_and(|(m, _)| m.capture.killed_turn().is_some())
+            {
+                self.hung.get_or_insert(name);
+            }
+            ran
+        }
+
+        /// Why `p`'s runs are skipped, once a turn of one hung it.
+        fn hung_in(&self, p: &Profile) -> Option<String> {
+            self.hung
+                .map(|hung| format!("skipped: {} hung in {hung}", p.source))
+        }
+
+        /// Why a run that goes on from `before` never ran.
+        fn not_run(&self, p: &Profile, before: &str) -> String {
+            self.hung_in(p)
+                .unwrap_or_else(|| format!("its {before} run was not judged"))
+        }
+    }
+
+    /// `entries` as [`issues::VERDICTS`] holds them, from the leg running
+    /// [`SHARDS`]' `shard`th.
+    fn verdicts(shard: Option<usize>, entries: &[Entry]) -> Verdicts {
+        Verdicts {
+            os: std::env::consts::OS.to_owned(),
+            shard,
+            runs: entries
+                .iter()
+                .map(|e| RunVerdict {
+                    source: e.source.to_owned(),
+                    key: e.key.clone(),
+                    version: e.version.clone(),
+                    label: e.verdict.label(),
+                    findings: e.verdict.findings().to_vec(),
+                })
+                .collect(),
+        }
     }
 
     /// One section of the report: one run, or a source's runs together.
     struct Entry {
+        /// The source that ran.
+        source: &'static str,
         key: String,
         /// The CLI's `--version`, for one run.
         version: Option<String>,
@@ -698,9 +727,15 @@ mod run {
     }
 
     impl Entry {
-        fn new(key: String, version: Option<String>, verdict: Verdict) -> Self {
+        fn new(
+            source: &'static str,
+            key: String,
+            version: Option<String>,
+            verdict: Verdict,
+        ) -> Self {
             println!("   {:?}", verdict.label());
             Self {
+                source,
                 key,
                 version,
                 verdict,
@@ -765,8 +800,8 @@ mod run {
             }
         }
         out += "\nNot covered:";
-        for (source, absence) in NOT_HERMETIC {
-            out += &format!(" {source} ({absence:?})");
+        for u in NOT_HERMETIC {
+            out += &format!(" {} ({:?})", u.source, u.absence);
         }
         if !not_run.is_empty() {
             out += &format!("\nNot run here: {}", not_run.join(" "));
@@ -792,9 +827,8 @@ mod run {
             .ok_or_else(|| std::io::Error::other("an example sits three below its target dir"))
     }
 
-    /// The build under test, beside this example in its profile's directory:
-    /// the binary, the shim and the recorder. Never a `pixtuoid` off PATH: a
-    /// released one would pass with none of the change under test in it.
+    /// The build under test: the binary and the shim ([`built`]), and beside
+    /// this example the recorder and the TUI driver.
     struct Built {
         pixtuoid: PathBuf,
         shim: PathBuf,
@@ -806,18 +840,14 @@ mod run {
     impl Built {
         fn find() -> std::io::Result<Self> {
             let me = std::env::current_exe()?;
-            let profile_dir = me
-                .parent()
-                .and_then(Path::parent)
-                .ok_or_else(|| std::io::Error::other("an example sits two below its target dir"))?;
             let exe = |name: &str| format!("{name}{}", std::env::consts::EXE_SUFFIX);
             let found = Self {
-                pixtuoid: profile_dir.join(exe("pixtuoid")),
-                shim: profile_dir.join(exe("pixtuoid-hook")),
+                pixtuoid: built("pixtuoid")?,
+                shim: built("pixtuoid-hook")?,
                 recorder: me.with_file_name(exe("capture_fixture")),
                 driver: me.with_file_name(exe("tui_drive")),
             };
-            for p in [&found.pixtuoid, &found.shim, &found.recorder, &found.driver] {
+            for p in [&found.recorder, &found.driver] {
                 if !p.is_file() {
                     return Err(std::io::Error::other(format!(
                         "{} is not built — `just hermetic` builds it",
@@ -829,36 +859,6 @@ mod run {
         }
     }
 
-    /// The directory every sandbox's PATH names, holding the tier's one shim:
-    /// Unix links the built one, and Windows, where a symlink needs privilege,
-    /// copies it once. The shim runs once here, at no endpoint, so no run's first
-    /// hook is a cold exec of a new file: a CLI lost its first payload behind one.
-    fn warmed_shim_dir(tier: &Path, shim: &Path) -> std::io::Result<PathBuf> {
-        let dir = tier.join("bin");
-        match std::fs::remove_dir_all(&dir) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-        std::fs::create_dir_all(&dir)?;
-        let name = shim
-            .file_name()
-            .ok_or_else(|| std::io::Error::other("the shim has no file name"))?;
-        let placed = dir.join(name);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(shim, &placed)?;
-        #[cfg(windows)]
-        std::fs::copy(shim, &placed)?;
-        let mut warm = tool(&placed)
-            .env(Endpoint::ENV, dir.join("nothing-listens"))
-            .stdin(Stdio::piped())
-            .spawn()?;
-        if let Some(mut stdin) = warm.stdin.take() {
-            stdin.write_all(b"{}")?;
-        }
-        warm.wait()?;
-        Ok(dir)
-    }
-
     /// The scripted model, installed from the committed lockfile, scripts off.
     struct Aimock {
         launch: Launch,
@@ -867,7 +867,7 @@ mod run {
 
     impl Aimock {
         fn install(tier: &Path) -> std::io::Result<Self> {
-            let src = hermetic::scripts_dir().join("aimock");
+            let src = hermetic::aimock_dir();
             let lock: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(src.join("package-lock.json"))?)?;
             let version = lock["packages"][format!("node_modules/{AIMOCK_PACKAGE}")]["version"]
@@ -990,10 +990,19 @@ mod run {
 
     /// The release `versions` names for `p`.
     fn resolve(p: &Profile, versions: &Versions) -> Result<Version, String> {
-        match (versions, p.package) {
-            (Versions::Pinned, _) => pin::pinned(p.descriptor()),
-            (Versions::Exact(release), _) => Ok(release.clone()),
-            (Versions::Latest, Package::Npm(package)) => {
+        match versions {
+            Versions::Pinned => pin::pinned(p.descriptor()),
+            Versions::Exact(release) => Ok(release.clone()),
+            Versions::Latest => latest(p.package.feed()).and_then(|release| {
+                Version::parse(&release).map_err(|_| format!("{release:?} is not a release"))
+            }),
+        }
+    }
+
+    /// The release `feed` names as its latest, as the feed spells it.
+    fn latest(feed: Feed) -> Result<String, String> {
+        match feed {
+            Feed::Npm(package) => {
                 // A bare name reads npm's `tag` config, which an operator's
                 // `.npmrc` can point at another dist-tag
                 // (https://github.com/npm/cli/blob/83ea1a1c19648a6b4f5e52a498d8a6aaaf60e52b/lib/commands/view.js#L141-L145).
@@ -1002,30 +1011,45 @@ mod run {
                     .args(["view", &spec, "version"])
                     .output()
                     .map_err(|e| format!("npm view {spec}: {e}"))?;
-                npm_release(&spec, out.status, &out.stdout, &out.stderr)
+                npm_release(&spec, out.status, &out.stdout, &out.stderr).map(|v| v.to_string())
             }
-            (Versions::Latest, Package::GithubRelease { repo, .. } | Package::UvLocked(repo)) => {
+            Feed::GithubLatest(repo) => {
                 // It redirects to the latest release
                 // (docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases).
                 let url = format!("https://github.com/{repo}/releases/latest");
                 let headers = curl_get(&url, Curl::Headers).map_err(|e| e.to_string())?;
                 latest_tag(&String::from_utf8_lossy(&headers))
+                    .map(|v| v.to_string())
                     .ok_or_else(|| format!("{url} redirected to no release tag"))
             }
-            (
-                Versions::Latest,
-                Package::UpdaterManifest {
-                    manifest,
-                    platforms,
-                    ..
-                },
-            ) => {
+            Feed::UpdaterManifest {
+                manifest,
+                platforms,
+            } => {
                 let here = asset_here(platforms).map_err(|e| e.to_string())?;
                 let current = fetch_manifest(manifest, here).map_err(|e| e.to_string())?;
                 Version::parse(&current.version)
+                    .map(|v| v.to_string())
                     .map_err(|_| format!("{here}'s manifest names {:?}", current.version))
             }
+            Feed::Installer { script, build_at } => {
+                let body = curl_get(script, Curl::Body).map_err(|e| e.to_string())?;
+                installer_build(&String::from_utf8_lossy(&body), build_at)
+                    .map(str::to_owned)
+                    .map_err(|why| format!("{script}: {why}"))
+            }
         }
+    }
+
+    /// Each unprofiled source's latest release, for `issues plan`.
+    fn freshness() -> Vec<Freshness> {
+        NOT_HERMETIC
+            .iter()
+            .map(|u| Freshness {
+                source: u.source.to_owned(),
+                latest: latest(u.feed),
+            })
+            .collect()
     }
 
     /// One platform's build, as an updater manifest and a manifest lock name it.
@@ -1469,31 +1493,13 @@ mod run {
         }
     }
 
-    /// One sandbox: every home a CLI or pixtuoid resolves points inside it, so
-    /// nothing reads or writes the operator's.
+    /// One sandbox ([`SandboxEnv`]), with the profile's own env and config.
     struct Sandbox {
         dir: tempfile::TempDir,
-        env: Vec<(String, OsString)>,
+        env: SandboxEnv,
         /// Where the headless pixtuoid listens and the recorder tees to.
         scene: Endpoint,
     }
-
-    /// Every home a CLI or pixtuoid may resolve, each a directory of the
-    /// sandbox. All are set on every platform: a variable no reader there reads
-    /// is inert.
-    const SANDBOX_HOMES: &[(&str, &str)] = &[
-        ("HOME", "home"),
-        ("USERPROFILE", "home"),
-        ("APPDATA", "home/AppData/Roaming"),
-        ("LOCALAPPDATA", "home/AppData/Local"),
-        // Each at its default under the home: reasonix refuses to link a
-        // plugin from outside it
-        // (`internal/ext/installsource/plugin_package.go:480-481` at v2.39.0).
-        ("XDG_CONFIG_HOME", "home/.config"),
-        ("XDG_DATA_HOME", "home/.local/share"),
-        ("XDG_STATE_HOME", "home/.local/state"),
-        ("XDG_CACHE_HOME", "home/.cache"),
-    ];
 
     impl Sandbox {
         fn new(
@@ -1508,34 +1514,12 @@ mod run {
             // plugin copy then refuses its plugin (`@openclaw/fs-safe`
             // `src/copy-root-file-sync.ts:57`, `:77-79` at v0.24.2).
             let dir = tempfile::tempdir_in(dunce::canonicalize(std::env::temp_dir())?)?;
-            let at = |rel: &str| -> std::io::Result<PathBuf> {
-                let d = dir.path().join(rel);
-                std::fs::create_dir_all(&d)?;
-                Ok(d)
-            };
-            let mut env: Vec<(String, OsString)> = inherited()
-                .filter(|k| *k != "PATH")
-                .filter_map(|k| std::env::var_os(k).map(|v| (k.to_string(), v)))
-                .collect();
-            let host_path = std::env::var_os("PATH").unwrap_or_default();
-            let path = std::env::join_paths(
-                [shim_dir.to_path_buf(), cli_bin.to_path_buf()]
-                    .into_iter()
-                    .chain(std::env::split_paths(&host_path)),
-            )
-            .map_err(std::io::Error::other)?;
-            env.push(("PATH".into(), path));
-            for (var, rel) in SANDBOX_HOMES {
-                env.push(((*var).into(), at(rel)?.into()));
-            }
-            for var in p.home_vars() {
-                env.push((var.into(), at(&format!("homes/{var}"))?.into()));
-            }
+            let mut env = SandboxEnv::new(dir.path(), p.home_vars(), &[shim_dir, cli_bin])?;
             let expand = |t: &str| expanded(t, ports);
             // Every child gets the profile's env, `connect`'s spawned CLI included;
             // the CLI under test also gets it in the plan's `cli_env` (`Sandbox::cli_env`).
             for (k, v) in p.env {
-                env.push(((*k).to_string(), expand(v).into()));
+                env.set(*k, expand(v));
             }
             let sandbox = Self {
                 scene: Endpoint::in_dir(dir.path(), "scene"),
@@ -1579,22 +1563,11 @@ mod run {
         }
 
         fn var_os(&self, key: &str) -> Option<&OsString> {
-            self.env
-                .iter()
-                .rev()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v)
+            self.env.var_os(key)
         }
 
-        /// A child of the run. Its stdin is empty: `opencode run` reads a non-TTY
-        /// stdin to its end (`packages/cli/src/run/run.ts:76`), so an inherited
-        /// one that never closes hangs the run.
         fn command(&self, program: impl AsRef<OsStr>) -> Command {
-            let mut c = Command::new(program);
-            c.env_clear()
-                .envs(self.env.iter().map(|(k, v)| (k, v)))
-                .stdin(Stdio::null());
-            c
+            self.env.command(program)
         }
     }
 
@@ -1690,20 +1663,12 @@ mod run {
     ) -> std::io::Result<(Manifest, Sandboxed)> {
         let (ports, _) = Ports::pick(0)?;
         let ((workspace, workspace_root), cli, sandbox) = sandboxed(ctx, p, version, ports)?;
-        let connect = sandbox
-            .command(&ctx.built.pixtuoid)
-            .args(["connect", p.source, "--json"])
-            .output()?;
-        std::fs::write(dir.join("connect.log"), &connect.stdout)?;
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_slice(&connect.stdout).unwrap_or_default();
-        if !rows.iter().any(|r| r["outcome"] == Step::Connect.outcome()) {
-            return Err(std::io::Error::other(format!(
-                "pixtuoid connect {} did not connect: {}",
-                p.source,
-                String::from_utf8_lossy(&connect.stderr).trim()
-            )));
-        }
+        connect(
+            &sandbox.env,
+            &ctx.built.pixtuoid,
+            p.source,
+            &mut std::fs::File::create(dir.join("connect.log"))?,
+        )?;
         let run = Sandboxed {
             ports,
             workspace,
@@ -1814,8 +1779,8 @@ mod run {
         );
         wait_until("aimock", BOOT, || Ok(http_get(port, "/v1/models").is_ok()))?;
 
-        // A root absent at boot is watched only from the next poll, so a short
-        // run would reach pixtuoid by hook alone.
+        // A CLI that has run before has its root; create it so the sandbox
+        // matches.
         let mut prepare = sandbox.command(&built.recorder);
         prepare.args(Invocation::prepare_root_args(sandbox.dir.path(), p.source));
         succeed(prepare)?;
@@ -1872,20 +1837,18 @@ mod run {
         let results_seen = results_seen(&entries);
 
         // The recorder writes its record whenever the CLI ran, so a missing
-        // one means the CLI never did; it fails past one only on a capture it
-        // could not complete, which its log's last line names.
+        // one means the CLI never did.
         let capture: CaptureRecord = match std::fs::read_to_string(dir.join(CAPTURE_RECORD)) {
-            Ok(text) if recorder.success() => serde_json::from_str(&text)?,
-            read => {
+            Ok(text) => serde_json::from_str(&text)?,
+            Err(_) => {
                 let log = std::fs::read_to_string(dir.join(RECORDER_LOG)).unwrap_or_default();
                 let last = log
                     .lines()
                     .rev()
                     .find(|l| !l.trim().is_empty())
                     .unwrap_or_default();
-                let relation = if read.is_ok() { "after" } else { "with no" };
                 return Err(std::io::Error::other(format!(
-                    "the recorder exited {recorder} {relation} {CAPTURE_RECORD}: {last}"
+                    "the recorder exited {recorder} with no {CAPTURE_RECORD}: {last}"
                 )));
             }
         };
@@ -1944,11 +1907,12 @@ mod run {
                 path.exists().then(|| path.display().to_string())
             }
             #[cfg(windows)]
-            HostConfig::Registry(key) => {
-                pixtuoid_core::harness::host::registry_key_exists(key).then(|| (*key).to_owned())
+            HostConfig::Registry { hive, sub } => {
+                pixtuoid_core::harness::host::registry_key_exists(*hive, sub)
+                    .then(|| format!(r"{}\{sub}", hive.name()))
             }
             #[cfg(not(windows))]
-            HostConfig::Registry(_) => None,
+            HostConfig::Registry { .. } => None,
         }
     }
 
@@ -2031,7 +1995,7 @@ mod run {
             }),
             None => None,
         };
-        let second_turn = match (scenario.turn.second, p.second_turn) {
+        let second_turn = match (scenario.headless_second(), p.second_turn) {
             (Some(second), Some(words)) => {
                 let words = with_launch(
                     words[1..]
@@ -2069,7 +2033,7 @@ mod run {
                         .launch
                         .argv()
                         .into_iter()
-                        .chain(row.args().iter().map(OsString::from))
+                        .chain(row.args().iter().map(|w| OsString::from(ported(w))))
                         .collect(),
                 };
                 for arg in line.to_args() {
@@ -2090,9 +2054,23 @@ mod run {
             workspace: Some(path(run.workspace)?),
             cli_version: Some(NonEmpty::try_from(run.cli_version).map_err(std::io::Error::other)?),
             cli_env: run.cli_env.clone(),
-            seed: None,
+            seed: scenario
+                .seed(p.source)
+                .map(|dir| {
+                    text(dir.as_os_str())
+                        .and_then(|t| NonEmpty::try_from(t).map_err(std::io::Error::other))
+                })
+                .transpose()?,
             daemon,
             first_turn: Argv::resolved(first_turn).map_err(plan_error)?,
+            server_stop: p
+                .server_stop
+                .map(|words| {
+                    Argv::resolved(with_launch(words[1..].iter().map(|w| ported(w)).collect()))
+                })
+                .transpose()
+                .map_err(plan_error)?,
+            operator: None,
         })
     }
 
@@ -2261,6 +2239,7 @@ mod run {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use pixtuoid_core::harness::host::SANDBOX_HOMES;
         use pixtuoid_core::harness::plan::Resolved;
         use strum::VariantArray;
 
@@ -2331,13 +2310,12 @@ mod run {
         }
 
         #[test]
-        fn a_live_tier_s_exit_reads_pass_blocked_or_fail() {
+        fn a_live_tier_s_exit_reads_pass_or_fail() {
             let Some(live) = &hermetic::profile("openclaw").expect("openclaw").live else {
                 panic!("openclaw runs live");
             };
             let label = |code| live_verdict(live, code).label();
             assert_eq!(label(Some(0)), Label::Pass);
-            assert_eq!(label(Some(LIVE_PREREQUISITE)), Label::Blocked);
             assert_eq!(label(Some(1)), Label::Fail);
             assert_eq!(label(None), Label::Fail, "a signal");
         }
@@ -2370,31 +2348,22 @@ mod run {
                     "subagent",
                     "permission",
                     "model-error",
-                    "ask-user"
+                    "ask-user",
+                    "two-turn"
                 ]
             );
             assert!(not_run(&every, false).is_empty());
             let r = report(&Versions::Pinned, None, &[], &[], &not_run(&every, true));
             assert!(
                 r.ends_with(
-                    "\nNot run here: grok/permission (its TUI paints nothing under ConPTY) \
+                    "\nNot run here: opencode/cancel (its TUI was never run under ConPTY) \
+                     grok/permission (its TUI paints nothing under ConPTY) \
+                     grok/two-turn (its TUI paints nothing under ConPTY) \
                      openclaw/live (its tier waits on a Unix socket)\n"
                 ),
                 "{r}"
             );
             assert!(!report(&Versions::Pinned, None, &[], &[], &[]).contains("Not run"));
-            let entry = |label, finding: &str| {
-                Entry::new(
-                    "copilot/tool-run".into(),
-                    None,
-                    Verdict::new(vec![(label, finding.into())]),
-                )
-            };
-            assert_eq!(
-                new_count(&[entry(Label::New, "/type: `x`"), entry(Label::Fail, "lost")]),
-                1,
-                "the New findings alone"
-            );
             let macos = Unjudged::RecordedOn("macos".into());
             assert_eq!(
                 not_judged(
@@ -2408,9 +2377,10 @@ mod run {
                 ),
                 "copilot/tool-run (no baseline); 2 recorded on macos"
             );
-            let unjudged = |key: &str, why| {
+            let unjudged = |source, scenario: &str, why| {
                 Entry::new(
-                    key.into(),
+                    source,
+                    format!("{source}/{scenario}"),
                     None,
                     Verdict::new(Vec::new()).unjudged_because(why),
                 )
@@ -2420,8 +2390,8 @@ mod run {
                 None,
                 &[],
                 &[
-                    unjudged("copilot/tool-run", Unjudged::NoBaseline),
-                    unjudged("codex/tool-run", Unjudged::RecordedOn("macos".into())),
+                    unjudged("copilot", "tool-run", Unjudged::NoBaseline),
+                    unjudged("codex", "tool-run", Unjudged::RecordedOn("macos".into())),
                 ],
                 &[],
             );
@@ -2434,8 +2404,105 @@ mod run {
             assert!(!report(&Versions::Pinned, None, &[], &[], &[]).contains("not judged"));
             let judged = |n| vec![PathBuf::new(); n];
             assert!(judges_leg(grok, &judged(5), true), "grok moves on Windows");
-            assert!(!judges_leg(grok, &judged(5), false));
-            assert!(judges_leg(grok, &judged(6), false));
+            assert!(!judges_leg(grok, &judged(6), false));
+            assert!(judges_leg(grok, &judged(7), false));
+        }
+
+        #[test]
+        fn verdicts_hold_each_runs_source_key_version_label_and_findings() {
+            let blocked = Entry::new(
+                "opencode",
+                "opencode/tool-run".into(),
+                Some("1.0.0".into()),
+                Verdict::new(vec![(Label::Blocked, "npm view failed".into())]),
+            );
+            assert_eq!(
+                verdicts(Some(2), &[blocked]),
+                Verdicts {
+                    os: std::env::consts::OS.into(),
+                    shard: Some(2),
+                    runs: vec![RunVerdict {
+                        source: "opencode".into(),
+                        key: "opencode/tool-run".into(),
+                        version: Some("1.0.0".into()),
+                        label: Label::Blocked,
+                        findings: vec![(Label::Blocked, "npm view failed".into())],
+                    }],
+                }
+            );
+        }
+
+        #[test]
+        fn a_turn_the_recorder_killed_skips_the_rest_of_its_source() {
+            use pixtuoid_core::harness::{ProcessExit, SecondTurn};
+            let p = hermetic::profile("dsh").expect("dsh's profile");
+            let ended = |end, second: Option<ProcessExit>| Manifest {
+                source: "dsh".into(),
+                scenario: "subagent".into(),
+                capture: CaptureRecord {
+                    workspace: PathBuf::from("/ws"),
+                    cli: "dsh".into(),
+                    version: "0.2.1".into(),
+                    end,
+                    give_up_reason: None,
+                    incomplete: None,
+                    second_turn: second.map(|end| SecondTurn { end }),
+                    server_stop: None,
+                    note_survived: true,
+                },
+                aimock: "1.45.1".into(),
+                requests: 4210,
+                unmatched: 0,
+                results_seen: 0,
+            };
+            let ran = |m: Manifest| move |_: &Version| Ok((m, ()));
+            let never = |_: &Version| -> std::io::Result<(Manifest, ())> {
+                panic!("a hung release ran again")
+            };
+            let installed = Ok(Version::new(0, 2, 1));
+            let mut release = Release {
+                installed: &installed,
+                hung: None,
+            };
+            let ok = |r: std::io::Result<(Manifest, ())>| r.expect("it ran");
+            ok(release.run(p, "tool-run", ran(ended(ProcessExit::Exited(1), None))));
+            ok(release.run(p, "subagent", ran(ended(ProcessExit::OutOfTime, None))));
+            let skipped = "skipped: dsh hung in subagent";
+            let after = release.run(p, "permission", never).expect_err("skipped");
+            assert_eq!(after.to_string(), skipped);
+            let lifecycle = release.run(p, LIFECYCLE, never).expect_err("skipped");
+            assert_eq!(lifecycle.to_string(), skipped);
+            assert_eq!(release.not_run(p, "permission"), skipped);
+
+            let mut release = Release {
+                installed: &installed,
+                hung: None,
+            };
+            let second = ended(ProcessExit::Exited(0), Some(ProcessExit::OutOfTime));
+            ok(release.run(p, LIFECYCLE, ran(second)));
+            assert_eq!(
+                release
+                    .run(p, "subagent", never)
+                    .expect_err("skipped")
+                    .to_string(),
+                "skipped: dsh hung in lifecycle"
+            );
+            let unresolved = Err("npm view failed".to_owned());
+            let mut release = Release {
+                installed: &unresolved,
+                hung: None,
+            };
+            assert_eq!(
+                release
+                    .run(p, "tool-run", never)
+                    .expect_err("unresolved")
+                    .to_string(),
+                "npm view failed"
+            );
+            assert_eq!(
+                release.not_run(p, "tool-run"),
+                "its tool-run run was not judged"
+            );
         }
 
         #[test]
@@ -2443,12 +2510,14 @@ mod run {
             let os = std::env::consts::OS;
             let host = ["git version 2.55.0".to_string()];
             let pass = Entry::new(
+                "codex",
                 "codex/tool-run".into(),
                 Some("codex-cli 0.155.1".into()),
                 Verdict::new(vec![]),
             );
             let blocked = || {
                 Entry::new(
+                    "opencode",
                     "opencode/tool-run".into(),
                     None,
                     Verdict::new(vec![(Label::Blocked, "npm view failed".into())]),
@@ -2469,6 +2538,7 @@ mod run {
             );
             // The script lost a CLI that then exited: it ran, and its drift is the title.
             let lost = Entry::new(
+                "codex",
                 "codex/tool-run".into(),
                 None,
                 Verdict::new(vec![
@@ -2481,7 +2551,7 @@ mod run {
                 r.lines().next(),
                 Some(format!("# hermetic, latest CLIs on {os}: Script").as_str())
             );
-            // A shard's leg names it, so the issue tells two legs of one OS apart.
+            // A shard's leg names it, so a reader tells two legs of one OS apart.
             let r = report(&Versions::Latest, Some(2), &host, &[blocked()], &[]);
             assert_eq!(
                 r.lines().next(),
@@ -2564,12 +2634,19 @@ mod run {
         #[cfg(windows)]
         #[test]
         fn a_registry_row_is_config_outside_the_sandbox_while_its_key_exists() {
-            let present = HostConfig::Registry(r"HKCU\Software");
+            use pixtuoid_core::harness::host::Hive;
+            let present = HostConfig::Registry {
+                hive: Hive::Hkcu,
+                sub: "Software",
+            };
             assert_eq!(
                 host_config_found(&present, None).as_deref(),
                 Some(r"HKCU\Software")
             );
-            let absent = HostConfig::Registry(r"HKCU\Software\pixtuoid-absent-row");
+            let absent = HostConfig::Registry {
+                hive: Hive::Hkcu,
+                sub: r"Software\pixtuoid-absent-row",
+            };
             assert_eq!(host_config_found(&absent, None), None);
         }
 
@@ -2790,6 +2867,20 @@ mod run {
             );
         }
 
+        /// Every scenario, its TUI ones too: a server any turn started outlives
+        /// the run unless stopped after it.
+        #[test]
+        fn a_server_stop_reaches_the_recorder_for_every_scenario() {
+            let p = hermetic::profile("hermes").expect("hermes");
+            for scenario in p.scenarios {
+                let plan = plan_of(p, scenario);
+                let stop = plan.server_stop.as_ref().expect("a server stop");
+                assert_eq!(strings(stop), ["/cli/hermes", "gateway", "stop"]);
+            }
+            let codex = hermetic::profile("codex").expect("codex");
+            assert_eq!(plan_of(codex, &codex.scenarios[0]).server_stop, None);
+        }
+
         #[test]
         fn a_daemon_profile_hands_the_recorder_its_daemon_and_its_config_the_held_port() {
             let p = hermetic::profile("openclaw").expect("openclaw");
@@ -2828,7 +2919,7 @@ mod run {
 
         #[test]
         fn a_tui_scenario_hands_the_recorder_the_driver_and_the_clis_interactive_launch() {
-            let p = hermetic::profile("claude-code").expect("profile");
+            let p = hermetic::profile("opencode").expect("profile");
             let (scenario, row) = p
                 .scenarios
                 .iter()
@@ -2858,8 +2949,20 @@ mod run {
             let program: Vec<OsString> = launch
                 .argv()
                 .into_iter()
-                .chain(row.args().iter().map(OsString::from))
+                .chain(row.args().iter().map(|w| {
+                    w.replace(
+                        Placeholder::DaemonPort.as_str(),
+                        &TEST_PORTS.daemon.to_string(),
+                    )
+                    .into()
+                }))
                 .collect();
+            assert!(
+                row.args()
+                    .iter()
+                    .any(|w| w.contains(Placeholder::DaemonPort.as_str())),
+                "a row that spells no port proves no expansion"
+            );
             assert_eq!(line.program, program);
         }
 
@@ -3011,29 +3114,6 @@ mod run {
                     p.source
                 );
             }
-        }
-
-        /// The built shim itself, run once before any CLI: a fresh copy, or a
-        /// first exec, is cold.
-        #[cfg(unix)]
-        #[test]
-        fn a_tier_links_the_built_shim_and_runs_it_once() {
-            use std::os::unix::fs::PermissionsExt;
-            let d = tempfile::tempdir().expect("tempdir");
-            let shim = d.path().join("pixtuoid-hook");
-            let ran = d.path().join("ran");
-            std::fs::write(&shim, format!("#!/bin/sh\ncat > '{}'\n", ran.display()))
-                .expect("a shim");
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-                .expect("executable");
-            let dir = warmed_shim_dir(&d.path().join("tier"), &shim).expect("placed");
-            let placed = dir.join("pixtuoid-hook");
-            assert_eq!(std::fs::read_link(&placed).ok(), Some(shim), "not a copy");
-            assert_eq!(
-                std::fs::read_to_string(&ran).ok().as_deref(),
-                Some("{}"),
-                "it ran"
-            );
         }
 
         #[test]
@@ -3293,34 +3373,17 @@ mod run {
         }
 
         #[test]
-        fn the_lifecycle_turns_a_headless_scenario_and_never_records() {
-            let tui = PROFILES
-                .iter()
-                .flat_map(|p| p.scenarios)
-                .find(|s| matches!(s.surface, Surface::Tui { .. }))
-                .expect("a TUI scenario");
-            let scenario = |surface, fixture| Scenario {
-                name: tui.name,
-                shape: tui.shape,
-                surface,
-                expects: &[],
-                fixture,
-                turn: hermetic::Turn::PROFILE,
-            };
-            let tui_first = [
-                scenario(tui.surface, "tui"),
-                scenario(Surface::Headless, "headless"),
-            ];
-            let picked = |s: &[Scenario]| headless_first(s.iter()).map(|s| s.fixture);
-            assert_eq!(picked(&tui_first), Some("headless"));
-            assert_eq!(picked(&tui_first[..1]), Some("tui"));
+        fn the_lifecycle_runs_where_selected_and_never_records() {
             let codex = hermetic::profile("codex").expect("profiled");
             let record = parse(&args(&["--record", "codex"])).expect("parse");
-            assert!(lifecycle_turn(&record, codex).is_none());
+            assert!(lifecycle_turn(&record, codex, false).is_none());
             let all = parse(&args(&[])).expect("parse");
-            assert!(lifecycle_turn(&all, codex).is_some());
+            assert!(lifecycle_turn(&all, codex, false).is_some());
             let other = parse(&args(&["codex", "tool-run"])).expect("parse");
-            assert!(lifecycle_turn(&other, codex).is_none(), "not selected");
+            assert!(
+                lifecycle_turn(&other, codex, false).is_none(),
+                "not selected"
+            );
         }
 
         #[test]
@@ -3330,7 +3393,7 @@ mod run {
             assert!(check(&["codex", "tool-run"]).is_ok());
             assert!(check(&["codex", "no-such-scenario"]).is_err());
             assert!(check(&["no-such-source"]).is_err());
-            let (absent, _) = NOT_HERMETIC[0];
+            let absent = NOT_HERMETIC[0].source;
             assert!(check(&[absent]).is_err(), "an unprofiled source says why");
             let on = |windows| {
                 parse(&args(&["grok", "permission"]))

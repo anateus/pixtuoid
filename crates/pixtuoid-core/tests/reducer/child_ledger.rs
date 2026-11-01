@@ -6,7 +6,9 @@ use pixtuoid_core::source::{AgentEvent, Transport};
 use pixtuoid_core::state::SceneState;
 use pixtuoid_core::state::reducer::{CHILD_END_GATE_TTL, Reducer, STRAGGLER_TTL};
 
-use crate::{HOOK_AND_TRANSCRIPT, act_end, act_start, sess_end, start, start_as};
+use crate::{
+    HOOK_AND_TRANSCRIPT, sess_end, start, start_as, tool_use_end, tool_use_start, turn_end,
+};
 
 #[test]
 fn hook_session_end_blocks_reordered_trailing_event_synthesis() {
@@ -17,7 +19,7 @@ fn hook_session_end_blocks_reordered_trailing_event_synthesis() {
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     sess_end(&mut r, &mut scene, id, false, t0, Transport::Hook);
-    act_end(
+    tool_use_end(
         &mut r,
         &mut scene,
         id,
@@ -30,7 +32,7 @@ fn hook_session_end_blocks_reordered_trailing_event_synthesis() {
         "a reordered trailing event must not resurrect a session that just ended"
     );
 
-    act_end(
+    tool_use_end(
         &mut r,
         &mut scene,
         other,
@@ -52,7 +54,7 @@ fn hook_event_after_the_straggler_window_synthesizes_again() {
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
 
     sess_end(&mut r, &mut scene, id, false, t0, Transport::Hook);
-    act_start(
+    tool_use_start(
         &mut r,
         &mut scene,
         id,
@@ -68,7 +70,7 @@ fn hook_event_after_the_straggler_window_synthesizes_again() {
 }
 
 /// The 5 s straggler window is the ONLY guard, and past it nothing cares
-/// which arm arrives: a turn-boundary `ActivityEnd` re-registers exactly as an
+/// which arm arrives: a turn-boundary `TurnEnd` re-registers exactly as an
 /// `Identity` does. hermes has no other reaper (`resurrects_on_prompt: false`),
 /// so a turn finishing after the user rotates with `/new` leaves the outgoing id
 /// on the floor until the 30-minute stale sweep — the cost of "a hook is proof of
@@ -83,10 +85,10 @@ fn past_the_straggler_window_any_hook_arm_re_registers_including_a_turn_boundary
     let past = t0 + STRAGGLER_TTL + Duration::from_secs(1);
 
     sess_end(&mut r, &mut scene, ended, false, t0, Transport::Hook);
-    act_end(&mut r, &mut scene, ended, None, past, Transport::Hook);
+    turn_end(&mut r, &mut scene, ended, past, Transport::Hook);
     assert!(
         scene.agents.contains_key(&ended),
-        "an ActivityEnd past the TTL re-registers — the pre-existing behaviour"
+        "a TurnEnd past the TTL re-registers — the pre-existing behaviour"
     );
 
     let with_id = AgentId::from_parts("hermes", "same-but-with-identity");
@@ -419,7 +421,7 @@ fn walked_out_child(r: &mut Reducer, scene: &mut SceneState) -> (AgentId, AgentI
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let at = |s| t0 + Duration::from_secs(s);
     r.apply(scene, session_start(parent, None), at(0), Transport::Hook);
-    act_start(
+    tool_use_start(
         r,
         scene,
         parent,
@@ -434,7 +436,7 @@ fn walked_out_child(r: &mut Reducer, scene: &mut SceneState) -> (AgentId, AgentI
         at(2),
         Transport::Hook,
     );
-    act_end(r, scene, parent, Some("call_1"), at(3), Transport::Hook);
+    tool_use_end(r, scene, parent, Some("call_1"), at(3), Transport::Hook);
     let gone = at(3) + B1_CASCADE_GRACE + EXIT_GRACE_WINDOW + Duration::from_secs(1);
     r.tick(scene, at(3) + B1_CASCADE_GRACE);
     r.tick(scene, gone);
@@ -540,7 +542,7 @@ fn an_identity_or_bare_activity_re_admits_an_inferred_child_under_its_parent() {
                 Transport::Hook,
             );
         } else {
-            act_start(
+            tool_use_start(
                 &mut r,
                 &mut scene,
                 child,
@@ -579,7 +581,7 @@ fn a_readmission_under_a_parent_that_would_close_a_cycle_comes_back_parentless()
     );
     assert_eq!(scene.agents[&parent].parent_id, Some(child), "precondition");
     let back = gone + Duration::from_secs(1);
-    act_start(
+    tool_use_start(
         &mut r,
         &mut scene,
         child,
@@ -615,7 +617,7 @@ fn a_readmitted_childs_next_end_gates_from_that_end() {
                 Transport::Hook,
             );
         } else {
-            act_start(
+            tool_use_start(
                 &mut r,
                 &mut scene,
                 child,
@@ -628,7 +630,7 @@ fn a_readmitted_childs_next_end_gates_from_that_end() {
         assert!(scene.agents.contains_key(&child), "re-admitted");
 
         let dispatch = back + CHILD_END_GATE_TTL;
-        act_start(
+        tool_use_start(
             &mut r,
             &mut scene,
             parent,
@@ -638,7 +640,7 @@ fn a_readmitted_childs_next_end_gates_from_that_end() {
             Transport::Hook,
         );
         let drain = dispatch + Duration::from_secs(1);
-        act_end(
+        tool_use_end(
             &mut r,
             &mut scene,
             parent,
@@ -702,7 +704,7 @@ fn a_known_childs_own_end_is_reported_without_as_child() {
     r.tick(&mut scene, gone);
     assert!(gone < end + STRAGGLER_TTL);
     let straggle = |r: &mut Reducer, scene: &mut SceneState, at| {
-        act_start(r, scene, child, None, Some("read"), at, Transport::Hook);
+        tool_use_start(r, scene, child, None, Some("read"), at, Transport::Hook);
     };
     straggle(&mut r, &mut scene, gone);
     assert!(
@@ -737,7 +739,7 @@ fn inside_the_end_gate_a_hook_activity_readmits_an_ended_child_only_under_its_pa
                 stop + EXIT_GRACE_WINDOW + Duration::from_secs(1),
             );
         }
-        act_start(
+        tool_use_start(
             &mut r,
             &mut scene,
             child,
@@ -832,14 +834,14 @@ fn a_grok_childs_parentless_next_start_is_readmitted_under_its_remembered_parent
 /// in place on its next `user_prompt_submit`, though that names no parent.
 #[test]
 fn a_walking_out_grok_childs_parentless_next_start_revives_it_under_its_parent() {
-    use pixtuoid_core::state::reducer::{EXIT_GRACE_WINDOW, STALE_WAITING_TIMEOUT};
+    use pixtuoid_core::state::reducer::{EXIT_GRACE_WINDOW, STALE_BLOCKED_TIMEOUT};
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let (parent, child_sess, child, started) = linked_grok_child(&mut r, &mut scene);
-    let sweep = started + STALE_WAITING_TIMEOUT + Duration::from_secs(1);
-    let mut busy = grok_hook("pre_tool_use", "parent-sess");
-    busy["toolName"] = "read_file".into();
-    apply_hook_payload(&mut r, &mut scene, busy, sweep - Duration::from_secs(1));
+    let sweep = started + STALE_BLOCKED_TIMEOUT + Duration::from_secs(1);
+    let mut running = grok_hook("pre_tool_use", "parent-sess");
+    running["toolName"] = "read_file".into();
+    apply_hook_payload(&mut r, &mut scene, running, sweep - Duration::from_secs(1));
     r.tick(&mut scene, sweep);
     assert!(scene.agents[&parent].exiting_at.is_none(), "parent swept");
     assert!(scene.agents[&child].exiting_at.is_some(), "child not swept");
@@ -1164,7 +1166,7 @@ fn reasonix_resurrect_is_unaffected_by_another_ids_lifecycle() {
 }
 
 /// The hook shapes a claude-code subagent's turns arrive in
-/// (`claude/fixtures/subagent-hermetic`), around one root session.
+/// (`claude_code/fixtures/subagent-hermetic`), around one root session.
 struct CcTurns {
     root: AgentId,
     child: AgentId,
@@ -1467,11 +1469,11 @@ fn a_subagents_start_just_inside_the_walkout_after_its_own_stop_is_refused() {
 }
 
 /// A subagent blocked on its own permission prompt keeps its delegating parent
-/// alive with it: no probe vouches either (Windows), and the parent's own Active
+/// alive with it: no probe vouches either (Windows), and the parent's own `STALE_TOOL_TIMEOUT`
 /// window would otherwise sweep both mid-gate.
 #[test]
 fn a_parent_waits_with_its_subagent_on_a_permission_prompt() {
-    use pixtuoid_core::state::reducer::STALE_ACTIVE_TIMEOUT;
+    use pixtuoid_core::state::reducer::STALE_TOOL_TIMEOUT;
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let cc = CcTurns::new(&mut r, &mut scene);
@@ -1486,11 +1488,11 @@ fn a_parent_waits_with_its_subagent_on_a_permission_prompt() {
     cc.hook(&mut r, &mut scene, ask, t1 + Duration::from_secs(1));
     r.tick(
         &mut scene,
-        t1 + Duration::from_secs(1) + STALE_ACTIVE_TIMEOUT + Duration::from_secs(1),
+        t1 + Duration::from_secs(1) + STALE_TOOL_TIMEOUT + Duration::from_secs(1),
     );
-    assert!(cc.live(&scene), "the waiting subagent was swept");
+    assert!(cc.live(&scene), "the requires-action subagent was swept");
     assert!(
         scene.agents[&cc.root].exiting_at.is_none(),
-        "the parent waiting on its subagent's prompt was swept"
+        "the parent waiting with its subagent on the prompt was swept"
     );
 }

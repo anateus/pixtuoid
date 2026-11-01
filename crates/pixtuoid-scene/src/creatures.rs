@@ -39,8 +39,8 @@ pub(crate) fn naps_here(layout: &SceneLayout, agents: &[AgentSlot], at: Point) -
         .filter(|a| matches!(a.state, ActivityState::Idle) && a.exiting_at.is_none())
         .filter_map(|a| layout.home_desk(a.desk_index.single_floor_local()))
         .any(|d| {
-            (i32::from(at.x) - i32::from(d.x)).abs() <= NAP_NEAR_DESK_PX
-                && (i32::from(at.y) - i32::from(d.y)).abs() <= NAP_NEAR_DESK_PX
+            (i32::from(at.x) - i32::from(d.at.x)).abs() <= NAP_NEAR_DESK_PX
+                && (i32::from(at.y) - i32::from(d.at.y)).abs() <= NAP_NEAR_DESK_PX
         })
 }
 
@@ -98,7 +98,7 @@ fn rests_at(layout: &SceneLayout, p: Point) -> bool {
 
 /// Full ticks per walk cycle at a pet's cruise.
 const PET_TICKS_PER_STRIDE: u64 = 2;
-/// Full ticks per walk cycle at a busy gateway mascot's cruise; an idle one
+/// Full ticks per walk cycle at a running gateway mascot's cruise; an idle one
 /// takes twice as many, a degraded one three times.
 const MASCOT_TICKS_PER_STRIDE: u64 = 4;
 
@@ -108,7 +108,7 @@ const PET_REST_MS: u64 = 25_000;
 /// roam waits this long.
 pub const PET_LONGEST_REST_MS: u64 = longest_rest(PET_REST_MS);
 /// About how long a gateway mascot rests between walks, in beat ms.
-const MASCOT_BUSY_REST_MS: u64 = 2_500;
+const MASCOT_RUNNING_REST_MS: u64 = 2_500;
 const MASCOT_IDLE_REST_MS: u64 = 5_000;
 const MASCOT_DEGRADED_REST_MS: u64 = 7_700;
 
@@ -152,8 +152,8 @@ impl Roam {
     pub(crate) fn mascot(stride: NonZeroU16, state: DaemonState) -> Self {
         match state {
             // a downed gateway's mascot hurries out
-            DaemonState::Busy | DaemonState::Down => {
-                Self::of(stride, MASCOT_TICKS_PER_STRIDE, MASCOT_BUSY_REST_MS)
+            DaemonState::Running | DaemonState::Down => {
+                Self::of(stride, MASCOT_TICKS_PER_STRIDE, MASCOT_RUNNING_REST_MS)
             }
             DaemonState::Degraded => {
                 Self::of(stride, 3 * MASCOT_TICKS_PER_STRIDE, MASCOT_DEGRADED_REST_MS)
@@ -511,10 +511,10 @@ pub struct GatewayCard {
     /// concurrent lobsters names the one under the cursor. `None` when its
     /// source runs a single instance, whose id means nothing to the user.
     pub instance: Option<String>,
-    /// An agent run is in flight. Keyed on the run state, NOT the session count
+    /// An agent turn is in flight. Keyed on the turn state, NOT the session count
     /// — a single-user gateway holds one persistent session even at rest.
-    pub busy: bool,
-    /// Gateway up but its model backend is failing every run.
+    pub running: bool,
+    /// Gateway up but its model backend is failing every turn.
     pub degraded: bool,
     /// Number of sessions the gateway currently holds.
     pub active_sessions: u32,
@@ -536,7 +536,7 @@ impl GatewayCard {
         Some(Self {
             name: def.display_name,
             instance: (siblings > 1).then(|| key.instance().as_str().to_string()),
-            busy: state == DaemonState::Busy,
+            running: state == DaemonState::Running,
             degraded: state == DaemonState::Degraded,
             active_sessions: presence.active_sessions,
         })
@@ -698,7 +698,7 @@ mod tests {
             .chain(
                 [
                     (DaemonState::Idle, 2 * MASCOT_TICKS_PER_STRIDE),
-                    (DaemonState::Busy, MASCOT_TICKS_PER_STRIDE),
+                    (DaemonState::Running, MASCOT_TICKS_PER_STRIDE),
                     (DaemonState::Degraded, 3 * MASCOT_TICKS_PER_STRIDE),
                     (DaemonState::Down, MASCOT_TICKS_PER_STRIDE),
                 ]
@@ -815,7 +815,7 @@ mod tests {
     fn a_creature_walks_routed_ground_and_rests_on_clear_floor() {
         let pack = test_pack();
         let roams = [
-            Roam::mascot(pack.stride(Walk::LobsterWalk), DaemonState::Busy),
+            Roam::mascot(pack.stride(Walk::LobsterWalk), DaemonState::Running),
             Roam::pet(pack.stride(PetKind::Cat.walk_anim())),
         ];
         let min = crate::layout::min_layout_size();
@@ -873,7 +873,7 @@ mod tests {
     #[test]
     fn a_calmer_tier_roams_a_quarter_as_often_and_a_still_one_never() {
         let pack = test_pack();
-        let roam = Roam::mascot(pack.stride(Walk::LobsterWalk), DaemonState::Busy);
+        let roam = Roam::mascot(pack.stride(Walk::LobsterWalk), DaemonState::Running);
         let l = layout(192, 80);
         let starts_at = |motion| {
             (0..4)
@@ -974,17 +974,14 @@ mod tests {
     /// a time.
     struct Office {
         session: FloorSession,
-        pack: OfficeArt,
         size: Size,
         floor: FloorMeta,
     }
 
     impl Office {
         fn new(w: u16, h: u16) -> Self {
-            let pack = test_pack();
             Self {
-                session: FloorSession::new(std::sync::Arc::new(pack.clone())),
-                pack,
+                session: FloorSession::new(std::sync::Arc::new(test_pack())),
                 size: Size { w, h },
                 floor: FloorMeta::ground(),
             }
@@ -1001,7 +998,6 @@ mod tests {
                 .step(
                     FloorInputs {
                         scene,
-                        pack: &self.pack,
                         now: at(ms),
                         floor: self.floor,
                         pets: PetInputs { pet, petting },
@@ -1028,7 +1024,7 @@ mod tests {
                 active_sessions: 0,
                 last_seen: at(seen_ms),
                 entered_at: at(entered_ms),
-                in_flight_runs: Default::default(),
+                in_flight_turns: Default::default(),
                 current_pid: Some(1),
             },
         );
@@ -1533,17 +1529,22 @@ mod tests {
     #[test]
     fn a_gateways_state_reaches_its_card() {
         let key = openclaw_key("18789");
-        let running = || std::collections::BTreeMap::from([("run".to_string(), at(0))]);
-        for (liveness, in_flight_runs, busy, degraded) in [
+        let in_flight = || {
+            std::collections::HashMap::from([(
+                pixtuoid_core::state::TurnKey::Id("run".into()),
+                at(0),
+            )])
+        };
+        for (liveness, in_flight_turns, running, degraded) in [
             (DaemonLiveness::UP, Default::default(), false, false),
-            (DaemonLiveness::UP, running(), true, false),
+            (DaemonLiveness::UP, in_flight(), true, false),
             (
                 DaemonLiveness::Up { degraded: true },
-                running(),
+                in_flight(),
                 false,
                 true,
             ),
-            (DaemonLiveness::Down, running(), false, false),
+            (DaemonLiveness::Down, in_flight(), false, false),
         ] {
             let mut scene = SceneState::uniform(16);
             scene.insert_daemon(
@@ -1554,12 +1555,16 @@ mod tests {
                     active_sessions: 0,
                     last_seen: at(0),
                     entered_at: at(0),
-                    in_flight_runs,
+                    in_flight_turns,
                     current_pid: Some(1),
                 },
             );
             let card = GatewayCard::of(&scene, &key).expect("a gateway with a mascot");
-            assert_eq!((card.busy, card.degraded), (busy, degraded), "{liveness:?}");
+            assert_eq!(
+                (card.running, card.degraded),
+                (running, degraded),
+                "{liveness:?}"
+            );
         }
     }
 
@@ -1661,7 +1666,6 @@ mod tests {
     }
 
     /// Every pet's walk master faces east too, so both densities face one way.
-    #[cfg(feature = "cutaway-assets")]
     #[test]
     fn every_pet_walk_master_faces_east() {
         let pack = test_pack();

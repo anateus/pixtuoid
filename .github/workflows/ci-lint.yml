@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-cargo-just
@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-alsa
@@ -41,16 +41,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
           persist-credentials: false
       # No setup-cargo-just: nothing compiles here, so the runner's preinstalled
       # cargo is enough — but cargo-deny DOES shell out to `cargo metadata`.
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: ./.github/actions/setup-tools
         with:
-          tool: cargo-deny
-      - uses: ./.github/actions/setup-just
+          tools: cargo-deny
       - run: just deny
       # Both verdicts show: a red deny must not hide arch.
       - if: ${{ !cancelled() }}
@@ -68,14 +67,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # cargo-machete parses manifests and does not need a Rust toolchain.
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: ./.github/actions/setup-tools
         with:
-          tool: cargo-machete
-      - uses: ./.github/actions/setup-just
+          tools: github:bnjbvr/cargo-machete
       - run: just machete
 
   # The `just lint` recipes no other job runs, so a skipped local preflight can't land their break.
@@ -86,54 +84,18 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
-      # Keyed on this workflow file: a version bump edits it, so the cache can
-      # never serve a stale binary; any other ci-lint edit costs one cold
-      # reinstall. ~/go/bin is spelled, not derived: GOPATH is the runner
-      # default, and deriving it here while the cache stores a literal is how
-      # a hit could restore binaries to a directory that is not on PATH.
-      - name: Cache the Go-built tools
-        id: go-tools
-        uses: actions/cache@v6
+      - uses: ./.github/actions/setup-tools
         with:
-          path: ~/go/bin
-          key: go-tools-${{ runner.os }}-${{ hashFiles('.github/workflows/ci-lint.yml') }}
-      - name: Expose Go tool binaries
-        run: echo "$HOME/go/bin" >> "$GITHUB_PATH"
-      - name: Install workflow lint + policy tools
-        if: steps.go-tools.outputs.cache-hit != 'true'
-        run: |
-          go install mvdan.cc/sh/v3/cmd/shfmt@v3.13.1
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          go install github.com/mikefarah/yq/v4@v4.53.3
-      - name: Install the JSON Schema validator
-        run: pipx install check-jsonschema==0.37.4
-      # Lychee is not manifest-managed by install-action, so its documented
-      # cargo-binstall fallback installs our pinned version.
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+          tools: shfmt aqua:rhysd/actionlint shellcheck zizmor yq jq gitleaks lychee pypi:check-jsonschema uv ruff
+      # pyright and tsc.
+      - uses: ./.github/actions/setup-npm
         with:
-          tool: lychee@0.24.2,zizmor@1.30.0
-          fallback: cargo-binstall
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: shellcheck@0.11.0
-          fallback: none
-      # `just fixture-pii` is a REQUIRED gate and cannot degrade — a missing
-      # gitleaks must fail the job, not silently scan nothing. Not via
-      # taiki-e/install-action: gitleaks is not in its TOOLS.md (checked).
-      - name: Install gitleaks
-        run: |
-          set -euo pipefail
-          ver=8.30.1
-          url="https://github.com/gitleaks/gitleaks/releases/download/v$ver/gitleaks_${ver}_linux_x64.tar.gz"
-          curl -fsSL "$url" -o /tmp/gitleaks.tar.gz
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz" | sha256sum -c -
-          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
-          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
-          gitleaks version
-      - uses: ./.github/actions/setup-just
+          directory: .
+      - run: just toolchain-ceiling
       - run: just shfmt-check
       - run: just shellcheck
       - run: just actionlint
@@ -144,42 +106,52 @@ jobs:
       - run: just ci-observability
       - run: just json-schemas
       - run: just links
+      - run: just ruff
+      - run: just pyright
+      - run: just tsc
+      - run: just lang-census
+      # The host install is the cost, so a PR that leaves every input of the
+      # verdict alone skips it; path-changed treats a push as unchanged. Each
+      # host's pin sits in its source module, which a bump PR moves.
+      - uses: ./.github/actions/path-changed
+        id: plugin-types
+        with:
+          paths: crates/pixtuoid/src/install crates/pixtuoid-core/src/source crates/pixtuoid-core/src/harness/hermetic/profiles crates/pixtuoid-core/examples/bump.rs package.json package-lock.json justfile .github/workflows/ci-lint.yml .github/actions/setup-npm site/package.json
+      - if: steps.plugin-types.outputs.changed == 'true'
+        uses: ./.github/actions/setup-npm
+        with:
+          directory: crates/pixtuoid/src/install
+      # `bump plugin-types` names each host at its pin. No cache: main, the one
+      # place a cache saves, never runs this.
+      - if: steps.plugin-types.outputs.changed == 'true'
+        uses: ./.github/actions/setup-cargo-just
+        with:
+          enable-cache: 'false'
+      - if: steps.plugin-types.outputs.changed == 'true'
+        run: just plugin-types
       - run: just hook-scrub-selftest
       - run: just star-history-selftest
       - run: just bmc-button-selftest
+      - run: just hermes-plugin-selftest
       # The capture-tree provenance rules are NOT here: they are Rust tests
       # (`tests/sources/captures.rs`, #929) riding ci-tests.yml's three-platform
       # `test` job instead of this job's one, and no toolchain in a lint job.
       - run: just fixture-pii
       - run: just fixture-pii-selftest
 
-  msrv:
-    name: msrv
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup-alsa
-      # No rust-cache on purpose: it would key the runner's stable compiler,
-      # while the MSRV recipe installs the exact rust-version toolchain.
-      - uses: ./.github/actions/setup-just
-      - run: just msrv
-
   npm-gen:
     name: npm package generator
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # Exercise the generator before release.yml uses it to publish.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
-      - uses: ./.github/actions/setup-just
+          node-version-file: mise.toml
+      - uses: ./.github/actions/setup-tools
       - run: just npm-check
 
   # Generated-file freshness is formatter-class, so every PR push runs it
@@ -190,14 +162,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
-      - uses: ./.github/actions/setup-just
-      - uses: actions/setup-python@v7
+          node-version-file: mise.toml
+      - uses: ./.github/actions/setup-tools
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.x"
           cache: pip
@@ -206,12 +178,12 @@ jobs:
         run: |
           python3 -m venv .venv
           .venv/bin/pip install -r requirements-dev.txt
-      - name: Generated sprites, icons and banner, README sections, the comparator
-        run: just gen-readme-check gen-art-check gen-banner-check gen-icons-check compare-selftest
+      - name: Generated-file drift
+        run: just gen-check
       # gen-icons-check's overlays.
       - name: Upload drift overlays
-        if: always()
-        uses: actions/upload-artifact@v7
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: generated-drift-diffs
           path: target/gen-check-diff/
@@ -226,21 +198,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: v1-rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: ./.github/actions/setup-tools
         with:
-          tool: cargo-binstall
-      # The justfile's API_PUBLIC_API is the authority; api-surface-check
-      # asserts this copy against it before reading a golden.
+          tools: cargo-binstall
       - name: Install cargo-public-api (pinned to match the committed goldens)
-        run: cargo binstall -y cargo-public-api@0.52.0
-      - uses: ./.github/actions/setup-just
+        run: just _install-public-api
       - run: just api-surface-check
 
   # rustdoc warnings and doctests are invisible to clippy and nextest.
@@ -249,23 +218,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-alsa
       - uses: ./.github/actions/setup-cargo-just
       - run: just doc-check
-
-  required:
-    name: required-lint-jobs
-    # This explicit manifest prevents a nested job deletion or rename from
-    # silently shrinking the single protected ci-gate.
-    if: ${{ always() }}
-    needs: [fmt, clippy, deny, machete, hygiene, msrv, npm-gen, generated, api-surface, docs]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: pixtuoid/.github/.github/actions/require-jobs@main
-        with:
-          results: ${{ toJSON(needs) }}
-          label: "Required lint job failed"

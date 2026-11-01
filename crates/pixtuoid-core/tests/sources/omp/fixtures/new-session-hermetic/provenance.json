@@ -1,15 +1,15 @@
 {
   "origin": "recorded",
   "cli": "omp",
-  "version": "omp/18.12.1",
-  "captured": "2026-10-20",
+  "version": "omp/18.14.2",
+  "captured": "2026-10-31",
   "command": "just hermetic --record omp",
   "deidentified": {
     "method": "decoder-allowlist",
-    "blanked": 13
+    "blanked": 14
   },
-  "aimock": "1.45.1",
-  "script": "tests/sources/hermetic/omp/new-session.json",
+  "aimock": "1.47.0",
+  "script": "tests/sources/omp/hermetic/new-session.json",
   "dropped": {
     "os": "macos",
     "at": {

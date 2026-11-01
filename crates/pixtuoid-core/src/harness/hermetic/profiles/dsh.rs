@@ -1,4 +1,4 @@
-//! dsh's cites are `deepseek-ai/deepseek-harness` at `dsh-v0.2.0-rc.2`.
+//! dsh's cites are `deepseek-ai/deepseek-harness` at `dsh-v0.2.1-rc.2`.
 
 use crate::harness::plan::Placeholder;
 use std::borrow::Cow;
@@ -12,6 +12,7 @@ fn event(v: &Value) -> Option<Cow<'_, str>> {
     Some(Cow::Borrowed(match v.get("type")?.as_str()? {
         "session_start" => "agent/created",
         "session_end" => "agent/disposed",
+        "turn_end" => "turn/end",
         "model" => "request/header",
         "usage" => "assistant/message",
         "tool_call" => "tool/call",
@@ -23,14 +24,19 @@ fn event(v: &Value) -> Option<Cow<'_, str>> {
 }
 
 pub(crate) const PROFILE: Profile = Profile {
-    source: "dsh",
+    source: crate::source::dsh::SOURCE_NAME,
     package: Package::Npm("@deepseek-ai/dsh"),
+    plugin_types: &[
+        "@deepseek-ai/dsh-agent",
+        "@deepseek-ai/dsh-session",
+        "@deepseek-ai/dsh-user-approval",
+    ],
     invocation: &["dsh", "--profile", "headless", Placeholder::Prompt.as_str()],
     second_turn: None,
     // The Messages endpoint and key come from the launch environment
-    // (`packages/llm/llm-deepseek/src/config.ts:290`,
+    // (`packages/llm/llm-deepseek/src/config.ts:300`,
     // `packages/llm/llm-deepseek-api-key/src/index.ts:20-35`); the feedback
-    // upload's switch (`packages/bundle/base/cordis.patch.yml:193-195`).
+    // upload's switch (`packages/bundle/base/cordis.patch.yml:207-209`).
     env: &[
         ("DEEPSEEK_BASE_URL", "http://127.0.0.1:{port}"),
         ("DEEPSEEK_API_KEY", "{key}"),
@@ -42,7 +48,7 @@ pub(crate) const PROFILE: Profile = Profile {
         windows: &[],
     },
     // AGENTS.md and CLAUDE.md stop at the nearest `.git`
-    // (`packages/context/agent-instructions/README.md:36`), which the
+    // (`packages/context/agent-instructions/README.md:38`), which the
     // recorder's `git init` makes the workspace.
     ancestor_config: &[],
     config: &[],
@@ -57,9 +63,9 @@ pub(crate) const PROFILE: Profile = Profile {
                 "assistant/message",
                 "tool/call",
                 "tool/result",
+                "turn/end",
                 "agent/disposed",
             ],
-            fixture: "fixtures/dsh/tool-run-recorded",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -74,9 +80,9 @@ pub(crate) const PROFILE: Profile = Profile {
                 "approval/asked",
                 "approval/decided",
                 "tool/result",
+                "turn/end",
                 "agent/disposed",
             ],
-            fixture: "fixtures/dsh/permission-recorded",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -89,9 +95,21 @@ pub(crate) const PROFILE: Profile = Profile {
                 "assistant/message",
                 "tool/call",
                 "tool/result",
+                "turn/end",
                 "agent/disposed",
             ],
-            fixture: "delegation/fixtures/dsh",
+            turn: Turn::PROFILE,
+        },
+        Scenario {
+            name: "model-error",
+            shape: Shape::ModelError,
+            surface: Surface::Headless,
+            expects: &[
+                "agent/created",
+                "request/header",
+                "turn/end",
+                "agent/disposed",
+            ],
             turn: Turn::PROFILE,
         },
     ],
@@ -112,4 +130,6 @@ pub(crate) const PROFILE: Profile = Profile {
     result_unseen: false,
     live: None,
     daemon: None,
+    server_stop: None,
+    turn_exits: &[],
 };

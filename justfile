@@ -3,12 +3,12 @@
 # `workspace-version` names the one exception.
 #
 # Recipes are grouped by intent (see `just --list`):
-#   rust     — build, test and lint the repo (Rust, shell, workflows), plus the
+#   rust     — build, test and lint the repo (Rust, shell, workflows, Python, JS), plus the
 #              on-demand e2e / capture / fixture recipes
 #   site     — the Astro landing page under site/ (npm + the wasm build)
 #   gen      — regenerate + check committed artifacts
-#   release  — what release.yml builds and checks: the cross builds, the .deb,
-#              the version read, and the Node gates (npm-check)
+#   release  — what release.yml builds: the cross builds, the .deb, the version
+#              read; plus the Node gates (npm-check)
 #   meta     — tooling setup, the local gate (preflight), the fixture
 #              gates, and the gates' selftests
 
@@ -22,6 +22,18 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 # runs.
 set positional-arguments
 
+# A Homebrew cargo ahead of the rustup proxy ignores rust-toolchain.toml and
+# RUSTUP_TOOLCHAIN and ships only the host std: `--target` and nightly
+# recipes die on E0463 or `-Z` (a0d18c03e).
+# An empty CARGO_HOME reads as unset, which `env`'s default alone does not.
+_cargo_home := env('CARGO_HOME', '')
+
+# mise.toml's tools, ahead of ~/.cargo/bin (cargo resolves subcommands in PATH
+# order, and stale copies sit there). Directories, not shims: a shim errors
+# outside the repo, and the hermetic sandbox runs CLIs in temp dirs.
+_mise_paths := shell('command -v mise >/dev/null || exit 0; MISE_OFFLINE=1 mise env --paths')
+export PATH := (if _mise_paths == '' { '' } else { replace_regex(_mise_paths, '\r?\n', PATH_VAR_SEP) + PATH_VAR_SEP }) + (if _cargo_home == '' { home_directory() / '.cargo' } else { _cargo_home }) / 'bin' + PATH_VAR_SEP + env('PATH')
+
 # ── variables ─────────────────────────────────────────────────────
 # just evaluates these globally regardless of position; kept at the top so the
 # file's config lives in one place.
@@ -33,6 +45,10 @@ set positional-arguments
 # release-plz.toml switches the check off for the binary's lib target.
 PUBLISHED_CRATES := "pixtuoid-core pixtuoid-scene"
 
+# The wasm the site ships, one per crate: `gen-wasm` builds them, `gen-wasm-check`
+# caps each, and `hawk` leaves their wasm exports alone.
+WASM_CRATES := "pixtuoid-web pixtuoid-web-music"
+
 # Standalone shell FILES share one authority so formatting and lint coverage
 # cannot drift. Shell embedded in YAML is a second population this cannot cover:
 # workflow `run:` blocks go to actionlint, composite-action ones to
@@ -40,25 +56,22 @@ PUBLISHED_CRATES := "pixtuoid-core pixtuoid-scene"
 # scalar in place — so adding a file here is not enough for embedded shell.
 SHELL_SOURCES := "scripts/lib/*.sh .githooks/* policy/ci-observability/*.sh"
 
-# The tools `lint` refuses to start without: `setup-tools` brew-installs the
-# first list and cargo-installs the second.
-LINT_BREW_TOOLS := "shfmt actionlint shellcheck zizmor yq jq check-jsonschema gitleaks"
-LINT_CARGO_TOOLS := "cargo-machete cargo-deny lychee"
+# The projects that run their own checkers (site/AGENTS.md,
+# integrations/raycast/AGENTS.md), as git pathspecs.
+SELF_GATED := "':!:site/' ':!:integrations/'"
 
 # The nightly the api-surface goldens are pinned to (rustdoc JSON is
-# nightly-only). Provisioned by `_api-toolchain`.
-API_NIGHTLY := "nightly-2026-07-22"
+# nightly-only). Provisioned by `_api-toolchain`, which also fails while it
+# can't build what rust-toolchain.toml's release admits (`_toolchain-covers`).
+API_NIGHTLY := "nightly-2026-10-22"
 
 # The cargo-public-api the api/ goldens are reproducible against — tool-exact:
-# a different version rewrites them all. ci-lint.yml installs its own copy;
-# `_api-toolchain` asserts the pair, so divergence fails loud instead of
-# churning goldens.
+# a different version rewrites them all.
 API_PUBLIC_API := "0.52.0"
 
 # The cargo-hawk `hawk` runs, and the exact rustc it links (its
 # rust-toolchain.toml): hawk refuses any other, so a bump moves both, and the
-# installer's hash with them; a workspace `rust-version` past HAWK_RUST fails
-# `just hawk` until they move.
+# installer's hash with them.
 HAWK_VERSION := "0.1.15"
 HAWK_RUST := "1.99.0"
 HAWK_INSTALLER_SHA256 := "4e1b85fc15d3d4efa9b3bd7c62620655cc5504b7164272292043e3794f54111f"
@@ -83,8 +96,8 @@ default:
 
 # Format check only — fast, gates pre-commit. The justfile has a canonical
 # format too (`just --fmt`), so it is checked with the Rust; just gives its
-# formatter no cross-version guarantee, so `setup-just` pins CI's just and a
-# local one on another version may disagree.
+# formatter no cross-version guarantee, and `setup-tools` installs the newest
+# just, so a release that reformats fails this until `just --fmt`'s output lands.
 [group('rust')]
 fmt-check:
     cargo fmt --all --check
@@ -112,7 +125,7 @@ shfmt-fix:
 [doc('Run shellcheck over repository shell sources')]
 [group('rust')]
 shellcheck:
-    shellcheck {{ SHELL_SOURCES }}
+    shellcheck -x {{ SHELL_SOURCES }}
 
 # Lint the GitHub Actions workflows (actionlint): YAML schema, expression types,
 # action input/output names, runner labels, AND shellcheck over every `run:`
@@ -135,37 +148,22 @@ actionlint-composites:
     set -euo pipefail
     shopt -s nullglob
     actions=(.github/actions/*/action.y*ml) # GitHub accepts action.yaml too
-    ((${#actions[@]})) || { echo "error: no composite actions found" >&2; exit 1; }
     work="$(mktemp -d)"
     trap 'rm -rf "$work"' EXIT
     checked=0
-    skipped=()
     for action in "${actions[@]}"; do
         count="$(yq '[.runs.steps[] | select(has("run"))] | length' "$action")"
         ((count)) || continue # a pure `uses:` composite has no shell to check
         for i in $(seq 0 $((count - 1))); do
-            # The default should never fire — a composite run step must name a
-            # shell — but bash is what actionlint assumes for a workflow step.
-            shell="$(yq -r ".runs.steps | map(select(has(\"run\"))) | .[$i].shell // \"bash\"" "$action")"
-            case "$shell" in
-            bash | sh) ;;
-            # pwsh/python are not shellcheck's to judge, but a bounded gate that
-            # does not name what it dropped reads as full coverage.
-            *)
-                skipped+=("$action run step $i ($shell)")
-                continue
-                ;;
-            esac
+            shell="$(yq -r ".runs.steps | map(select(has(\"run\"))) | .[$i].shell" "$action")"
             script="$work/$(echo "$action" | tr /. __)-$i.$shell"
             { echo "#!/usr/bin/env $shell"; yq -r ".runs.steps | map(select(has(\"run\"))) | .[$i].run" "$action"; } >"$script"
-            shellcheck -s "$shell" "$script" || { echo "  ^ from $action run step $i" >&2; exit 1; }
+            shellcheck -s "$shell" "$script"
             checked=$((checked + 1))
         done
     done
     ((checked > 0)) || { echo "error: no composite run: blocks were checked" >&2; exit 1; }
     echo "$checked composite run: blocks shellchecked"
-    ((${#skipped[@]})) && printf '  skipped (not a shellcheck dialect): %s\n' "${skipped[@]}"
-    exit 0
 
 # Security audit for workflows/actions/Dependabot. zizmor owns the parser and
 # audit catalog; .github/zizmor.yml records its deliberate exceptions, and every
@@ -208,9 +206,7 @@ ci-observability:
 json-schemas:
     #!/usr/bin/env bash
     set -euo pipefail
-    shopt -s nullglob
     schemas=(integrations/raycast/contract/*.schema.json)
-    ((${#schemas[@]})) || { echo "error: no committed JSON Schemas found" >&2; exit 1; }
     check-jsonschema --check-metaschema "${schemas[@]}"
     echo "${#schemas[@]} JSON Schemas validated"
 
@@ -224,6 +220,81 @@ links:
     # Source CSS uses Vite package specifiers; its module graph belongs to the
     # site build, while this gate owns documentation links and anchors.
     lychee --offline --include-fragments --extensions md --hidden .
+
+[doc('Lint and format-check the Python (ruff)')]
+[group('rust')]
+ruff:
+    ruff check
+    ruff format --check
+
+# Every tracked Python file, so none escapes an `include`. The env uv builds
+# out of requirements-dev.txt resolves the scripts' imports.
+[doc('Type-check the Python (pyright, as pyproject.toml configures it)')]
+[group('rust')]
+pyright: (_npm ".")
+    git ls-files -z -- '*.py' '*.pyi' {{ SELF_GATED }} | xargs -0 uv run --no-project --with-requirements requirements-dev.txt -- node_modules/.bin/pyright
+
+[doc('Type-check the JavaScript (tsc --checkJs, as tsconfig.json configures it)')]
+[group('rust')]
+tsc: (_npm ".")
+    node_modules/.bin/tsc -p tsconfig.json
+
+# What each checker reads, by its own account: tsc's program, the files `pyright`
+# is handed and SHELL_SOURCES as the shell expands it for shellcheck. tsc lists
+# the plugins' project without its hosts' types installed, then exits 1.
+[doc('Fail on a tracked JS/TS, Python or shell source no checker reads')]
+[group('rust')]
+lang-census: (_npm ".")
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export LC_ALL=C
+    interpreter='^#!.*[/[:space:]](node|python[0-9.]*|sh|bash)$'
+    read_by=$(
+        {
+            for project in tsconfig.json crates/pixtuoid/src/install; do
+                { node_modules/.bin/tsc -p "$project" --listFilesOnly || true; } | grep "^$PWD/" | cut -c "$((${#PWD} + 2))-"
+            done
+            git ls-files -- '*.py' '*.pyi' {{ SELF_GATED }}
+            printf '%s\n' {{ SHELL_SOURCES }}
+        } | sort -u
+    )
+    unread=$(
+        git ls-files -z -- {{ SELF_GATED }} | while IFS= read -r -d '' f; do
+            case ${f##*/} in
+                (*.py | *.pyi | *.js | *.mjs | *.cjs | *.ts | *.mts | *.cts | *.sh) ;;
+                (*.*) continue ;;
+                (*)
+                    [[ -f $f && ! -L $f ]] || continue
+                    shebang=$(head -n 1 "$f")
+                    [[ $shebang =~ $interpreter ]] || continue
+                    ;;
+            esac
+            printf '%s\n' "$f"
+        done | sort | comm -23 - <(printf '%s\n' "$read_by")
+    )
+    if [[ -n $unread ]]; then
+        echo "no checker reads these: give an extensionless script its extension, else name it in a tsconfig.json include or SHELL_SOURCES" >&2
+        printf '%s\n' "$unread" >&2
+        exit 1
+    fi
+
+# Each host's own published types at its `verified_version`, the one pin, on top
+# of the committed runtime types: an install too heavy for `lint`, so CI's
+# hygiene job runs it when an input changes.
+[doc("Type-check each shipped plugin against its host's own published API")]
+[group('rust')]
+plugin-types: (_npm ".") (_npm "crates/pixtuoid/src/install")
+    #!/usr/bin/env bash
+    set -euo pipefail
+    read -ra hosts <<<"$(cargo run -q -p pixtuoid-core --example bump -- plugin-types | tr '\n' ' ')"
+    npm install --prefix crates/pixtuoid/src/install --no-save --no-audit --no-fund "${hosts[@]}"
+    node_modules/.bin/tsc -p crates/pixtuoid/src/install
+
+# An install older than its lockfile is redone; `dir`'s .npmrc fails it on any
+# install script its `allowScripts` hasn't reviewed.
+[private]
+_npm dir:
+    @[ "$1/node_modules/.package-lock.json" -nt "$1/package-lock.json" ] || npm ci --prefix "$1" --no-audit --no-fund
 
 # Clippy across the workspace, warnings denied.
 [group('rust')]
@@ -271,19 +342,9 @@ arch:
 
 # Fast, independent lint checks in parallel.
 [group('rust')]
-lint:
+lint: (_npm ".")
     #!/usr/bin/env bash
     set -euo pipefail
-    # Fail fast with an actionable message when a lint tool is missing, instead
-    # of a bare `command not found` (exit 127) buried in a parallel job's log.
-    missing=()
-    for t in {{ LINT_BREW_TOOLS }} {{ LINT_CARGO_TOOLS }}; do
-        command -v "$t" &>/dev/null || missing+=("$t")
-    done
-    if (( ${#missing[@]} )); then
-        printf 'error: missing lint tool(s): %s — run `just setup-tools`\n' "${missing[*]}" >&2
-        exit 1
-    fi
     # Per-check logs; dump only the failures so a green run stays quiet.
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
     run() { local n="$1"; shift; if "$@" >"$tmp/$n.log" 2>&1; then printf '  \033[32m✓ %s\033[0m\n' "$n"; else printf '  \033[31m✗ %s\033[0m\n' "$n"; cat "$tmp/$n.log"; return 1; fi; }
@@ -294,6 +355,7 @@ lint:
     run machete just machete            & pids+=($!)
     run deny    just deny                & pids+=($!)
     run arch    just arch                & pids+=($!)
+    run ceiling just toolchain-ceiling   & pids+=($!)
     run shfmt   just shfmt-check         & pids+=($!)
     run shell   just shellcheck           & pids+=($!)
     run actions just actionlint          & pids+=($!)
@@ -302,9 +364,14 @@ lint:
     run ci-obs  just ci-observability     & pids+=($!)
     run schemas just json-schemas         & pids+=($!)
     run links   just links               & pids+=($!)
+    run ruff    just ruff                & pids+=($!)
+    run pyright just pyright             & pids+=($!)
+    run tsc     just tsc                 & pids+=($!)
+    run census  just lang-census         & pids+=($!)
     run hookscrub just hook-scrub-selftest  & pids+=($!)
     run starhist just star-history-selftest & pids+=($!)
     run bmcbtn  just bmc-button-selftest  & pids+=($!)
+    run hmplugin just hermes-plugin-selftest & pids+=($!)
     run fixpii  just fixture-pii          & pids+=($!)
     run piiself just fixture-pii-selftest & pids+=($!)
     for p in "${pids[@]}"; do wait "$p" || fail=1; done
@@ -318,7 +385,6 @@ lint:
 [doc('Run the tests under cargo-nextest; forwards args (e.g. -p <crate> <filter>)')]
 [group('rust')]
 test *args:
-    @cargo nextest --version &>/dev/null || { echo 'error: cargo-nextest is not installed — run `just setup-tools`' >&2; exit 1; }
     @TZ={{ TEST_TZ }} cargo nextest run "$@"
 
 # The filter forwards to every target, and one matching nothing in a target is
@@ -352,28 +418,15 @@ pace-check *args:
 hack:
     #!/usr/bin/env bash
     set -euo pipefail
-    command -v cargo-hack &>/dev/null || { echo "error: cargo-hack not found — run \`just setup-tools\`" >&2; exit 1; }
     cargo hack --feature-powerset --no-dev-deps clippy --workspace -- -D warnings
     cargo clippy -p pixtuoid-scene --no-default-features --all-targets -- -D warnings
     just test -p pixtuoid-scene --no-default-features
 
-# Same toolchain gotcha as `api-surface` and `gen-wasm`, and it bites HARDER
-# here because the compiler's own advice is wrong: a Homebrew cargo ahead of the
-# rustup proxy on PATH ships only the host std, so the cross-lint dies on E0463
-# "can't find crate for `core`" while suggesting `rustup target add
-# x86_64-pc-windows-msvc` for a target rustup already has. Prepending the proxy
-# (a no-op on CI, where it is already first) fixes it; the explicit preflight
-# then owns the genuinely-missing case with an accurate message. It catches
-# cfg(windows)-only compile and lint errors locally; a string path assert still
-# fails only in `windows-test`.
+# It catches cfg(windows)-only compile and lint errors locally; a string path
+# assert still fails only in `windows-test`.
 [doc('Cross-lint the workspace for x86_64-pc-windows-msvc via clippy (no linking; ubuntu runner suffices)')]
 [group('rust')]
-check-windows:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
-    rustup target list --toolchain stable --installed | grep -q x86_64-pc-windows-msvc \
-        || { echo "needs the target: rustup target add x86_64-pc-windows-msvc" >&2; exit 1; }
+check-windows: (_targets "x86_64-pc-windows-msvc")
     cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 
 # The other-unix arms compile on none of the OSes release.yml ships, so only this
@@ -381,38 +434,14 @@ check-windows:
 # script can't probe a cross target.
 [doc('Cross-lint the workspace for x86_64-unknown-freebsd, the stand-in for every other unix (no linking)')]
 [group('rust')]
-check-other-unix:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # rustup's proxy cargo, so `--target` finds the std added below (see `check-windows`).
-    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
-    target=x86_64-unknown-freebsd
-    rustup target list --installed | grep -qx "$target" || rustup target add "$target"
-    cargo clippy --workspace --all-targets --target "$target" --no-default-features --features pixtuoid/portable -- -D warnings
-
-# Catches a dep bump (or newer stdlib use) that silently raises the floor past
-# the version we advertise to crates.io consumers of pixtuoid-core. CI-only in
-# practice (installs a pinned toolchain + a full check), NOT in preflight.
-# Reads the version from Cargo.toml so there's one source of truth.
-[doc('Check the workspace builds on the declared MSRV (rust-version in Cargo.toml)')]
-[group('rust')]
-msrv:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    msrv="$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*"([0-9]+\.[0-9]+(\.[0-9]+)?)".*/\1/')"
-    echo "declared MSRV: $msrv"
-    rustup toolchain install "$msrv" --profile minimal --no-self-update >/dev/null 2>&1 || true
-    # Clear RUSTFLAGS so the default linker is used: this gate verifies
-    # COMPILATION on the floor and must not also require the lld that
-    # `.cargo/config.toml` pins for x86_64 Linux. (RUSTFLAGS env overrides
-    # target.*.rustflags wholesale.)
-    RUSTFLAGS="" rustup run "$msrv" cargo check --workspace
+check-other-unix: (_targets "x86_64-unknown-freebsd")
+    cargo clippy --workspace --all-targets --target x86_64-unknown-freebsd --no-default-features --features pixtuoid/portable -- -D warnings
 
 # Reproduce release-plz's semver verdict LOCALLY. Not a gate and not in CI:
 # release-plz runs cargo-semver-checks itself on the release PR and RAISES the
 # bump when it finds a break, so this exists only so a human can see the same
 # answer before dispatching. Needs network for the baseline crates, and
-# cargo-semver-checks on PATH (`cargo binstall cargo-semver-checks`).
+# cargo-semver-checks on PATH.
 [doc("Reproduce release-plz's semver verdict for the published crates (local, not a gate)")]
 [group('rust')]
 semver:
@@ -439,12 +468,6 @@ api-surface mode="": _api-toolchain
     check) out=$(mktemp -d); trap 'rm -rf "$out"' EXIT ;;
     *) echo "usage: just api-surface [check]" >&2; exit 2 ;;
     esac
-    # cargo-public-api only honors RUSTUP_TOOLCHAIN when the invoked `cargo` is
-    # the rustup PROXY. A Homebrew/system cargo ahead of it on PATH ignores the
-    # env, so cargo-public-api falls back to rust-toolchain.toml's STABLE pin and
-    # dies on `-Z` (nightly-only). Prepend the rustup bin so the proxy wins (a
-    # no-op on CI, where it's already first).
-    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
     fail=0
     for crate in {{ PUBLISHED_CRATES }}; do
         RUSTUP_TOOLCHAIN={{ API_NIGHTLY }} cargo public-api -p "$crate" -s > "$out/$crate.txt"
@@ -461,35 +484,35 @@ api-surface-check: (api-surface "check")
 
 # Both halves of the goldens' reproducibility contract: refuse a mismatched
 # cargo-public-api, then self-provision the pinned nightly (rustdoc JSON is
-# nightly-only) if it isn't already installed. The minimal profile carries
-# rustdoc (bundled with rustc), all cargo-public-api needs.
+# nightly-only) if it isn't already installed, and refuse one older than
+# rust-toolchain.toml's release. The minimal profile carries rustdoc (bundled
+# with rustc), all cargo-public-api needs.
 [private]
 _api-toolchain:
     #!/usr/bin/env bash
     set -euo pipefail
-    have="$(cargo public-api --version 2>/dev/null | awk '{print $NF}' || true)"
-    if [ -z "$have" ]; then
-        echo "error: cargo-public-api not installed — goldens need {{ API_PUBLIC_API }} (just setup-tools)" >&2
-        exit 1
-    fi
+    have="$(cargo public-api --version | awk '{print $NF}')"
     if [ "$have" != "{{ API_PUBLIC_API }}" ]; then
         echo "error: cargo-public-api $have installed, goldens need {{ API_PUBLIC_API }} (just setup-tools)" >&2
         exit 1
     fi
-    command -v rustup >/dev/null || { echo "rustup not found — install {{ API_NIGHTLY }} manually for api-surface" >&2; exit 1; }
-    rustup toolchain list | grep -q '{{ API_NIGHTLY }}' && exit 0
-    echo "installing {{ API_NIGHTLY }} (api-surface needs nightly rustdoc JSON)…" >&2
-    rustup toolchain install {{ API_NIGHTLY }} --profile minimal
+    rustup toolchain list | grep -q '{{ API_NIGHTLY }}' || {
+        echo "installing {{ API_NIGHTLY }} (api-surface needs nightly rustdoc JSON)…" >&2
+        rustup toolchain install {{ API_NIGHTLY }} --profile minimal
+    }
+    just _toolchain-covers "$(rustup run {{ API_NIGHTLY }} rustc --version | cut -d' ' -f2)" API_NIGHTLY
 
-# `pixtuoid_web`'s `pub` surface is the wasm exports the site's JS calls,
+[private]
+_install-public-api:
+    cargo binstall -y cargo-public-api@{{ API_PUBLIC_API }}
+
+# The web crates' `pub` surface is the wasm exports the site's JS calls,
 # outside the workspace: hawk's `--exclude-crate` case.
 [doc('Fail on a `pub` item no other workspace crate needs (cargo-hawk; the full tier gates on it); forwards args, e.g. --fix')]
 [group('rust')]
 hawk *args: _hawk-toolchain
     #!/usr/bin/env bash
     set -euo pipefail
-    # rustup's proxy cargo, so `+{{ HAWK_RUST }}` selects the toolchain (see `check-windows`).
-    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
     bin="$PWD/target/cargo-hawk-{{ HAWK_VERSION }}"
     if [ ! -x "$bin/cargo-hawk" ]; then
         installer="$(mktemp)"
@@ -502,7 +525,7 @@ hawk *args: _hawk-toolchain
     fi
     # The `-A`: AGENTS.md's Visibility rule stops at `pub(crate)`, never private.
     PATH="$bin:$PATH" cargo +{{ HAWK_RUST }} hawk check --target-dir target/hawk \
-        --exclude-crate pixtuoid_web -D warnings -A hawk::unnecessary_restricted_visibility "$@"
+        $(printf -- '--exclude-crate %s ' {{ replace(WASM_CRATES, "-", "_") }}) -D warnings -A hawk::unnecessary_restricted_visibility "$@"
 
 [private]
 _hawk-toolchain:
@@ -510,6 +533,27 @@ _hawk-toolchain:
     set -euo pipefail
     rustup toolchain list | grep -q '^{{ HAWK_RUST }}-' \
         || rustup toolchain install {{ HAWK_RUST }} --profile minimal --no-self-update >&2
+
+# Dependabot moves rust-toolchain.toml alone, while hawk builds on HAWK_RUST, so
+# this fails that bump's PR instead of a later one leaning on the new release.
+[doc("Fail when rust-toolchain.toml pins a newer Rust minor than HAWK_RUST's")]
+[group('rust')]
+toolchain-ceiling: (_toolchain-covers HAWK_RUST "HAWK_RUST")
+
+# A dependency or API the pin admits must still build on `version`'s rustc.
+# Minors, not patches: a point release carries only accepted stable backports
+# (forge.rust-lang.org/release/backporting.html). A `1.N.0-nightly` is built
+# before 1.N branches to beta, so it lacks 1.N's later stabilizations and covers
+# only older minors (forge.rust-lang.org/release/process.html).
+[private]
+_toolchain-covers version name:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pin="$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)"
+    [[ "$pin" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || { echo "error: rust-toolchain.toml's channel '$pin' is not an exact release" >&2; exit 1; }
+    awk -v pin="$pin" -v have="{{ version }}" 'BEGIN { split(pin, p, "."); split(have, h, "."); n = have ~ /-nightly/; exit !(p[1] + 0 < h[1] + 0 || (p[1] + 0 == h[1] + 0 && (n ? p[2] + 0 < h[2] + 0 : p[2] + 0 <= h[2] + 0))) }' \
+        || { echo "error: rust-toolchain.toml pins $pin, a newer Rust minor than {{ name }}'s rustc {{ version }} covers: move {{ name }} with it" >&2; exit 1; }
 
 # Doc-rendering gate. Two things `cargo build`/`clippy`/`nextest` can't see:
 # (1) build every item's docs, private ones included, with EVERY rustdoc
@@ -525,11 +569,9 @@ _hawk-toolchain:
 # nextest does not.
 [doc('Doc gate: cargo doc (private items, bin, examples, DOC_TARGETS) with -D warnings + the doctests nextest skips (CI-only)')]
 [group('rust')]
-doc-check: _doc-targets
+doc-check: (_targets DOC_TARGETS)
     #!/usr/bin/env bash
     set -euo pipefail
-    # rustup's proxy cargo, so `--target` finds the std `_doc-targets` added (see `check-windows`).
-    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
     doc() { RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items "$@"; }
     host="$(rustc -vV | sed -n 's/^host: //p')"
     for target in "" {{ DOC_TARGETS }}; do
@@ -543,14 +585,8 @@ doc-check: _doc-targets
     cargo test --doc --workspace
 
 [private]
-_doc-targets:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    command -v rustup >/dev/null || { echo "rustup not found — add the std for {{ DOC_TARGETS }} manually for doc-check" >&2; exit 1; }
-    installed="$(rustup target list --installed)"
-    for target in {{ DOC_TARGETS }}; do
-        grep -qx "$target" <<<"$installed" || rustup target add "$target"
-    done
+_targets +targets:
+    rustup target add {{ targets }}
 
 [doc('Coverage + JUnit XML — ci-tests.yml runs it on every tier, the full one uploading it (needs llvm-cov + nextest)')]
 [group('rust')]
@@ -580,18 +616,7 @@ mutants *args:
     # check is NOT sufficient: a diff of test files plus `exclude_globs` entries
     # yields zero mutants and passes it. `--list` enumerates without running
     # (sub-second), so the pre-check is cheap.
-    #
-    # A FAILING tool and an empty result are reported separately. Folding them
-    # sends the reader to inspect their diff when the real cause is a missing
-    # cargo-mutants or an unparseable .cargo/mutants.toml — misdirection is the
-    # failure class this gate exists to remove, so it must not commit it.
-    if ! listed=$(cargo mutants --in-diff target/mutants.diff --list 2>/dev/null); then
-        echo "error: \`cargo mutants --list\` failed — the mutant count is unknown." >&2
-        echo "  Usually a missing cargo-mutants (\`cargo binstall cargo-mutants\`) or an" >&2
-        echo "  unparseable .cargo/mutants.toml. Rerunning with stderr shown:" >&2
-        cargo mutants --in-diff target/mutants.diff --list >/dev/null || true
-        exit 1
-    fi
+    listed=$(cargo mutants --in-diff target/mutants.diff --list)
     if [ -z "$listed" ]; then
         echo "error: the diff vs $base yields ZERO mutants — nothing would be tested." >&2
         echo "  Either there are no .rs changes, or every changed .rs is test code" >&2
@@ -602,15 +627,15 @@ mutants *args:
     fi
     TZ={{ TEST_TZ }} cargo mutants --in-diff target/mutants.diff "$@"
 
-# Record a conformance fixture from bytes a real CLI actually sent. Hook-only
-# sources have no persistent corpus — hook events are transient — so their
-# fixtures are the ONLY wire evidence they have, and the ones this tree has not
-# re-recorded yet were composed by hand. One BILLED model turn per run.
-# `{prompt}` expands to the shared scenario prompt; a custom one is a quoted arg.
+# Record a conformance fixture from bytes a real CLI actually sent, the CLI run
+# under a throwaway home holding only the built pixtuoid's hook for it and a
+# link to the operator's login keychain. One BILLED model turn per run. `{prompt}` expands to the shared scenario prompt; a
+# custom one is a quoted arg.
 #   just capture-fixture cursor tool-run cursor-agent -p --trust '{prompt}'
 [doc('Record a conformance fixture from a real CLI run (BILLED — one model turn)')]
 [group('rust')]
 capture-fixture source scenario *cmd:
+    cargo build --release -q -p pixtuoid -p pixtuoid-hook
     cargo run --release -q -p pixtuoid-core --example capture_fixture -- "$@"
 
 [doc('Strip every committed fixture of what no decoder reads, in place (local, unbilled)')]
@@ -627,18 +652,15 @@ corpus-all:
     #!/usr/bin/env bash
     set -uo pipefail
     cc=target/release/examples/corpus_check
-    [ -x "$cc" ] || { echo "run: just build --release --examples" >&2; exit 2; }
+    cargo build --release -q --example corpus_check -p pixtuoid-scene || exit 2
     # Read the roster BEFORE the loop: as a process substitution its exit status
     # is unobservable, so a roster that dies would feed an empty loop and the
     # census would report "everything clean" having censused nothing.
     roster="$("$cc" --roster)" || { echo "corpus_check --roster failed" >&2; exit 2; }
-    [ -n "$roster" ] || { echo "corpus_check --roster returned no rows" >&2; exit 2; }
+    [ -n "$roster" ] || { echo "roster listed no transcript sources" >&2; exit 2; }
     rc=0
-    n=0
     uncovered=()
-    while IFS=$'\t' read -r id kind; do
-        [ "$kind" = transcript ] || continue
-        n=$((n + 1))
+    while read -r id; do
         echo "── $id"
         "$cc" "$id"
         # 3 is "no corpus on this host" — never ran that CLI here. It is NOT a
@@ -650,44 +672,10 @@ corpus-all:
         *) rc=1 ;;
         esac
     done <<<"$roster"
-    # `-n "$roster"` checked the TEXT; this checks the PARSE. A roster that is
-    # non-empty but yields zero transcript rows — a column insertion, a rename of
-    # the `transcript` literal — reproduces the exact silent-empty census the
-    # guard above was added for.
-    [ "$n" -gt 0 ] || { echo "roster parsed 0 transcript rows — column layout changed?" >&2; exit 2; }
     if [ ${#uncovered[@]} -gt 0 ]; then
         echo "NOT COVERED (no local corpus): ${uncovered[*]}"
     fi
     exit "$rc"
-
-# Never-panic fuzz ONE source's transcript decoder over a JSONL corpus DIR
-# (on-demand; not in preflight/CI — points at local or public real sessions, not
-# committed data). SOURCE is a registered source name (see `registered_source_names`):
-# every line is routed through THAT source's registry line_decoder — no shape
-# guessing, so a newer source can't be silently misrouted to decode_cc_line.
-# Exits non-zero on any panic. Examples:
-#   just fuzz claude-code ~/.claude/projects   # your CC sessions (newest formats)
-#   just fuzz codex ~/.codex/sessions          # your Codex rollouts
-#   just fuzz grok ~/.grok/sessions            # grok ACP transcripts
-#   just fuzz omp ~/.omp/agent/sessions        # omp sessions
-#   # a PUBLIC real-session corpus, so drift shows up without waiting for your own
-#   # sessions to hit the shape. Its codex samples are single .json objects,
-#   # which this recipe's *.jsonl glob does not admit.
-#   git clone --depth 1 https://github.com/daaain/claude-code-log /tmp/ccl && just fuzz claude-code /tmp/ccl/dev-docs/messages
-[doc('Never-panic fuzz a source decoder over a JSONL corpus dir: just fuzz claude-code ~/.claude/projects')]
-[group('rust')]
-fuzz source dir:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    source="$1"
-    dir="$2"
-    [ -d "$dir" ] || { echo "error: corpus dir '$dir' does not exist" >&2; exit 1; }
-    # Guard the corpus BEFORE fuzzing: a dir with no .jsonl feeds the fuzzer
-    # zero lines, and it exits 0 — reporting the never-panic contract verified
-    # having tested nothing.
-    [ -n "$(find "$dir" -name '*.jsonl' -print -quit)" ] || { echo "error: no .jsonl files under '$dir' — nothing to fuzz" >&2; exit 1; }
-    cargo build --release --example decoder_fuzz -p pixtuoid-core
-    find "$dir" -name '*.jsonl' -print0 | xargs -0 cat | ./target/release/examples/decoder_fuzz "$source"
 
 # N REAL `openclaw gateway run` processes, each in its own throwaway
 # OPENCLAW_HOME on its own port, feeding one headless pixtuoid: one
@@ -713,19 +701,16 @@ hermetic-build:
 hermetic *args: hermetic-build
     cargo run --release -q -p pixtuoid-core --example hermetic -- "$@"
 
-# The nightly's bump leg: snapshots rewritten for the re-recorded fixtures,
-# then judged as CI judges them.
+# The nightly's bump leg: snapshots rewritten for the re-recorded fixtures.
 [doc('Re-record a source at a release, moving its pin, and write the bump as a patch')]
 [group('rust')]
 hermetic-bump source release out: (hermetic "--cli" release "--record" source)
     TZ={{ TEST_TZ }} INSTA_UPDATE=always INSTA_FORCE_PASS=1 cargo test -q -p pixtuoid-core --test sources
-    TZ={{ TEST_TZ }} cargo test -q -p pixtuoid-core --test sources
     cargo run --release -q -p pixtuoid-core --example bump -- patch "$1" "$3"
 
 # Compile the workspace; extra args are forwarded:
 #   just build                                # debug
 #   just build --release                      # release
-#   just build --release --bins --examples    # what ci-tests.yml's smoke job builds
 [doc('Compile the workspace; forwards args (e.g. --release --bins --examples)')]
 [group('rust')]
 build *args:
@@ -746,7 +731,7 @@ site-setup:
 [doc('Render site/public/demos when absent or its manifests changed')]
 [group('site')]
 site-demos:
-    #!/usr/bin/env sh
+    #!/usr/bin/env bash
     set -eu
     stamp=target/site-demos.inputs
     want=$(cat scripts/media.json scripts/gen-media.py site/src/themes.json site/src/weather.json | shasum | cut -d' ' -f1)
@@ -754,7 +739,6 @@ site-demos:
     # re-renders instead of passing on the inputs alone.
     have() { find site/public/demos -type f -exec cksum {} + 2>/dev/null | sort | shasum | cut -d' ' -f1; }
     [ "$(cat "$stamp" 2>/dev/null)" = "$want $(have)" ] && exit 0
-    test -x .venv/bin/python3 || { echo "needs the venv: python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt"; exit 1; }
     .venv/bin/python3 scripts/gen-media.py --only site
     mkdir -p target && echo "$want $(have)" > "$stamp"
 
@@ -773,7 +757,7 @@ site-dev: site-demos
 [doc('Dev server as a background daemon (survives stdin EOF) — waits on /_astro/status; stop: just site-dev-stop')]
 [group('site')]
 site-dev-bg: site-demos
-    #!/usr/bin/env sh
+    #!/usr/bin/env bash
     set -eu
     cd site
     node node_modules/astro/bin/astro.mjs dev --background
@@ -806,7 +790,7 @@ site-fmt:
 [doc('E2E smoke suite vs the PRODUCTION build (astro preview) — the runtime-contract gate')]
 [group('site')]
 site-e2e: gen-wasm site-demos
-    #!/usr/bin/env sh
+    #!/usr/bin/env bash
     set -eu
     cd site
     export GH_STARS_E2E=1
@@ -848,13 +832,13 @@ gen-banner-check:
     python3 scripts/gen-banner.py --selftest
     python3 scripts/gen-banner.py --check docs/images/banner
 
-# Not in `gen`: it downloads its pinned fonts.
-[doc("Regenerate the scene's Fusion Pixel faces + their licenses (crates/pixtuoid-scene/fonts/) from scripts/gen-fonts.py")]
+# Not in `gen`: it downloads its pinned fonts. Requires the .venv (fontTools).
+[doc("Regenerate Fusion Pixel 8px + its licenses for the scene (crates/pixtuoid-scene/fonts/) and the site (site/src/assets/fonts/) from scripts/gen-fonts.py")]
 [group('gen')]
 gen-fonts:
-    python3 scripts/gen-fonts.py
+    .venv/bin/python3 scripts/gen-fonts.py
 
-[doc('Sync README install/features/tools sections from site/src/*.json')]
+[doc('Sync README install/features/tools sections from site/src/*.json, and its images from scripts/media.json + docs/images')]
 [group('gen')]
 gen-readme:
     node scripts/gen-readme.mjs
@@ -878,7 +862,7 @@ gen-cutaway-golden:
     SNAPSHOTS=overwrite just test -p pixtuoid-scene --lib the_canvas_paints_the_pinned_frames
 
 # Pure node:builtins — no npm ci.
-[doc('Fail if the committed README drifted from site data (features/sources/install.json)')]
+[doc('Fail if the committed README drifted from site data (features/sources/install.json) or scripts/media.json')]
 [group('gen')]
 gen-readme-check:
     node scripts/gen-readme.mjs --check
@@ -895,75 +879,61 @@ gen-media *args:
 gen-icons:
     .venv/bin/python3 scripts/gen-pix-icons.py
 
-# The wasm-bindgen CLI must match the crate's version exactly; Cargo.lock is that authority.
+# The wasm-bindgen CLI must match the crate's version exactly; CI installs Cargo.lock's.
 [private]
 _wasm-bindgen-version:
     @awk '$0 == "name = \"wasm-bindgen\"" { getline; gsub(/"/, "", $3); print $3; found = 1 } END { exit !found }' Cargo.lock
 
 # The output is gitignored; CI builds it through .github/actions/gen-wasm.
-# Toolchain gotcha: the PATH cargo/rustc may be Homebrew's, which has NO wasm32
-# std — and even `rustup run stable cargo` fails because cargo resolves `rustc`
-# via PATH. So the recipe prepends the RUSTUP toolchain bin (via `rustup which`)
-# and invokes that cargo explicitly.
-[doc('Build pixtuoid-web (wasm) + JS glue into site/public/wasm/')]
+[doc("Build the site's wasm crates + JS glue into site/public/wasm/")]
 [group('site')]
-gen-wasm:
-    #!/usr/bin/env sh
+gen-wasm: (_targets "wasm32-unknown-unknown")
+    #!/usr/bin/env bash
     set -eu
-    want="$(just _wasm-bindgen-version)"
-    have="$(wasm-bindgen --version 2>/dev/null || true)"
-    [ "${have#wasm-bindgen }" = "$want" ] || { echo "needs wasm-bindgen-cli $want (Cargo.lock's), found ${have:-none}: cargo install wasm-bindgen-cli --locked --version $want"; exit 1; }
-    command -v wasm-opt >/dev/null || { echo "needs wasm-opt: brew install binaryen"; exit 1; }
-    command -v rustup >/dev/null || { echo "needs rustup (Homebrew rust has no wasm std)"; exit 1; }
-    rustup target list --toolchain stable --installed | grep -q wasm32-unknown-unknown \
-        || { echo "needs the wasm target: rustup target add wasm32-unknown-unknown"; exit 1; }
-    TB="$(dirname "$(rustup which --toolchain stable rustc)")"
-    PATH="$TB:$PATH" "$TB/cargo" build -p pixtuoid-web --target wasm32-unknown-unknown --profile wasm-release
-    wasm-bindgen --target web --out-dir site/public/wasm \
-        target/wasm32-unknown-unknown/wasm-release/pixtuoid_web.wasm
-    wasm-opt -Oz -o site/public/wasm/pixtuoid_web_bg.wasm site/public/wasm/pixtuoid_web_bg.wasm
+    cargo build $(printf -- '-p %s ' {{ WASM_CRATES }}) --target wasm32-unknown-unknown --profile wasm-release
+    for lib in {{ replace(WASM_CRATES, "-", "_") }}; do
+        wasm-bindgen --target web --out-dir site/public/wasm \
+            "target/wasm32-unknown-unknown/wasm-release/$lib.wasm"
+        wasm-opt -Oz -o "site/public/wasm/${lib}_bg.wasm" "site/public/wasm/${lib}_bg.wasm"
+    done
 
-# Bloat gate for the wasm the site ships. Size: the hero must stay
-# a lazy-load behind the poster, so a silent size regression (a dep pulling in
-# formatting machinery, an accidental debug build) fails loudly. The cap is on
-# the GZIPPED size, because the wire cost is what the poster is hiding.
-# Raw is REPORTED, never gated as wire: the runner prices the wasm gzipped, as
-# GitHub Pages ships it (`startPagesLikeProxy`), so site/lighthouserc.json sees raw
-# growth only as parse/compile cost (its CPU-time assertions). WIRE cost is gated
-# twice on purpose — here, naming the wasm, and there via its byte budgets under
-# simulated throttling, sized to admit a wasm AT this cap. The cap is growth
-# budget for the scene the hero runs, not a margin over today's payload, so a
-# regression shows as the printed gap shrinking, not as a red.
-[doc('Fail if the built wasm is missing or over its gzipped size cap')]
+# Bloat gate for each wasm the site ships: a silent size regression (a dep
+# pulling in formatting machinery, an accidental debug build) fails loudly. The
+# cap is on the GZIPPED size, the wire cost; raw is REPORTED, never gated as
+# wire: the runner prices the office's wasm gzipped, as GitHub Pages ships it
+# (`startPagesLikeProxy`), so site/lighthouserc.json sees raw growth only as
+# parse/compile cost (its CPU-time assertions). The office's WIRE cost is gated
+# twice on purpose — here, naming the file, and there via its byte budgets under
+# simulated throttling, sized to admit it AT this cap — because the poster hides
+# it while the hero lazy-loads. Its cap is growth budget for the scene the hero
+# runs, not a margin over today's payload, so a regression shows as the printed
+# gap shrinking, not as a red.
+[doc('Fail if a built wasm is missing or over its gzipped size cap')]
 [group('site')]
 gen-wasm-check:
-    #!/usr/bin/env sh
-    set -eu
-    W=site/public/wasm/pixtuoid_web_bg.wasm
-    # -s, not -f: an EMPTY wasm passes -f, and the ratio below divides
-    # by its size. Failing here says what is wrong; failing there says "division
-    # by 0".
-    test -s "$W" || { echo "missing or empty $W — run 'just gen-wasm'"; exit 1; }
-    # Not tuned to the last KB: this measures gzip locally while the CDN does its
-    # own.
-    CAP=524288
-    # Compress to a FILE, not through a pipe: POSIX sh has no `pipefail`, so
-    # `gzip … | wc -c` reports wc's status and a broken gzip would measure zero
-    # bytes and pass the cap unconditionally — the gate would go green exactly
-    # when it stopped working.
-    GZ=$(mktemp)
-    trap 'rm -f "$GZ"' EXIT
-    gzip -9 -c "$W" > "$GZ"
-    WIRE=$(wc -c < "$GZ" | tr -d ' ')
-    RAW=$(wc -c < "$W" | tr -d ' ')
-    test "$WIRE" -le "$CAP" || { echo "$W gzips to $WIRE bytes (> $CAP cap) — investigate the bloat"; exit 1; }
-    # Report the headroom, don't just pass silently. A ratchet you can only read
-    # at the moment it breaks gives no warning that it is about to — and a prose
-    # estimate of the size drifts unnoticed precisely because every run is green.
-    # Raw rides along with its RATIO, not bare: a bare byte count has nothing to
-    # be read against. The ratio does — it is gzipped-over-raw, so RISING means
-    # new poorly-compressible code and falling means new sprite text.
-    echo "wasm $WIRE / $CAP bytes gzipped ($((WIRE * 100 / CAP))% of cap, $(((CAP - WIRE) / 1024)) KB headroom; $RAW raw, compressing to $((WIRE * 100 / RAW))%)"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for lib in {{ replace(WASM_CRATES, "-", "_") }}; do
+        W="site/public/wasm/${lib}_bg.wasm"
+        # Not tuned to the last KB: this measures gzip locally while the CDN does its
+        # own.
+        case "$lib" in
+            pixtuoid_web) CAP=524288 ;;
+            # Fetched on the first ♩ click, which Lighthouse never makes: this cap alone gates it.
+            pixtuoid_web_music) CAP=131072 ;;
+            *) echo "no size cap for $lib"; exit 1 ;;
+        esac
+        WIRE=$(gzip -9 -c "$W" | wc -c | tr -d ' ')
+        RAW=$(wc -c < "$W" | tr -d ' ')
+        test "$WIRE" -le "$CAP" || { echo "$W gzips to $WIRE bytes (> $CAP cap) — investigate the bloat"; exit 1; }
+        # Report the headroom, don't just pass silently. A ratchet you can only read
+        # at the moment it breaks gives no warning that it is about to — and a prose
+        # estimate of the size drifts unnoticed precisely because every run is green.
+        # Raw rides along with its RATIO, not bare: a bare byte count has nothing to
+        # be read against. The ratio does — it is gzipped-over-raw, so RISING means
+        # new poorly-compressible code and falling means new sprite text.
+        echo "$lib $WIRE / $CAP bytes gzipped ($((WIRE * 100 / CAP))% of cap, $(((CAP - WIRE) / 1024)) KB headroom; $RAW raw, compressing to $((WIRE * 100 / RAW))%)"
+    done
 
 [doc('Fail if anything `just gen` writes has drifted')]
 [group('gen')]
@@ -974,9 +944,8 @@ gen-check: compare-selftest gen-readme-check gen-art-check gen-banner-check gen-
 [doc('Fail if a committed pix icon differs from what gen-pix-icons draws')]
 [group('gen')]
 gen-icons-check:
-    #!/usr/bin/env sh
+    #!/usr/bin/env bash
     set -eu
-    test -x .venv/bin/python3 || { echo "needs the venv: python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt"; exit 1; }
     .venv/bin/python3 scripts/gen-pix-icons.py --selftest
     .venv/bin/python3 scripts/gen-pix-icons.py --check
 
@@ -988,9 +957,8 @@ gen-icons-check:
 [doc("Diff the README's committed media against what gen-media renders")]
 [group('gen')]
 gen-media-check:
-    #!/usr/bin/env sh
+    #!/usr/bin/env bash
     set -eu
-    test -x .venv/bin/python3 || { echo "needs the venv: python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt"; exit 1; }
     .venv/bin/python3 scripts/gen-media.py --check --only docs
 
 # ── release ───────────────────────────────────────────────────────
@@ -1003,8 +971,7 @@ workspace-version:
     @grep -m1 '^version' Cargo.toml | cut -d'"' -f2
 
 # Pass `true` for targets that need the Docker-backed `cross` toolchain
-# (CI installs it via taiki-e/install-action with `tool: cross`); anything but true/false
-# fails loudly (the case below).
+# (CI installs it via taiki-e/install-action with `tool: cross`).
 [doc('Cross-compile a release for ONE target triple (release.yml build matrix)')]
 [group('release')]
 build-target target cross="false":
@@ -1012,15 +979,6 @@ build-target target cross="false":
     set -euo pipefail
     target="$1"
     use_cross="$2"
-    # Anything but the two legal words means the caller's positional args
-    # shifted, so fail loudly rather than infer "not true, so cargo".
-    case "$use_cross" in
-    true | false) ;;
-    *)
-        echo "error: cross must be 'true' or 'false', got '$use_cross' (positional args shifted?)" >&2
-        exit 1
-        ;;
-    esac
     # Every LINUX artifact drops `audio` (musl can't link ALSA statically; the
     # aarch64 cross image has no ALSA headers), so prebuilt Linux binaries ship
     # SILENT and Linux audio is a from-source feature (#633; see
@@ -1061,21 +1019,13 @@ deb target:
     cargo deb -p pixtuoid --no-build --no-strip --target "$1"
     cargo deb -p pixtuoid-hook --no-build --no-strip --target "$1"
 
-# The repo's NODE-side gate (no cargo): the npm package generator AND the bundled
-# OpenClaw plugin contract.
-#   - npm/generate.test.mjs — the ONLY validation of npm/generate.mjs. release.yml
-#     runs it as a hard gate right before `npm publish`, and ci-lint.yml's `npm-gen` job
-#     so a generator regression is caught at review time, not at the tag-push.
-#   - scripts/{openclaw,dsh}-plugin.test.mjs — drive each RENDERED plugin the way
-#     its CLI's loader does. The Rust side can only grep a template as a string, so
-#     this is the only place a plugin's runtime contract (never block its host /
-#     never forward content / openclaw's gateway identity, dsh's emit order) is
-#     actually EXECUTED.
-# NOT in preflight: a Rust pre-push shouldn't require a Node toolchain. Needs Node ≥ 22.
-[doc('Node gates: the npm package generator + the OpenClaw and dsh plugin contracts (CI + release; not in preflight)')]
+# The npm package generator's tests, its only run before a tag-push, and every
+# plugin's selftest, which executes it against `plugin-contract.json`; a
+# selftest is found by its name, the one the census pairs with its plugin.
+[doc('Node tests: the npm package generator and every plugin selftest (CI)')]
 [group('release')]
 npm-check:
-    node --test npm/generate.test.mjs scripts/openclaw-plugin.test.mjs scripts/dsh-plugin.test.mjs
+    node --test 'npm/*.test.mjs' 'scripts/*.test.mjs'
 
 # ── meta ──────────────────────────────────────────────────────────
 
@@ -1096,100 +1046,36 @@ preflight mode="":
     *) echo "usage: just preflight [full]" >&2; exit 2 ;;
     esac
 
-# Install the dev tools every check + recipe relies on (idempotent). Prefers
-# cargo-binstall (prebuilt) and falls back to cargo install (compiles).
+# Install the dev tools every check + recipe relies on (idempotent): mise.toml's
+# through mise, then cargo-public-api at API_PUBLIC_API's tool-exact pin.
 [doc('Install the dev tools the checks + recipes need (idempotent)')]
 [group('meta')]
 setup-tools:
     #!/usr/bin/env bash
     set -euo pipefail
-    # cargo-public-api rides API_PUBLIC_API — the tool-exact story lives there.
-    # cargo-edit: `cargo set-version --workspace` raises a release PR's version
-    # by hand for a break cargo-semver-checks cannot see
-    # (docs/CONTRIBUTING.md#releasing).
-    tools=(cargo-nextest {{ LINT_CARGO_TOOLS }} cargo-hack cargo-edit cargo-insta cargo-public-api@{{ API_PUBLIC_API }})
-    if command -v cargo-binstall &>/dev/null; then
-        cargo binstall -y "${tools[@]}"
-    else
-        echo "cargo-binstall not found — compiling from source (slow)." >&2
-        echo "brew install cargo-binstall (or cargo install cargo-binstall) to grab prebuilt binaries instead." >&2
-        cargo install "${tools[@]}"
-    fi
+    # Activate the local pre-push gate (dormant by default in a fresh clone, so CI
+    # would otherwise be the only gate), first so a failed install below cannot
+    # skip it. CI runs every gate itself, so a skipped local hook still meets
+    # them at merge.
+    git config core.hooksPath .githooks
+    mise install
     # The rust-analyzer component powers the editor / AI-agent LSP (go-to-def,
     # find-references — the tool the "change all N keying sites in lockstep"
     # invariants depend on). rust-toolchain.toml pins only rustfmt+clippy, so
     # without this the `~/.cargo/bin/rust-analyzer` rustup shim errors with
-    # "Unknown binary" and the LSP silently degrades to grep. Idempotent; skipped
-    # cleanly when rustup is absent (e.g. a distro-packaged toolchain).
-    if command -v rustup &>/dev/null; then
-        rustup component add rust-analyzer >/dev/null 2>&1 ||
-            echo "could not add the rust-analyzer component — install it for LSP support" >&2
-    fi
-    # `LINT_BREW_TOOLS`, via brew. gitleaks is among them because `just
-    # fixture-pii` is a REQUIRED gate that does not degrade to a weaker scan
-    # without it (a weaker scan is what it replaced).
-    for t in {{ LINT_BREW_TOOLS }}; do
-        command -v "$t" &>/dev/null && continue
-        if command -v brew &>/dev/null; then
-            brew install "$t" || true
-        fi
-    done
-    # Re-verify AFTER the install attempts: a `brew install` that exits 0 without
-    # putting the binary on PATH (transient failure), or no brew at all, must be
-    # caught here — not silently pass as a successful setup.
-    missing=()
-    for t in {{ LINT_BREW_TOOLS }}; do
-        command -v "$t" &>/dev/null || missing+=("$t")
-    done
-    if (( ${#missing[@]} )); then
-        echo "error: ${missing[*]} still missing after setup — install via your package manager (e.g. brew install ${missing[*]}); \`just lint\` needs it." >&2
-        exit 1
-    fi
-    # Activate the local pre-push gate (dormant by default in a fresh clone, so CI
-    # would otherwise be the only gate). Idempotent. CI runs every gate itself,
-    # so a skipped local hook still meets them at merge.
-    git config core.hooksPath .githooks
-
-# The size gate's own negative control: a size cap that stops measuring reports
-# success for any artifact at all, which no linter can see. This pins the
-# FAIL-OPEN class specifically — the pipe hazard gen-wasm-check's gzip
-# step is written around: driving the real recipe with a gzip that exits 1 must
-# red it.
-# Not covered, deliberately: the over-cap and empty-artifact arms, which would
-# have to mutate the built wasm to exercise. Their failures are loud; the
-# fail-open one is the silent class worth a test.
-[doc('Self-test the wasm size gate: prove it still reds when its measurement breaks')]
-[group('meta')]
-[private]
-wasm-check-selftest:
-    #!/usr/bin/env sh
-    set -eu
-    stub=$(mktemp -d)
-    trap 'rm -rf "$stub"' EXIT
-    printf '#!/bin/sh\nexit 1\n' > "$stub/gzip"
-    chmod +x "$stub/gzip"
-    if PATH="$stub:$PATH" just gen-wasm-check >/dev/null 2>&1; then
-        echo "wasm-check-selftest: FAIL — gen-wasm-check passed with a broken gzip;"
-        echo "  the size measurement is fail-OPEN. Did the gzip call become a pipe?"
-        exit 1
-    fi
-    just gen-wasm-check >/dev/null
-    echo "wasm-check-selftest: OK (reds on a broken measurement, greens on a real one)"
+    # "Unknown binary" and the LSP silently degrades to grep. Idempotent.
+    rustup component add rust-analyzer
+    just _install-public-api
 
 # The pixel comparator is the primitive under `gen-check` and
 # `gen-media-check`; an always-green comparator reports success for any render
-# at all. Its own recipe because it needs only Pillow, while `gen-check` needs
-# every generator's toolchain: a developer who cannot run that gate should still
-# be able to run this.
+# at all.
 [doc('Self-test the pixel comparator that gen-check and gen-media-check ride on')]
 [group('meta')]
 compare-selftest:
-    #!/usr/bin/env sh
+    #!/usr/bin/env bash
     set -eu
-    # Prefer the venv (the same Pillow gen-media.py uses), but do not require it:
-    # any python3 with Pillow answers the question this recipe asks.
-    if [ -x .venv/bin/python3 ]; then py=.venv/bin/python3; else py=python3; fi
-    "$py" scripts/compare-screenshots.py --selftest
+    .venv/bin/python3 scripts/compare-screenshots.py --selftest
 
 [doc("Self-test the git env scrub of the pre-push hook")]
 [group('meta')]
@@ -1208,6 +1094,13 @@ star-history-selftest:
 [group('meta')]
 bmc-button-selftest:
     python3 scripts/bmc-button.py --selftest
+
+# The bundled Hermes plugin, driven as hermes's loader drives it and held to
+# `plugin-contract.json`, like the JS plugins' selftests in `npm-check`.
+[doc("Self-test the Hermes plugin's runtime contract")]
+[group('meta')]
+hermes-plugin-selftest:
+    python3 scripts/hermes-plugin.test.py
 
 # The recorder refuses a capture carrying its own identity, but that check runs
 # ONCE, on the capturer's terminal. This re-scans what is actually COMMITTED, so
@@ -1266,9 +1159,8 @@ fixture-pii-selftest:
     # The RESIDUAL, pinned so it is visible rather than assumed closed: a secret
     # that lands INSIDE the wire-id allowlist's own length window (`.gitleaks.toml`) still rides the
     # allowlist. Any shape-based waiver admits a secret wearing that shape; what
-    # stops this class is `no_identity_key_holds_a_value_outside_a_pinned_exemption`,
-    # which reads the committed bytes — and an exempt capture, being outside it, is
-    # the one place a human read is still the only check.
+    # stops this class is `no_identity_key_holds_a_value`, which reads the
+    # committed bytes.
     printf '{"api_key":"msg_%s"}\n' "Kd8sQm2zXv6bTn4wRj9c" > "$d/quiet/cred-residual.txt"
     printf '/Users/dev/x\n/home/runner/work\n/home/ubuntu\n/home/linuxbrew\n/Users/Shared\nmcp__exampleThing\nC:\\Users\\Me\n/Users/dev.\n' \
         > "$d/quiet/identity.txt"
@@ -1279,8 +1171,8 @@ fixture-pii-selftest:
     printf 'Bearer short\n' > "$d/quiet/bearer.txt"
     printf 'msg_%s\n%s\n' "0123456789abcdefghij" "20260815_120000_a1b2c3" > "$d/quiet/cred.txt"
     fired() {
-        gitleaks dir "$2" -c "$1" --no-banner --redact --report-format json \
-            --report-path "$d/out.json" >/dev/null 2>&1 || true
+        gitleaks dir "$2" -c "$1" --no-banner --redact --exit-code 0 --log-level error \
+            --report-format json --report-path "$d/out.json" >/dev/null
         jq -r '[.[].File | split("/") | last] | unique | join(",")' "$d/out.json"
     }
     fail=0

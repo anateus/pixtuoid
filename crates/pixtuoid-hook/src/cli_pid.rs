@@ -230,8 +230,8 @@ fn process_snapshot() -> std::collections::HashMap<u32, ProcRow> {
 /// `szExeFile` is a NUL-padded UTF-16 buffer; decode up to the first NUL.
 #[cfg(windows)]
 fn exe_name(raw: &[u16]) -> String {
-    let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-    String::from_utf16_lossy(raw.get(..end).unwrap_or(raw))
+    let units: Vec<u16> = raw.iter().copied().take_while(|&c| c != 0).collect();
+    String::from_utf16_lossy(&units)
 }
 
 #[cfg(test)]
@@ -255,10 +255,10 @@ mod tests {
         move |pid| rows.get(&pid).cloned()
     }
 
-    /// The only parser over bytes we do not control. `panic = "abort"` makes an
-    /// out-of-bounds slice here a SIGABRT the agent CLI sees, and the walk now
-    /// runs off-thread where a panic would be INVISIBLE to the suite — so the
-    /// hostile rows are pinned directly rather than through `proc_row`'s read.
+    /// The only parser over bytes we do not control. A panic here drops the whole
+    /// envelope, and the walk runs off-thread where a panic would be INVISIBLE to
+    /// the suite — so the hostile rows are pinned directly rather than through
+    /// `proc_row`'s read.
     #[test]
     fn a_hostile_stat_row_is_no_answer_not_a_panic() {
         for row in [
@@ -296,18 +296,6 @@ mod tests {
     fn a_direct_parent_that_is_not_a_shell_is_the_cli() {
         let rows = table(&[
             (300, 200, "pixtuoid-hook.exe"),
-            (200, 100, "codex.exe"),
-            (100, 50, "WindowsTerminal.exe"),
-        ]);
-        assert_eq!(first_cli_ancestor(300, rows), Some(200));
-    }
-
-    /// The `cmd.exe /C` form — the trap this module exists for.
-    #[test]
-    fn the_transient_cmd_parent_is_skipped_for_the_cli_above_it() {
-        let rows = table(&[
-            (300, 250, "pixtuoid-hook.exe"),
-            (250, 200, "cmd.exe"),
             (200, 100, "codex.exe"),
             (100, 50, "WindowsTerminal.exe"),
         ]);

@@ -16,6 +16,10 @@ concurrency:
 permissions:
   contents: read
 
+# A tag's run restores main's caches, which would reach the builds that are
+# attested and published (https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#controlling-cache-access-with-cache-mode).
+cache-mode: none
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -25,21 +29,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history for the tag-on-main ancestry check below.
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-alsa
-      - uses: ./.github/actions/setup-gpu
-      - uses: pixtuoid/.github/.github/actions/setup-rust@main
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: cargo-nextest
-      - uses: ./.github/actions/setup-just
+      - uses: ./.github/actions/setup-tools
       - name: Validate tag commit is on main
         # A release tag pushed at an arbitrary (unreviewed) commit must not build +
-        # publish (#215). Pre-release tester tags are exempt — they test pre-merge.
+        # publish (#215). Pre-release tester tags are exempt — they test pre-merge,
+        # on a commit whose PR run gave it a ci-gate.
         if: ${{ !contains(github.ref_name, '-') }}
         run: |
           git fetch origin main --quiet
@@ -58,16 +57,17 @@ jobs:
             echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CARGO_VERSION}"
             exit 1
           fi
-      # Intentionally lighter than `just preflight full` (no lint + hack): the tag comes
-      # from main, which already passed the full CI matrix — this re-verifies
-      # fmt/clippy/tests against the exact tagged commit.
-      - run: just fmt-check
-      - run: just clippy
-      - run: just test
+
+  # Neither check above proves the commit's CI passed.
+  ci-passed:
+    needs: check
+    permissions:
+      checks: read
+    uses: ./.github/workflows/wait-ci-gate.yml
 
   build:
     name: build (${{ matrix.target }})
-    needs: check
+    needs: ci-passed
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -91,7 +91,7 @@ jobs:
           - target: aarch64-pc-windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -99,11 +99,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: ./.github/actions/setup-just
+      - uses: ./.github/actions/setup-tools
 
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cross
 
@@ -139,7 +139,7 @@ jobs:
           just stage-notices "$DIR"
           ( cd "$DIR" && 7z a "../${DIR}.zip" . )
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifact-${{ matrix.target }}
           path: |
@@ -149,7 +149,7 @@ jobs:
 
   deb:
     name: deb (${{ matrix.target }})
-    needs: check
+    needs: ci-passed
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -160,7 +160,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             cross: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -168,16 +168,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: ./.github/actions/setup-just
+      - uses: ./.github/actions/setup-tools
 
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cross
 
       - name: Install cargo-deb
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-deb
 
@@ -187,7 +187,7 @@ jobs:
       - name: Build .deb packages
         run: just deb ${{ matrix.target }}
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: deb-${{ matrix.target }}
           path: target/${{ matrix.target }}/debian/*.deb
@@ -203,13 +203,13 @@ jobs:
       id-token: write # provenance attestation (OIDC)
       attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Download artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
@@ -222,12 +222,20 @@ jobs:
       # Before the release goes public, so a failed attestation leaves a draft,
       # never a published release without provenance.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             artifacts/*.tar.gz
             artifacts/*.deb
             artifacts/*.zip
+
+      # Lets a download be verified offline (`gh attestation verify --bundle`);
+      # `*.intoto.jsonl` is the name Scorecard's Signed-Releases looks for.
+      - name: Name the attestation bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp -- "$BUNDLE" "artifacts/pixtuoid-${GITHUB_REF_NAME}.intoto.jsonl"
 
       # release-plz created this release as a DRAFT carrying the changelog, so
       # the version is never visible without its binaries. Passing neither
@@ -248,13 +256,14 @@ jobs:
             artifacts/*.deb
             artifacts/*.zip
             artifacts/sha256sums.txt
+            artifacts/*.intoto.jsonl
 
   npm:
     name: publish to npm
     # The full build matrix gates this one: an npm publish is irreversible (no
     # unpublish after 72h) and its packages ARE those binaries, so a target that
     # fails to build must not reach the registry as a missing optional dep.
-    needs: [check, build, deb]
+    needs: [build, deb]
     # Never publish a pre-release to npm — tester tags build artifacts only.
     if: ${{ !contains(github.ref_name, '-') }}
     # Its required reviewer is the publish approval, and the npm Trusted
@@ -266,23 +275,18 @@ jobs:
       contents: read
       id-token: write # npm provenance (`npm publish --provenance`)
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7 # zizmor: ignore[cache-poisoning] this publisher does not enable setup-node's package cache
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          node-version-file: mise.toml
+          # npm Trusted Publishing (#216) authenticates by OIDC only (no
+          # NODE_AUTH_TOKEN), which this triggers.
           registry-url: https://registry.npmjs.org
-      # npm Trusted Publishing (#216): node 22 bundles npm 10.x but OIDC needs
-      # >= 11.5.1, and OIDC is the only auth path (no NODE_AUTH_TOKEN) — without
-      # this upgrade the publish silently fails unauthenticated. `registry-url`
-      # above STAYS: it is what triggers npm's OIDC detection. Pinned EXACTLY, not
-      # @11 — an irreversible publish must not float with the registry.
-      - run: npm install -g npm@11.5.1 # zizmor: ignore[adhoc-packages] exact OIDC-capable npm bootstrap for trusted publishing
-      - uses: ./.github/actions/setup-just
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
@@ -290,28 +294,21 @@ jobs:
       - name: Extract binaries per target
         run: |
           set -euo pipefail
+          shopt -s nullglob
           TAG="${GITHUB_REF_NAME}"
-          # Mirrors the `build` matrix + npm/generate.mjs TARGETS; that equality is
-          # pinned by npm/generate.test.mjs (`just npm-check`).
-          for target in aarch64-apple-darwin x86_64-apple-darwin \
-                        x86_64-unknown-linux-musl aarch64-unknown-linux-gnu \
-                        x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
-            dest="npm/dist/${target}"
+          # npm/generate.mjs fails on a target whose binary is absent.
+          for tgz in artifacts/pixtuoid-"${TAG}"-*.tar.gz; do
+            target="${tgz#artifacts/pixtuoid-"${TAG}"-}"
+            dest="npm/dist/${target%.tar.gz}"
             mkdir -p "$dest"
-            tgz="artifacts/pixtuoid-${TAG}-${target}.tar.gz"
-            zip="artifacts/pixtuoid-${TAG}-${target}.zip"
-            if [ -f "$tgz" ]; then
-              tar xzf "$tgz" -C "$dest" --strip-components=1
-            elif [ -f "$zip" ]; then
-              unzip -o "$zip" -d "$dest"
-            else
-              echo "::error::missing artifact for ${target} (${tgz} / ${zip})"
-              exit 1
-            fi
+            tar xzf "$tgz" -C "$dest" --strip-components=1
           done
-
-      - name: Test the package generator
-        run: just npm-check
+          for zip in artifacts/pixtuoid-"${TAG}"-*.zip; do
+            target="${zip#artifacts/pixtuoid-"${TAG}"-}"
+            dest="npm/dist/${target%.zip}"
+            mkdir -p "$dest"
+            unzip -o "$zip" -d "$dest"
+          done
 
       - name: Generate npm packages
         run: node npm/generate.mjs --version "${GITHUB_REF_NAME#v}" --artifacts npm/dist

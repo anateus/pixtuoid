@@ -216,7 +216,7 @@ impl LightView {
     }
 
     /// Where it lifts most, in art pixels: the middle of its brightest.
-    #[cfg(all(test, feature = "cutaway-assets"))]
+    #[cfg(test)]
     pub(crate) fn peak(&self) -> (f32, f32) {
         let top = self.lift.iter().copied().max().unwrap_or(0);
         let w = usize::from(self.w.max(1));
@@ -268,8 +268,8 @@ pub(crate) fn tint_of(
         EmitterKind::NeonGlow => Some(crate::floor::neon_look(neon, theme).halo),
         // Dark themes only, as in the classic's
         // `pixel_painter::ambient::paint_ceiling_halos`: on a light one it reads as grime.
-        EmitterKind::MonitorHalo(tool) => {
-            (theme.kind == crate::theme::ThemeKind::Dark).then(|| theme.tool_glow.for_kind(tool))
+        EmitterKind::MonitorHalo(work) => {
+            (theme.kind == crate::theme::ThemeKind::Dark).then(|| theme.tool_glow.for_work(work))
         }
     }
 }

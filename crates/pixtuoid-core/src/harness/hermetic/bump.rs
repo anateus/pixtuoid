@@ -12,19 +12,15 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::{PROFILES, Profile, SHARDS, pin};
+use super::{Leg, OSES, PROFILES, Profile, legs, pin};
 use crate::harness::sources_root;
-
-/// The matrix's `os` axis, as `hermetic.yml` names it.
-const OSES: &[&str] = &["macos", "windows"];
 
 /// The file beside a run's reports naming each source that moved.
 pub const MOVED: &str = "moved.json";
 
-/// The `hermetic.yml` output the drift leg on `os` running [`SHARDS`]' `shard`th
-/// reports its [`MOVED`] rows as, counting from 1 as `--shard` does.
-fn moved_output(os: &str, shard: usize) -> String {
-    format!("moved_{os}_{shard}")
+/// The `hermetic.yml` output `leg` reports its [`MOVED`] rows as.
+fn moved_output(leg: Leg) -> String {
+    format!("moved_{}_{}", leg.os, leg.shard)
 }
 
 /// The file a bump leg writes its patch for `source` to, and check reads it from.
@@ -84,12 +80,11 @@ pub fn plan(drift: &Map<String, Value>, taken: &[String]) -> Result<Vec<Proposal
     let mut moved = Vec::new();
     for os in OSES {
         let mut rows: Vec<Moved> = Vec::new();
-        for shard in 1..=SHARDS.len() {
-            match drift.get(&moved_output(os, shard)).and_then(Value::as_str) {
+        for leg in legs().filter(|leg| leg.os == *os) {
+            match drift.get(&moved_output(leg)).and_then(Value::as_str) {
                 None | Some("") => {}
                 Some(json) => rows.extend(
-                    serde_json::from_str::<Vec<Moved>>(json)
-                        .map_err(|e| format!("{os} {shard}: {e}"))?,
+                    serde_json::from_str::<Vec<Moved>>(json).map_err(|e| format!("{leg}: {e}"))?,
                 ),
             }
         }
@@ -137,37 +132,39 @@ fn relative(abs: &Path) -> PathBuf {
     abs.strip_prefix(repo_root()).unwrap_or(abs).to_path_buf()
 }
 
-fn registry_relative() -> PathBuf {
-    relative(&pin::registry_path())
+fn descriptor_relative(source: &str) -> PathBuf {
+    relative(&pin::descriptor_path(source))
 }
 
 /// Whether a bump of `p` may change `path`, relative to the repository: the
-/// registry, its manifest lock, a file under one of its scenarios' fixtures,
-/// or one of their conformance snapshots, named as insta derives it
-/// (`conformance.rs`).
+/// pin's module, its manifest lock, a file under one of its scenarios' fixtures,
+/// or one of their conformance snapshots, under its source's home, named as
+/// insta derives it (`conformance.rs`).
 pub fn admits(p: &Profile, path: &Path) -> bool {
     if !path.components().all(|c| matches!(c, Component::Normal(_))) {
         return false;
     }
     let sources = relative(&sources_root());
-    path == registry_relative()
+    path == descriptor_relative(p.source)
         || p.manifest_lock()
             .is_some_and(|lock| path == relative(&lock))
         || p.scenarios.iter().any(|s| {
-            let fixture = sources.join(s.fixture);
+            let fixture = sources.join(s.fixture(p.source));
             let snapshot = fixture.file_name().map(|scenario| {
-                sources.join("snapshots").join(format!(
-                    "sources__conformance__{}__{}.snap",
-                    p.source,
-                    scenario.to_string_lossy()
-                ))
+                relative(&crate::harness::source_home(p.source))
+                    .join("snapshots")
+                    .join(format!(
+                        "sources__conformance__{}__{}.snap",
+                        p.source,
+                        scenario.to_string_lossy()
+                    ))
             });
             path.starts_with(&fixture) || snapshot.is_some_and(|s| path == s)
         })
 }
 
 /// Whether the tree a patch left is a bump of `p` to `version` and nothing
-/// else: every path git says `changed` [`admits`], and the registry `after`
+/// else: every path git says `changed` [`admits`], and its pin's module `after`
 /// exactly as [`pin::repinned`] writes `before`.
 ///
 /// # Errors
@@ -185,7 +182,8 @@ pub fn judge(
     };
     if after != expected {
         return Err(format!(
-            "the registry is not {}'s pin moving to {version}, and nothing else",
+            "{:?} is not {}'s pin moving to {version}, and nothing else",
+            descriptor_relative(p.source),
             p.source
         ));
     }
@@ -197,6 +195,7 @@ pub fn judge(
 
 #[cfg(test)]
 mod tests {
+    use super::super::SHARDS;
     use super::*;
     use crate::harness::hermetic::profile;
 
@@ -208,8 +207,8 @@ mod tests {
         profile("codex").expect("codex's profile")
     }
 
-    fn registry() -> String {
-        std::fs::read_to_string(pin::registry_path()).expect("registry.rs")
+    fn codex_module() -> String {
+        std::fs::read_to_string(pin::descriptor_path("codex")).expect("codex.rs")
     }
 
     fn above(p: &Profile) -> Version {
@@ -219,29 +218,25 @@ mod tests {
 
     /// The shard `source` runs in, or the first for one no profile names.
     fn shard_of(source: &str) -> usize {
-        SHARDS
-            .iter()
-            .position(|s| s.contains(&source))
-            .map_or(1, |i| i + 1)
+        super::super::shard_of(source).unwrap_or(1)
     }
 
     /// The drift job's outputs, each OS's rows as `hermetic.yml` reports them:
     /// from the leg running each row's shard.
     fn drift(legs: &[(&str, &[(&str, &str)])]) -> Map<String, Value> {
         let mut out = Map::new();
-        out.insert("runs-stem".into(), Value::from("hermetic-runs-1-1-"));
         for (os, rows) in legs {
-            for shard in 1..=SHARDS.len() {
+            for leg in super::legs().filter(|leg| leg.os == *os) {
                 let rows: Vec<Moved> = rows
                     .iter()
-                    .filter(|(source, _)| shard_of(source) == shard)
+                    .filter(|(source, _)| shard_of(source) == leg.shard)
                     .map(|(source, version)| Moved {
                         source: (*source).to_string(),
                         version: (*version).to_string(),
                     })
                     .collect();
                 let json = serde_json::to_string(&rows).expect("rows");
-                out.insert(moved_output(os, shard), Value::from(json));
+                out.insert(moved_output(leg), Value::from(json));
             }
         }
         out
@@ -288,7 +283,13 @@ mod tests {
         let next = Version::new(up.major, up.minor, up.patch + 1).to_string();
         let up = up.to_string();
         let mut silent = drift(&[("macos", &[("codex", &up)]), ("windows", &[])]);
-        silent.insert(moved_output("windows", shard_of("codex")), Value::from(""));
+        silent.insert(
+            moved_output(Leg {
+                os: "windows",
+                shard: shard_of("codex"),
+            }),
+            Value::from(""),
+        );
         for legs in [
             drift(&[("macos", &[("codex", &up)]), ("windows", &[])]),
             drift(&[("macos", &[("codex", &up)])]),
@@ -315,7 +316,10 @@ mod tests {
         .to_string();
         let mut garbled = drift(&[("macos", &[]), ("windows", &[])]);
         garbled.insert(
-            moved_output("macos", shard_of("codex")),
+            moved_output(Leg {
+                os: "macos",
+                shard: shard_of("codex"),
+            }),
             Value::from("[{\"source\":\"codex\"}]"),
         );
         for legs in [
@@ -353,38 +357,42 @@ mod tests {
         );
         for os in OSES {
             assert!(yml.contains(&format!("- {{ os: {os}, ")), "{os}'s runner");
-            for shard in 1..=SHARDS.len() {
-                assert_eq!(
-                    yml.matches(&format!("{}:", moved_output(os, shard)))
-                        .count(),
-                    2,
-                    "{os} {shard}'s rows, as the job's output and the workflow's"
-                );
-            }
+        }
+        for leg in legs() {
+            assert_eq!(
+                yml.matches(&format!("{}:", moved_output(leg))).count(),
+                2,
+                "{leg}'s rows, as the job's output and the workflow's"
+            );
         }
     }
 
     #[test]
-    fn a_bump_admits_its_registry_fixtures_and_snapshots_alone() {
+    fn a_bump_admits_its_pin_fixtures_and_snapshots_alone() {
         let p = codex();
         let sources = relative(&sources_root());
-        let fixture = sources.join(p.scenarios[0].fixture);
+        let fixture = sources.join(p.scenarios[0].fixture(p.source));
         let name = fixture.file_name().expect("a name").to_string_lossy();
-        assert!(registry_relative().is_relative());
-        assert_eq!(repo_root().join(registry_relative()), pin::registry_path());
-        assert!(admits(p, &registry_relative()));
+        assert!(descriptor_relative(p.source).is_relative());
+        assert_eq!(
+            repo_root().join(descriptor_relative(p.source)),
+            pin::descriptor_path(p.source)
+        );
+        assert!(admits(p, &descriptor_relative(p.source)));
+        assert!(!admits(p, &descriptor_relative("claude-code")));
         assert!(admits(p, &fixture.join("provenance.json")));
         let snap = format!("sources__conformance__codex__{name}.snap");
-        assert!(admits(p, &sources.join("snapshots").join(&snap)));
+        let snapshots = relative(&crate::harness::source_home("codex")).join("snapshots");
+        assert!(admits(p, &snapshots.join(&snap)));
         let other = profile("claude-code").expect("claude-code's profile");
         assert!(!admits(
             p,
             &sources
-                .join(other.scenarios[0].fixture)
+                .join(other.scenarios[0].fixture(other.source))
                 .join("provenance.json")
         ));
         let theirs = format!("sources__conformance__claude-code__{name}.snap");
-        assert!(!admits(p, &sources.join("snapshots").join(theirs)));
+        assert!(!admits(p, &snapshots.join(theirs)));
         assert!(!admits(p, &fixture.join("..").join("..").join("build.rs")));
         assert!(!admits(p, Path::new("justfile")));
         assert!(!admits(
@@ -405,15 +413,23 @@ mod tests {
     #[test]
     fn every_profile_with_a_conformance_scenario_admits_the_snapshot_insta_wrote() {
         let root = repo_root();
-        let snapshots: Vec<PathBuf> = std::fs::read_dir(sources_root().join("snapshots"))
-            .expect("the snapshots")
-            .map(|e| relative(&e.expect("an entry").path()))
+        let snapshots: Vec<PathBuf> = PROFILES
+            .iter()
+            .flat_map(|p| {
+                std::fs::read_dir(crate::harness::source_home(p.source).join("snapshots"))
+                    .into_iter()
+                    .flatten()
+                    .map(|e| relative(&e.expect("an entry").path()))
+            })
             .collect();
-        let conformance = sources_root().join("fixtures");
         let scanned = |p: &&Profile| {
-            p.scenarios
-                .iter()
-                .any(|s| sources_root().join(s.fixture).starts_with(&conformance))
+            p.scenarios.iter().any(|s| {
+                crate::harness::Capture {
+                    dir: s.fixture(p.source),
+                    source: p.source.to_string(),
+                }
+                .in_conformance()
+            })
         };
         let skipped: Vec<_> = PROFILES
             .iter()
@@ -421,7 +437,7 @@ mod tests {
             .map(|p| p.source)
             .collect();
         // omp's rounds fold their hook keys per platform, so no conformance
-        // golden holds them (`tests/sources/omp/mod.rs`).
+        // golden holds them (`tests/sources/omp.rs`).
         assert_eq!(skipped, ["omp"], "a profile left conformance");
         for p in PROFILES.iter().filter(scanned) {
             assert!(
@@ -461,18 +477,22 @@ mod tests {
     }
 
     fn fixture_path(name: &str) -> PathBuf {
-        relative(&sources_root().join(codex().scenarios[0].fixture).join(name))
+        relative(
+            &sources_root()
+                .join(codex().scenarios[0].fixture("codex"))
+                .join(name),
+        )
     }
 
     #[test]
     fn a_bump_is_judged_by_the_tree_it_left() {
-        let before = registry();
+        let before = codex_module();
         let up = above(codex());
         let after = pin::repinned(&before, codex().descriptor(), &up)
             .expect("a repin")
             .expect("a move");
         let ok = [
-            registry_relative(),
+            descriptor_relative("codex"),
             fixture_path("hook-payloads.jsonl"),
             fixture_path("new.jsonl"),
         ];
@@ -492,7 +512,7 @@ mod tests {
             judge(codex(), &up, &before, &injected, &ok).is_err(),
             "the pin, and code"
         );
-        let stray = [registry_relative(), PathBuf::from("justfile")];
+        let stray = [descriptor_relative("codex"), PathBuf::from("justfile")];
         assert!(
             judge(codex(), &up, &before, &after, &stray).is_err(),
             "a path no bump owns"

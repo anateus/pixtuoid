@@ -6,7 +6,7 @@
 //! allowlisted copy of each event into the `pixtuoid-hook` shim:
 //!
 //! ```json
-//! {"type":"session.created","location":{"directory":"/repo"},"data":{"sessionID":"ses_…","location":{"directory":"/repo"},"parentID":"ses_…","model":{"id":"…"}},"_pid":12345}
+//! {"type":"session.execution.started","data":{"sessionID":"ses_…","location":{"directory":"/repo"},"parentID":"ses_…","model":{"id":"…"}},"_pid":12345}
 //! ```
 //!
 //! The upstream facts the decode rests on, at opencode v2:
@@ -14,8 +14,11 @@
 //! - `sessionID` is on every session event and is the session's durable key,
 //!   so slots key on it.
 //! - A subagent is a child SESSION: the `subagent` tool creates it with
-//!   `parentID` (`packages/core/src/tool/plugin/subagent.ts:188-189`), so its
-//!   `session.created` links it.
+//!   `parentID` (`packages/core/src/tool/plugin/subagent.ts:188-189`), so the
+//!   record its first start carries links it.
+//! - A session registers at its first turn's start, the one signal for it: the
+//!   plugin's subscription may not be live yet when opencode publishes the
+//!   session's creation (#1934).
 //! - An event published in a location carries it on its envelope, beside
 //!   `data` (`packages/schema/src/event.ts:114`, `:138`): the recording's tool
 //!   and permission events do, its `session.execution.*` events do not.
@@ -28,12 +31,50 @@ use crate::AgentId;
 use crate::source::decoder::{
     DecodeError, DecodeResult as Result, MAX_DECODED_FIELD_CHARS, ellipsize, generic_tool_display,
 };
-use crate::source::{AgentEvent, ToolDetail};
+use crate::source::registry::{
+    ChildEndInference, FocusChannel, HookDecoding, HookObject, Hyphen, SourceCaps,
+    SourceDescriptor, SourceKind,
+};
+use crate::source::{AgentEvent, RequestKeys, ToolDetail};
+use crate::state::TurnKey;
 
 /// The opencode CLI source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "opencode";
 
-const SESSION_CREATED: &str = "session.created";
+pub(crate) const DESCRIPTOR: SourceDescriptor = SourceDescriptor {
+    name: SOURCE_NAME,
+    label_prefix: "oc",
+    verified_version: "2.2.5",
+    version_probe: Some(&["opencode", "--version"]),
+    version_hyphen: Hyphen::Prerelease,
+    home_env: None,
+    kind: SourceKind::Agent {
+        transcript: None,
+        hook: Some(HookDecoding::ClaimsAll(decode_oc_hook_payload)),
+        caps: SourceCaps {
+            // A TUI quit ends nothing: the session lives on in the server.
+            has_exit_signal: false,
+            // The next prompt's `session.execution.started` decodes to
+            // `SessionStart`.
+            resurrects_on_prompt: true,
+            // A `subagent` child is parented by its first start's `parentID`, so
+            // its events keep the parent fresh (`scope::refresh_lineage`).
+            delegations_are_hook_silent: false,
+            // A `subagent` call can return while its child runs on
+            // (`packages/core/src/tool/plugin/subagent.ts:229-243` at v2.0.32),
+            // and a session ends only by `session.deleted`.
+            child_end_inference: ChildEndInference::Durable,
+            child_hooks_unnamed: false,
+            brackets_turns: true,
+        },
+        // The plugin runs in the background server every TUI attaches to
+        // (`packages/client/src/service-contender.ts:19-20`), not in a TUI.
+        focus: FocusChannel::ServerStamp,
+    },
+    #[cfg(feature = "native")]
+    native: crate::source::registry::Native::NONE,
+};
+
 const SESSION_DELETED: &str = "session.deleted";
 const EXECUTION_STARTED: &str = "session.execution.started";
 const EXECUTION_SUCCEEDED: &str = "session.execution.succeeded";
@@ -44,17 +85,23 @@ const TOOL_SUCCESS: &str = "session.tool.success";
 const TOOL_FAILED: &str = "session.tool.failed";
 const PERMISSION_ASKED: &str = "permission.asked";
 
+/// The envelope's turn: an execution start's durable `seq`, which the plugin
+/// also stamps on that execution's settle; one whose start it never saw names
+/// none. Pinned to the plugin's key by its selftest, through
+/// `the_plugin_contract_is_the_committed_file`.
+#[doc(hidden)]
+pub const TURN: &str = "turn";
+
 /// The subagent dispatch tool (`packages/core/src/tool/plugin/subagent.ts:17`
 /// at v2.0.32).
 const DISPATCH_TOOL: &str = "subagent";
 
 /// The event types this decoder turns into events. Pinned to the arms below
 /// by `every_exported_set_is_exactly_its_dispatch_arms`, and to the plugin's
-/// `FORWARD` set by `the_plugin_forwards_exactly_what_the_decoder_reads`.
+/// forwarding by its selftest, through `the_plugin_contract_is_the_committed_file`.
 #[cfg(any(test, feature = "harness"))]
 #[doc(hidden)]
 pub const DECODED_EVENTS: &[&str] = &[
-    SESSION_CREATED,
     SESSION_DELETED,
     EXECUTION_STARTED,
     EXECUTION_SUCCEEDED,
@@ -68,8 +115,8 @@ pub const DECODED_EVENTS: &[&str] = &[
 
 /// Every `data` path `field` reads, dotted, pinned by
 /// `every_decoded_data_field_is_read`. The plugin's `allowlisted` copies these
-/// and nothing more, pinned by
-/// `the_plugin_copies_exactly_the_fields_the_decoder_reads`.
+/// and nothing more, which its selftest holds it to through
+/// `the_plugin_contract_is_the_committed_file`.
 #[cfg(any(test, feature = "harness"))]
 #[doc(hidden)]
 pub const DECODED_DATA_FIELDS: &[&str] = &[
@@ -89,12 +136,9 @@ pub const DECODED_DATA_FIELDS: &[&str] = &[
 ///
 /// # Errors
 ///
-/// If the payload is not an object or lacks `type`, or a mapped event lacks a
+/// If the payload lacks `type`, or a mapped event lacks a
 /// non-empty `data.sessionID`.
-pub(crate) fn decode_oc_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| DecodeError::not_an_object(SOURCE_NAME))?;
+pub(crate) fn decode_oc_hook_payload(obj: &HookObject) -> Result<Vec<AgentEvent>> {
     let event = obj
         .get("type")
         .and_then(Value::as_str)
@@ -107,24 +151,42 @@ pub(crate) fn decode_oc_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty());
 
+    let turn = obj.get(TURN).and_then(Value::as_u64).map(TurnKey::Seq);
     match event {
         // A new prompt re-emits SessionStart, the event that walks a swept
         // session back in, mid-walkout too. Its own `data` is only `sessionID`,
         // so the plugin adds the session's record (`ctx.session.get`).
-        SESSION_CREATED | EXECUTION_STARTED => session_start(data, at, event),
+        EXECUTION_STARTED => {
+            let mut out = session_start(data, at, event)?;
+            match turn {
+                Some(turn) => out.push(AgentEvent::TurnStart {
+                    agent_id: session(data, event)?.0,
+                    turn,
+                }),
+                None => crate::source::drift::missing_field(SOURCE_NAME, event, TURN),
+            }
+            Ok(out)
+        }
         // `data` is only `sessionID` (`packages/schema/src/session-event.ts:178`,
         // `Base`), so a child's end cannot be told from a root's here.
         SESSION_DELETED => Ok(vec![AgentEvent::SessionEnd {
             agent_id: session(data, event)?.0,
             as_child: false,
         }]),
-        // A turn's end, as cursor's `stop`: no call to pair, so it ends the
-        // session's activity rather than one tool's.
         EXECUTION_SUCCEEDED | EXECUTION_FAILED | EXECUTION_INTERRUPTED => {
-            ended(data, at, event, None)
+            ended(data, at, event, |agent_id| match turn {
+                Some(turn) => AgentEvent::keyed_turn_end(agent_id, turn),
+                None => AgentEvent::turn_end(agent_id),
+            })
         }
         TOOL_STARTED => tool_started(data, at),
-        TOOL_SUCCESS | TOOL_FAILED => ended(data, at, event, field(data, "id").map(str::to_owned)),
+        TOOL_SUCCESS | TOOL_FAILED => {
+            let tool_use_id = field(data, "id").map(str::to_owned);
+            ended(data, at, event, |agent_id| AgentEvent::ToolUseEnd {
+                agent_id,
+                tool_use_id,
+            })
+        }
         PERMISSION_ASKED => permission_asked(data, at),
         _ => Ok(vec![]),
     }
@@ -198,16 +260,10 @@ fn ended(
     data: &Map<String, Value>,
     at: Option<&str>,
     event: &str,
-    tool_use_id: Option<String>,
+    end: impl FnOnce(AgentId) -> AgentEvent,
 ) -> Result<Vec<AgentEvent>> {
     let (agent_id, session_id) = session(data, event)?;
-    Ok(vec![
-        identity(agent_id, session_id, at),
-        AgentEvent::ActivityEnd {
-            agent_id,
-            tool_use_id,
-        },
-    ])
+    Ok(vec![identity(agent_id, session_id, at), end(agent_id)])
 }
 
 /// The tool's `id` is the call id its `success`/`failed` pair on. The input
@@ -220,7 +276,7 @@ fn tool_started(data: &Map<String, Value>, at: Option<&str>) -> Result<Vec<Agent
     });
     Ok(vec![
         identity(agent_id, session_id, at),
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id,
             tool_use_id: field(data, "id").map(str::to_owned),
             detail: Some(if name == DISPATCH_TOOL {
@@ -232,7 +288,7 @@ fn tool_started(data: &Map<String, Value>, at: Option<&str>) -> Result<Vec<Agent
     ])
 }
 
-/// Waiting, labelled by the request's `action` and keyed on its tool call
+/// [`AgentEvent::UserActionRequest`], labelled by the request's `action` and keyed on its tool call
 /// (`source.id`) when it has one.
 fn permission_asked(data: &Map<String, Value>, at: Option<&str>) -> Result<Vec<AgentEvent>> {
     let (agent_id, session_id) = session(data, PERMISSION_ASKED)?;
@@ -242,11 +298,14 @@ fn permission_asked(data: &Map<String, Value>, at: Option<&str>) -> Result<Vec<A
     );
     Ok(vec![
         identity(agent_id, session_id, at),
-        AgentEvent::Waiting {
+        AgentEvent::user_action_request(
             agent_id,
-            reason,
-            tool_use_id: field(data, "source.id").map(str::to_owned),
-        },
+            Some(reason),
+            RequestKeys {
+                tool_use_id: field(data, "source.id").map(str::to_owned),
+                ..RequestKeys::default()
+            },
+        ),
     ])
 }
 
@@ -255,9 +314,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::source::decoder::test_obj;
 
     fn decode_all(v: Value) -> Vec<AgentEvent> {
-        decode_oc_hook_payload(&v).expect("decodes")
+        decode_oc_hook_payload(test_obj(&v)).expect("decodes")
     }
 
     /// The payload's MAIN event: the last decoded, after any Identity.
@@ -265,8 +325,8 @@ mod tests {
         decode_all(v).pop().expect("at least one event")
     }
 
-    fn created(data: Value) -> Value {
-        json!({"type": SESSION_CREATED, "data": data, "_pid": 13358})
+    fn started(data: Value) -> Value {
+        json!({"type": EXECUTION_STARTED, "data": data, "_pid": 13358})
     }
 
     /// [`field`]'s assertion holds every read to the list; this holds every
@@ -279,7 +339,7 @@ mod tests {
         let decoded = |ev: &str, data: &Value| {
             format!(
                 "{:?}",
-                decode_oc_hook_payload(&json!({"type": ev, "data": data}))
+                decode_oc_hook_payload(test_obj(&json!({"type": ev, "data": data})))
             )
         };
         for path in DECODED_DATA_FIELDS {
@@ -313,47 +373,11 @@ mod tests {
     }
 
     #[test]
-    fn session_created_keys_on_its_session_id_and_reads_its_location() {
-        let evs = decode_all(created(json!({
-            "sessionID": "ses_140762860ffe0d", "projectID": "prj_1", "slug": "shiny-canyon",
-            "location": {"directory": "/private/tmp/oc-capture/ws"},
-            "model": {"id": "claude-sonnet-4-5", "providerID": "anthropic"}, "version": "2.0.27"
-        })));
-        match &evs[0] {
-            AgentEvent::SessionStart {
-                agent_id,
-                source,
-                session_id,
-                cwd,
-                parent_id,
-            } => {
-                assert_eq!(source, SOURCE_NAME);
-                assert_eq!(
-                    *agent_id,
-                    AgentId::from_parts(SOURCE_NAME, "ses_140762860ffe0d")
-                );
-                assert_eq!(session_id, "ses_140762860ffe0d");
-                assert_eq!(*cwd, std::path::PathBuf::from("/private/tmp/oc-capture/ws"));
-                assert_eq!(*parent_id, None);
-            }
-            other => panic!("expected SessionStart, got {other:?}"),
-        }
-        assert!(
-            matches!(&evs[1], AgentEvent::ModelInfo { model: Some(m), effort: None, .. }
-            if m == "claude-sonnet-4-5")
-        );
-        let bare = decode_all(created(
-            json!({"sessionID": "ses_n", "location": {"directory": "/r"}}),
-        ));
-        assert_eq!(bare.len(), 1, "no model, no ModelInfo: {bare:?}");
-    }
-
-    #[test]
     fn a_subagent_session_links_to_its_parent_and_keeps_its_own_id() {
-        let parent = decode(created(
+        let parent = decode(started(
             json!({"sessionID": "ses_p", "location": {"directory": "/r"}}),
         ));
-        let child = decode_all(created(json!({
+        let child = decode_all(started(json!({
             "sessionID": "ses_c", "location": {"directory": "/r"}, "parentID": "ses_p"})));
         match &child[0] {
             AgentEvent::SessionStart {
@@ -369,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_start_is_activity_start_keyed_on_its_id() {
+    fn a_tool_start_is_tool_use_start_keyed_on_its_id() {
         let evs = decode_all(
             json!({"type": TOOL_STARTED, "location": {"directory": "/repo"},
             "data": {"sessionID": "ses_x", "assistantMessageID": "msg_1", "id": "call_abc", "name": "bash"}}),
@@ -379,7 +403,7 @@ mod tests {
             if session_id == "ses_x" && cwd.as_path() == std::path::Path::new("/repo"))
         );
         match &evs[1] {
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id,
                 tool_use_id,
                 detail,
@@ -388,7 +412,7 @@ mod tests {
                 assert_eq!(tool_use_id.as_deref(), Some("call_abc"));
                 assert_eq!(detail.as_ref().map(ToolDetail::display), Some("bash"));
             }
-            other => panic!("expected ActivityStart, got {other:?}"),
+            other => panic!("expected ToolUseStart, got {other:?}"),
         }
     }
 
@@ -408,7 +432,7 @@ mod tests {
     fn a_tool_without_a_name_degrades_to_a_question_mark() {
         let ev = decode(json!({"type": TOOL_STARTED, "data": {"sessionID": "ses_x", "id": "c"}}));
         assert!(
-            matches!(ev, AgentEvent::ActivityStart { detail: Some(d), .. } if d.display() == "?")
+            matches!(ev, AgentEvent::ToolUseStart { detail: Some(d), .. } if d.display() == "?")
         );
     }
 
@@ -419,7 +443,7 @@ mod tests {
                 "data": {"sessionID": "ses_x", "id": "call_abc"}}));
             assert!(
                 matches!(got.as_slice(), [AgentEvent::Identity { session_id, cwd: Some(_), .. },
-                    AgentEvent::ActivityEnd { tool_use_id: Some(id), .. }]
+                    AgentEvent::ToolUseEnd { tool_use_id: Some(id), .. }]
                 if session_id == "ses_x" && id == "call_abc"),
                 "{ev}: {got:?}"
             );
@@ -427,61 +451,103 @@ mod tests {
     }
 
     #[test]
-    fn an_execution_start_is_a_session_start_with_its_record_and_its_end_closes_the_turn() {
+    fn an_execution_start_is_a_session_start_with_its_record_opening_its_turn() {
         let start = decode_all(
-            json!({"type": EXECUTION_STARTED, "data": {"sessionID": "ses_c",
+            json!({"type": EXECUTION_STARTED, "turn": 7, "data": {"sessionID": "ses_c",
             "location": {"directory": "/repo"}, "parentID": "ses_p", "model": {"id": "m-1"}}}),
         );
         assert!(
             matches!(start.as_slice(), [
                 AgentEvent::SessionStart { session_id, cwd, parent_id: Some(p), .. },
                 AgentEvent::ModelInfo { model: Some(m), .. },
+                AgentEvent::TurnStart { turn: TurnKey::Seq(7), .. },
             ] if session_id == "ses_c" && cwd.as_path() == std::path::Path::new("/repo")
                 && *p == AgentId::from_parts(SOURCE_NAME, "ses_p") && m == "m-1"),
             "{start:?}"
         );
-        let bare = decode_all(json!({"type": EXECUTION_STARTED, "data": {"sessionID": "ses_c"}}));
+        let bare = decode_all(
+            json!({"type": EXECUTION_STARTED, "turn": 7, "data": {"sessionID": "ses_c"}}),
+        );
         assert!(
             matches!(
                 bare.as_slice(),
                 [
                     AgentEvent::Identity { cwd: None, .. },
-                    AgentEvent::SessionStart { .. }
+                    AgentEvent::SessionStart { .. },
+                    AgentEvent::TurnStart { .. },
                 ]
             ),
             "a start with no record is process-proven: {bare:?}"
         );
+    }
+
+    /// The plugin stamps every start with its durable `seq`, so one without it
+    /// is drift, and opens no turn.
+    #[test]
+    fn an_execution_start_naming_no_turn_opens_none_and_breadcrumbs() {
+        let logs = crate::test_capture::capture_logs(|| {
+            let got = decode_all(json!({"type": EXECUTION_STARTED,
+                "data": {"sessionID": "ses_c", "location": {"directory": "/repo"}}}));
+            assert!(
+                matches!(got.as_slice(), [AgentEvent::SessionStart { .. }]),
+                "{got:?}"
+            );
+        });
+        assert!(
+            logs.contains("missing_field") && logs.contains(TURN),
+            "{logs}"
+        );
+    }
+
+    /// A settle names its start's turn; one whose start this plugin never saw
+    /// names none, which ends whatever is open.
+    #[test]
+    fn a_settle_ends_the_turn_its_start_opened() {
         for ev in [EXECUTION_SUCCEEDED, EXECUTION_FAILED, EXECUTION_INTERRUPTED] {
-            let got = decode_all(json!({"type": ev, "data": {"sessionID": "ses_x"}}));
+            let got = decode_all(json!({"type": ev, "turn": 7, "data": {"sessionID": "ses_x"}}));
             assert!(
                 matches!(
                     got.as_slice(),
                     [
                         AgentEvent::Identity { .. },
-                        AgentEvent::ActivityEnd {
-                            tool_use_id: None,
+                        AgentEvent::TurnEnd {
+                            turn: Some(TurnKey::Seq(7)),
                             ..
                         }
                     ]
                 ),
                 "{ev}: {got:?}"
             );
+            let logs = crate::test_capture::capture_logs(|| {
+                let got = decode_all(json!({"type": ev, "data": {"sessionID": "ses_x"}}));
+                assert!(
+                    matches!(
+                        got.as_slice(),
+                        [
+                            AgentEvent::Identity { .. },
+                            AgentEvent::TurnEnd { turn: None, .. }
+                        ]
+                    ),
+                    "{ev}: {got:?}"
+                );
+            });
+            assert!(!logs.contains("missing_field"), "{ev}: {logs}");
         }
     }
 
     #[test]
-    fn a_permission_ask_is_waiting_on_its_tool_call() {
+    fn a_permission_ask_is_a_user_action_request_on_its_tool_call() {
         let evs = decode_all(json!({"type": PERMISSION_ASKED, "data": {
             "id": "per_1", "sessionID": "ses_x", "action": "bash", "resources": ["rm -rf /tmp/x"],
             "source": {"type": "tool", "messageID": "msg_1", "id": "call_abc"}}}));
         assert!(matches!(&evs[0], AgentEvent::Identity { .. }));
         assert!(
-            matches!(&evs[1], AgentEvent::Waiting { reason, tool_use_id: Some(id), .. }
-            if reason == "bash" && id == "call_abc")
+            matches!(&evs[1], AgentEvent::UserActionRequest { reason, tool_use_id: Some(id), .. }
+            if reason.as_deref() == Some("bash") && id == "call_abc")
         );
         let bare = decode(json!({"type": PERMISSION_ASKED, "data": {"sessionID": "ses_x"}}));
         assert!(
-            matches!(bare, AgentEvent::Waiting { reason, tool_use_id: None, .. } if reason == "permission")
+            matches!(bare, AgentEvent::UserActionRequest { reason, tool_use_id: None, .. } if reason.as_deref() == Some("permission"))
         );
     }
 
@@ -506,15 +572,15 @@ mod tests {
 
     #[test]
     fn malformed_payloads_are_errors_not_panics() {
-        assert!(decode_oc_hook_payload(&json!("x")).is_err());
-        assert!(decode_oc_hook_payload(&json!({"data": {"sessionID": "s"}})).is_err());
+        assert!(decode_oc_hook_payload(test_obj(&json!({"data": {"sessionID": "s"}}))).is_err());
         for ev in DECODED_EVENTS {
             assert!(
-                decode_oc_hook_payload(&json!({"type": ev, "data": {}})).is_err(),
+                decode_oc_hook_payload(test_obj(&json!({"type": ev, "data": {}}))).is_err(),
                 "{ev} without a sessionID"
             );
             assert!(
-                decode_oc_hook_payload(&json!({"type": ev, "data": {"sessionID": ""}})).is_err(),
+                decode_oc_hook_payload(test_obj(&json!({"type": ev, "data": {"sessionID": ""}})))
+                    .is_err(),
                 "{ev} with an empty sessionID"
             );
         }
@@ -523,7 +589,7 @@ mod tests {
     #[test]
     fn a_long_model_slug_is_truncated_at_the_decode_boundary() {
         let long = "m".repeat(MAX_DECODED_FIELD_CHARS + 10);
-        let evs = decode_all(created(
+        let evs = decode_all(started(
             json!({"sessionID": "s", "location": {"directory": "/r"}, "model": {"id": long}}),
         ));
         assert!(

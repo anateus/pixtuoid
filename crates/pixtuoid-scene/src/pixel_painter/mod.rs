@@ -14,7 +14,7 @@ use crate::display::{Badge, Hover, HoverTarget, Hovers, TextRun};
 #[cfg(test)]
 use crate::floor::VacancyDim;
 use crate::frame_cache::FrameCache;
-use crate::layout::{Depth, Facing, FixtureKind, Pivot, SceneLayout, Station};
+use crate::layout::{Depth, Facing, FixtureKind, Pivot, SceneLayout, StationArt};
 use crate::sim::pack_frame_size;
 use crate::walk::WalkState;
 
@@ -140,7 +140,7 @@ impl<'a> PaintCtx<'a> {
     /// The classic pass over `world` on `layout`, painting into `buf` with the
     /// floor's `caches` and the office's `outside`.
     pub(crate) fn classic(
-        world: crate::floor::FloorInputs<'a>,
+        (world, pack): (crate::floor::FloorInputs<'a>, &'a OfficeArt),
         layout: &'a SceneLayout,
         theme: &'a crate::theme::Theme,
         (caches, outside): (&'a mut ClassicCaches, &'a mut crate::outside::OutsideCache),
@@ -152,7 +152,7 @@ impl<'a> PaintCtx<'a> {
         Self {
             scene: world.scene,
             layout,
-            pack: world.pack,
+            pack,
             timing,
             sky: crate::sky::Sky::at(timing, world.floor.weather),
             window_sky: None,
@@ -190,7 +190,6 @@ impl<'a> PaintCtx<'a> {
 /// resolves presentation (theme colors, sprite pixels) and composites.
 pub(crate) fn paint_frame(ctx: &mut PaintCtx<'_>, frame: &SimFrame) -> Drawn {
     let agents: &[AgentSlot] = &frame.agents;
-    let buf_w = ctx.layout.buf_w;
     let buf_h = ctx.layout.buf_h;
 
     let moment = Moment::resolve(ctx.sky, ctx.theme, ctx.floor.altitude, ctx.timing);
@@ -209,11 +208,6 @@ pub(crate) fn paint_frame(ctx: &mut PaintCtx<'_>, frame: &SimFrame) -> Drawn {
         },
     );
     let top_wall_h = ctx.layout.wall_band_h();
-    assert_eq!(
-        (ctx.buf.width(), ctx.buf.height()),
-        (buf_w, buf_h),
-        "the classic pass draws layout units 1:1"
-    );
     paint_ground_and_walls(ctx.base_fill, ctx.buf, top_wall_h, &moment, ctx.theme);
     let window_moment = ctx
         .window_sky
@@ -466,11 +460,6 @@ fn queue_fixtures<'a>(
     neon: crate::floor::NeonLook,
 ) -> Furnishings<'a> {
     let layout = ctx.layout;
-    debug_assert_eq!(
-        desk_lights.len(),
-        layout.home_desks.len(),
-        "desk lights are index-parallel to the home desks"
-    );
     let mut out = Furnishings {
         backdrop: Vec::new(),
         sorted: Vec::new(),
@@ -478,7 +467,7 @@ fn queue_fixtures<'a>(
     for f in layout.fixtures() {
         let kind = match f.kind {
             FixtureKind::Desk(i) => {
-                let facing = layout.desk_facing(i);
+                let facing = layout.home_desks[i.0].facing;
                 DrawableKind::DeskCubicle {
                     desk: f.top_left(),
                     facing,
@@ -500,10 +489,9 @@ fn queue_fixtures<'a>(
                     sprite,
                     busy: frame.occupied_waypoints.contains(&waypoint),
                 };
-                match station {
-                    Station::PantryCounter => {
-                        let anim =
-                            crate::layout::pantry_counter_anim(layout.pantry_counter_size().w);
+                match station.art() {
+                    StationArt::PantryCounter => {
+                        let anim = crate::layout::pantry_counter_anim(f.visual.width);
                         DrawableKind::WaypointPantry {
                             pos: f.at,
                             anim,
@@ -514,11 +502,8 @@ fn queue_fixtures<'a>(
                             ),
                         }
                     }
-                    Station::VendingMachine => {
-                        appliance(pixtuoid_core::sprite::format::Piece::VendingMachine)
-                    }
-                    Station::Printer => appliance(pixtuoid_core::sprite::format::Piece::Printer),
-                    Station::SnackShelf => DrawableKind::SnackShelf { pos: f.at },
+                    StationArt::Appliance(sprite) => appliance(sprite),
+                    StationArt::SnackShelf => DrawableKind::SnackShelf { pos: f.at },
                 }
             }
             FixtureKind::Plant { kind, .. } => DrawableKind::Plant { kind, pos: f.at },

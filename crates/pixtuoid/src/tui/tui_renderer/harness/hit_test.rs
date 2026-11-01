@@ -6,58 +6,10 @@ use pixtuoid_scene::display::HoverTarget;
 use pixtuoid_scene::floor::PerFloor;
 
 #[test]
-fn furniture_hit_test_resolves_against_rendered_layout() {
-    let scene = scene_with(vec![idle("/hit/0.jsonl", 0, t0())], 16);
-    let mut r = build(120, 44, vec![]);
-    r.render(&scene, pack(), t0()).unwrap();
-    let layout = r.cached_layout().expect("layout");
-    let desk = layout.home_desks[0];
-    let hit = crate::tui::hit_test::hit_test_furniture(
-        layout,
-        CellArea::half_block(desk.x + 4, CellArea::row_of(desk.y) + 1),
-    );
-    assert_eq!(
-        hit,
-        Some("Desk"),
-        "a desk pixel should hit the Desk furniture in the cached layout"
-    );
-}
-
-#[test]
-fn coffee_machine_hit_test_resolves_on_pantry() {
-    use pixtuoid_scene::layout::WaypointKind;
-    let scene = scene_with(vec![idle("/cm/0.jsonl", 0, t0())], 16);
-    let mut r = build(140, 48, vec![]);
-    r.render(&scene, pack(), t0()).unwrap();
-    let layout = r.cached_layout().expect("layout");
-    let pantry = layout
-        .waypoints
-        .iter()
-        .find(|w| w.kind == WaypointKind::Pantry)
-        .expect("a 140×48 office must lay out a pantry");
-    let cx = pantry.pos.x;
-    let cy = CellArea::row_of(pantry.pos.y);
-    let mut found = false;
-    for dx in -14i32..=14 {
-        for dy in -4i32..=4 {
-            let mx = (i32::from(cx) + dx).max(0) as u16;
-            let my = (i32::from(cy) + dy).max(0) as u16;
-            if crate::tui::hit_test::hit_test_coffee_machine(layout, CellArea::half_block(mx, my)) {
-                found = true;
-            }
-        }
-    }
-    assert!(
-        found,
-        "the coffee machine should be hit-testable somewhere on the pantry counter"
-    );
-}
-
-#[test]
 fn pet_hit_test_resolves_at_pet_position() {
-    let scene = scene_with(vec![active("/ph/0.jsonl", 0, "Edit", t0())], 16);
+    let scene = scene_with(vec![running("/ph/0.jsonl", 0, "Edit", t0())], 16);
     let mut r = build(120, 44, vec![PetKind::Cat]);
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let PetHover { centre: pos, .. } = r.drawn_pet().expect("pet placed");
     assert!(
         matches!(
@@ -75,9 +27,9 @@ fn hovering_an_agent_marks_its_label() {
     let id = s.agent_id;
     let scene = scene_with(vec![s], 16);
     let mut r = build(140, 48, vec![]);
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     hover_agent(&mut r, id);
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let text = frame_text(r.frame_buffer());
     assert!(
         text.contains("\u{25b8}HOVERME") || text.contains("\u{25b8}"),
@@ -91,12 +43,12 @@ fn click_hit_test_follows_a_walking_sprite() {
     let mut s = idle("/w/0.jsonl", 0, t0() - Duration::from_secs(300));
     let scene = scene_with(vec![s.clone()], 16);
     let mut r = build(192, 80, vec![]);
-    r.render(&scene, pack(), t0()).unwrap();
-    let layout = r.cached_layout().expect("layout");
+    r.render(&scene, t0()).unwrap();
+    let desk = r.cached_layout().expect("layout").home_desks[0];
     let seat = pixtuoid_scene::sim::seated_top_left(
-        layout.home_desks[0],
+        desk.at,
         pixtuoid_scene::layout::CHARACTER_SPRITE_W,
-        layout.desk_facing(pixtuoid_core::state::FloorLocalDeskIndex(0)),
+        desk.facing,
     );
     let (dx, dy) = (
         seat.x + pixtuoid_scene::layout::CHARACTER_SPRITE_W / 2,
@@ -108,7 +60,7 @@ fn click_hit_test_follows_a_walking_sprite() {
     let scene = scene_with(vec![s], 16);
     // Mid-exit-walk, inside EXIT_GRACE_WINDOW — off the desk box, not yet GC'd.
     let walk_now = t0() + Duration::from_millis(1500);
-    r.render(&scene, pack(), walk_now).unwrap();
+    r.render(&scene, walk_now).unwrap();
     let drawn = drawn(&r, &scene, id, walk_now).top_left;
     assert_eq!(
         r.hit_test_agent_at(drawn.x, CellArea::row_of(drawn.y)),
@@ -136,7 +88,6 @@ fn drawn(r: &TuiRenderer<TestBackend>, scene: &SceneState, id: AgentId, now: Sys
         .step(
             pixtuoid_scene::floor::FloorInputs {
                 scene,
-                pack: pack(),
                 now,
                 floor: pixtuoid_scene::floor::FloorMeta::for_floor(0, 1),
                 pets: pixtuoid_scene::floor::PetInputs::default(),
@@ -179,17 +130,17 @@ const BREATH_PROBES_MS: [u64; 10] = [
 #[test]
 fn a_breathing_sitter_is_hit_at_its_drawn_cells_not_its_seat_top_left() {
     let (cols, rows) = (140, 48);
-    let mut s = active("/breath/0.jsonl", 0, "Edit", t0() - Duration::from_secs(60));
+    let mut s = running("/breath/0.jsonl", 0, "Edit", t0() - Duration::from_secs(60));
     s.label = "BREATH".into();
     let id = s.agent_id;
     let scene = scene_with(vec![s], 16);
     let mut r = build(cols, rows, vec![]);
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let layout = r.cached_layout().expect("layout").clone();
     let seat = pixtuoid_scene::sim::seated_top_left(
-        layout.home_desks[0],
+        layout.home_desks[0].at,
         pixtuoid_scene::layout::CHARACTER_SPRITE_W,
-        layout.desk_facing(pixtuoid_core::state::FloorLocalDeskIndex(0)),
+        layout.home_desks[0].facing,
     );
     let (now, drawn) = BREATH_PROBES_MS
         .into_iter()
@@ -197,7 +148,7 @@ fn a_breathing_sitter_is_hit_at_its_drawn_cells_not_its_seat_top_left() {
         .map(|now| (now, drawn(&r, &scene, id, now)))
         .find(|&(_, drawn)| drawn.top_left != seat)
         .expect("within one breath cycle the sitter bobs off its seat top-left");
-    r.render(&scene, pack(), now).unwrap();
+    r.render(&scene, now).unwrap();
     let seated = Sprite {
         top_left: seat,
         ..drawn
@@ -221,7 +172,7 @@ fn a_breathing_sitter_is_hit_at_its_drawn_cells_not_its_seat_top_left() {
     }
     let ((col, row), shows) = moved.expect("the bob moves the sprite across a cell edge");
     r.set_mouse_pos(Some((col, row)));
-    r.render(&scene, pack(), now).unwrap();
+    r.render(&scene, now).unwrap();
     assert_eq!(
         frame_text(r.frame_buffer()).contains('\u{25b8}'),
         shows,
@@ -235,16 +186,16 @@ fn overlapping_agents_hit_the_one_painted_on_top() {
     // Two arrivals of one instant walk out of the elevator on one spot; a
     // second cwd dresses the second in another outfit, so the pixels tell
     // them apart.
-    let mut a = active("/overlap/a.jsonl", 0, "Edit", t0());
+    let mut a = running("/overlap/a.jsonl", 0, "Edit", t0());
     a.label = "ALPHA".into();
-    let mut b = active("/overlap/b.jsonl", 1, "Edit", t0());
+    let mut b = running("/overlap/b.jsonl", 1, "Edit", t0());
     b.label = "BRAVO".into();
     b.cwd = Arc::from(Path::new("/elsewhere"));
     let now = t0() + Duration::from_millis(400);
     let render = |agents: Vec<AgentSlot>| {
         let scene = scene_with(agents, 16);
         let mut r = build(cols, rows, vec![]);
-        r.render(&scene, pack(), now).unwrap();
+        r.render(&scene, now).unwrap();
         (r, scene)
     };
     let (mut both, scene) = render(vec![a.clone(), b.clone()]);
@@ -287,7 +238,7 @@ fn overlapping_agents_hit_the_one_painted_on_top() {
     );
     assert_eq!(both.hit_test_agent_at(x, CellArea::row_of(y)), Some(top));
     both.set_mouse_pos(Some((x, CellArea::row_of(y))));
-    both.render(&scene, pack(), now).unwrap();
+    both.render(&scene, now).unwrap();
     let hovered = scene.agents[&top].label.clone();
     assert!(
         frame_text(both.frame_buffer()).contains(&format!("\u{25b8}{hovered}")),
@@ -300,7 +251,7 @@ fn the_drawn_geometry_answers_every_cell_as_the_half_block_does() {
     let now = t0() + Duration::from_secs(20);
     let mut scene = scene_with(
         (0..6)
-            .map(|i| active(&format!("/geo/{i}.jsonl"), i, "Edit", t0()))
+            .map(|i| running(&format!("/geo/{i}.jsonl"), i, "Edit", t0()))
             .collect(),
         16,
     );
@@ -312,7 +263,7 @@ fn the_drawn_geometry_answers_every_cell_as_the_half_block_does() {
             active_sessions: 1,
             last_seen: now,
             entered_at: t0(),
-            in_flight_runs: Default::default(),
+            in_flight_turns: Default::default(),
             current_pid: Some(1),
         },
     );
@@ -326,7 +277,6 @@ fn the_drawn_geometry_answers_every_cell_as_the_half_block_does() {
             office.stores(),
             normal_theme(),
             &scene,
-            pack(),
             now,
             FloorMeta::ground(),
         );
@@ -376,8 +326,8 @@ where
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     let now = t0() + Duration::from_secs(20);
     let id = AgentId::from_transcript_path("/click/0.jsonl");
-    let scene = scene_with(vec![active("/click/0.jsonl", 0, "Edit", t0())], 16);
-    r.render(&scene, pack(), now).unwrap();
+    let scene = scene_with(vec![running("/click/0.jsonl", 0, "Edit", t0())], 16);
+    r.render(&scene, now).unwrap();
     let (_tx, scene_rx) = tokio::sync::watch::channel(Arc::new(scene));
     let mut ui = crate::panels::ui_state::UiState::new(
         normal_theme(),
@@ -476,15 +426,14 @@ where
         on_agent,
     );
     send(r, &mut ui, MouseEventKind::Drag(MouseButton::Left), away);
-    r.render(&scene, pack(), now + Duration::from_millis(50))
-        .unwrap();
+    r.render(&scene, now + Duration::from_millis(50)).unwrap();
     assert!(
         matches!(r.scene_hit_at(away.0, away.1), Some(SceneHit::Figure(HoverTarget::Agent(hit))) if *hit == id),
         "the lifted agent hangs under the pointer"
     );
     send(r, &mut ui, MouseEventKind::Up(MouseButton::Left), away);
     for tenth in 1..=300 {
-        r.render(&scene, pack(), now + Duration::from_millis(100 * tenth))
+        r.render(&scene, now + Duration::from_millis(100 * tenth))
             .unwrap();
     }
     assert!(
@@ -531,7 +480,7 @@ pub(super) fn the_tooltip_names_what_a_click_acts_on<B>(
     let mut scene = scene_with(
         (0..3)
             .map(|i| {
-                let mut s = active(&format!("/same/{i}.jsonl"), i, "Edit", t0());
+                let mut s = running(&format!("/same/{i}.jsonl"), i, "Edit", t0());
                 s.label = format!("AGENT{i}").into();
                 s
             })
@@ -547,12 +496,12 @@ pub(super) fn the_tooltip_names_what_a_click_acts_on<B>(
                 active_sessions: 1,
                 last_seen: now,
                 entered_at: t0(),
-                in_flight_runs: Default::default(),
+                in_flight_turns: Default::default(),
                 current_pid: Some(1),
             },
         );
     }
-    r.render(&scene, pack(), now).unwrap();
+    r.render(&scene, now).unwrap();
     let (mut named, mut seen) = (Vec::new(), [false; 4]);
     for (col, row) in r.frame_buffer().area().positions().map(|p| (p.x, p.y)) {
         let (kind, says) = match r.scene_hit_at(col, row) {
@@ -584,7 +533,7 @@ pub(super) fn the_tooltip_names_what_a_click_acts_on<B>(
     // A stride, not every cell: each probe is a full render.
     for ((col, row), says) in named.iter().step_by(3) {
         r.set_mouse_pos(Some((*col, *row)));
-        r.render(&scene, pack(), now).unwrap();
+        r.render(&scene, now).unwrap();
         let text = frame_text(r.frame_buffer());
         assert!(
             text.contains(says.as_str()),

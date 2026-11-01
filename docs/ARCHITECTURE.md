@@ -9,7 +9,7 @@ How a running coding-agent session becomes a moving sprite in the office.
 
 ## The shape of it
 
-pixtuoid is a Cargo workspace of **five crates** wired as a strict
+pixtuoid is a Cargo workspace of **six crates** wired as a strict
 **producer → reducer → renderer** pipeline:
 
 - **`pixtuoid-core`** — the headless library: sources and decoders, the
@@ -24,14 +24,15 @@ pixtuoid is a Cargo workspace of **five crates** wired as a strict
   window.
 - **`pixtuoid-web`** — the third painter: a publish-excluded wasm crate
   rendering the same engine into a browser `<canvas>` (the site's live hero),
-  with `native` (core's async runtime) disabled so the pure
-  decode/reduce core compiles to wasm32.
+  with `native` (core's async runtime) off so core compiles to wasm32.
+- **`pixtuoid-web-music`** — the site's ♩ lofi stream, in a publish-excluded
+  wasm of its own that only the site's music worker loads.
 - **`pixtuoid-hook`** — a tiny shim your coding agent invokes per hook event:
   stdin JSON → a local IPC endpoint (Unix socket / named pipe), and it
   **always exits 0** so it can never block your agent.
 
 Dependency direction is one-way: `pixtuoid-core ← pixtuoid-scene ←
-{pixtuoid, pixtuoid-web}`. The engine's frame entry (`look::render`) is the
+{pixtuoid, pixtuoid-web, pixtuoid-web-music}`. The engine's frame entry (`look::render`) is the
 inversion point that keeps the core terminal-free — the same entry drives the
 terminal, the desktop window, and the browser canvas, in either look.
 
@@ -57,7 +58,7 @@ flowchart TB
 
   subgraph core["pixtuoid-core (headless)"]
     L["HookRouter<br/>(shared socket: Unix / named pipe)"]
-    D["decode_hook_payload"]
+    D["decode_hook_object"]
     J["JsonlWatcher · walk_jsonl"]
     R["Reducer::apply<br/>(Transport-tagged)"]
     AP["apply_presence<br/>(AgentId-free · bypasses Reducer)"]
@@ -93,7 +94,7 @@ flowchart TB
 **Walking the pipeline:**
 
 1. **Ingest.** A hook event rides the shim (enriched, watchdog-bounded, exit
-   0) to `HookSocketListener`, where `decode_hook_payload` turns it into
+   0) to `HookSocketListener`, where `decode_hook_object` turns it into
    `AgentEvent`s. In parallel, `JsonlWatcher` tails each agent's transcript
    (a first-sight gate keeps historical sessions from resurrecting) and
    decodes lines via that source's own decoder.
@@ -123,7 +124,7 @@ Load-bearing — see `AGENTS.md` and the nested crate guides before changing:
   per-source format knowledge lives in that source's own decoders. Hook-only
   CLIs are the documented exception: registry rows with `transcript: None`, a
   custom hook decoder, and an install target.
-- **Cross-source facts live in ONE registry row** (`SourceDescriptor`):
+- **Cross-source facts live in ONE registry row** (its module's `DESCRIPTOR`):
   prefix, decoders, hook decoding, capability flags. The reducer derives
   lifecycle policy from the flags — it never matches CLI names.
 - **Events flow through one tagged channel**; producers tag their own events.

@@ -1,6 +1,6 @@
 //! The cutaway as terminal images: a frame's changed tiles are encoded in the
-//! plan's protocol and written after ratatui's flush, once the frame's text
-//! cells are known.
+//! plan's protocol, kitty's written before ratatui's flush and SIXEL's and
+//! iTerm2's after it, once the frame's text cells are known.
 //!
 //! - kitty shows every tile through Unicode placeholders, which are ordinary
 //!   text, so a modal or tooltip drawn after them takes their cells as any
@@ -23,7 +23,7 @@ use pixtuoid_scene::screen::Admit;
 use ratatui::buffer::{Buffer, Cell, CellDiffOption};
 use ratatui::layout::{Position, Rect};
 
-use crate::graphics::tiles::{Carve, Changed, Tile, Tiles};
+use crate::graphics::tiles::{Carve, Changed, Tiles};
 use crate::graphics::{CellSize, ImageProtocol, cutaway_fit, iterm2, kitty, sixel};
 use crate::jank::FrameSend;
 use crate::tui::geometry::SceneGeometry;
@@ -32,9 +32,14 @@ use pixtuoid_scene::render_scale::PixelFit;
 /// Where the transmits go: the terminal ratatui's backend also writes to.
 pub(crate) type Sink = Box<dyn Write + Send>;
 
-/// What an image cell holds before the frame's text is drawn: a cell still
-/// equal to it afterwards is image, any other is text.
-const SENTINEL: &str = "\u{F8FF}";
+/// What an image cell no kitty placeholder names holds before the frame's
+/// text is drawn: a symbol no text sets, which ratatui's diff skips, so the
+/// flush never blanks the pixels.
+static SENTINEL: Cell = {
+    let mut cell = Cell::new("\u{F8FF}");
+    cell.set_diff_option(CellDiffOption::Skip);
+    cell
+};
 
 /// What a frame's tiles are cut for: the scene's cells, each `cell` big, and
 /// the office fitted over them.
@@ -96,9 +101,6 @@ pub(crate) struct TileCutaway {
     in_grid: &'static AtomicBool,
     /// When the last transmits were written, for the protocol's cadence.
     sent_at: Option<SystemTime>,
-    /// This frame's written transmits, counted as shown once the frame
-    /// lands ([`Self::landed`]).
-    landing: Option<Landing>,
     /// What the last frame's transmits did, for its jank report.
     last: FrameSend,
     /// The cores a frame's encode splits across: the platform's, or a test's
@@ -113,13 +115,6 @@ struct Pending {
     due: bool,
 }
 
-/// Transmits written into the frame; the cadence restarts from `at` when
-/// there were any.
-struct Landing {
-    sent: Vec<Changed>,
-    at: Option<SystemTime>,
-}
-
 impl std::fmt::Debug for TileCutaway {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TileCutaway")
@@ -128,7 +123,6 @@ impl std::fmt::Debug for TileCutaway {
             .field("route", &self.route)
             .field("origin", &self.origin)
             .field("pending", &self.pending.as_ref().map(|p| p.tiles.len()))
-            .field("landing", &self.landing.as_ref().map(|l| l.sent.len()))
             .finish_non_exhaustive()
     }
 }
@@ -164,7 +158,6 @@ impl TileCutaway {
             pending: None,
             in_grid: &crate::graphics::IN_GRID,
             sent_at: None,
-            landing: None,
             last: FrameSend::default(),
             cores: pixtuoid_scene::par::cores(),
         }
@@ -301,35 +294,35 @@ impl TileCutaway {
 
     /// Send kitty's tiles before ratatui's flush, so the placeholders it
     /// writes find their images there.
-    pub(crate) fn before_flush(&mut self, now: SystemTime) {
+    pub(crate) fn before_flush(&mut self, now: SystemTime) -> std::io::Result<()> {
         if self.route.protocol() == ImageProtocol::Kitty {
-            self.send(now);
+            self.send(now)?;
         }
+        Ok(())
     }
 
     /// Send SIXEL's or iTerm2's tiles after ratatui's flush, each carved
     /// around the text cells `carves` marks: only then are they known. A tile
     /// whose text moved is sent again, to give the cells text left back to
     /// the image.
-    pub(crate) fn after_flush(&mut self, carves: &[Carve], now: SystemTime) {
+    pub(crate) fn after_flush(&mut self, carves: &[Carve], now: SystemTime) -> std::io::Result<()> {
         if self.route.protocol() == ImageProtocol::Kitty {
-            return;
+            return Ok(());
         }
         if let Some(pending) = self.pending.as_mut().filter(|p| p.due) {
             pending.tiles = self.tiles.carved(&pending.tiles, carves);
         }
-        self.send(now);
+        self.send(now)
     }
 
-    /// Encode and write the queued tiles, to land with the frame. A write
-    /// the sink refuses is logged and leaves its tiles owed.
-    fn send(&mut self, now: SystemTime) {
+    /// Encode and write the queued tiles, to land with the frame, counting them
+    /// as shown: a frame that fails to land ends the run.
+    fn send(&mut self, now: SystemTime) -> std::io::Result<()> {
         let Some(Pending { tiles: send, .. }) = self.pending.take() else {
-            return;
+            return Ok(());
         };
         if send.is_empty() {
-            self.wrote(send, None);
-            return;
+            return Ok(());
         }
         match self.route.protocol() {
             ImageProtocol::Kitty => {
@@ -345,49 +338,23 @@ impl TileCutaway {
                 self.in_grid.store(true, Ordering::Relaxed)
             }
         }
-        let mut wrote = Ok(());
         let begun = Instant::now();
         let encoded =
             tracing::trace_span!("tiles.encode").in_scope(|| self.encoder().encode_all(&send));
         self.last.encode = begun.elapsed();
         let mut sent = Vec::with_capacity(send.len());
         for (c, bytes) in send.into_iter().zip(encoded) {
-            if wrote.is_err() {
-                break;
-            }
             if let Some(bytes) = bytes {
-                wrote = tracing::trace_span!("tile.write").in_scope(|| self.out.write_all(&bytes));
+                tracing::trace_span!("tile.write").in_scope(|| self.out.write_all(&bytes))?;
                 self.last.bytes += bytes.len() as u64;
                 sent.push(c);
             }
         }
-        let flushed = wrote.and_then(|()| self.out.flush());
+        self.out.flush()?;
         self.last.sent = sent.len();
-        match flushed {
-            Ok(()) => self.wrote(sent, Some(now)),
-            Err(e) => tracing::warn!(error = %e, "image transmit failed"),
-        }
-    }
-
-    /// A write went out with the frame: its transmits show once the frame
-    /// lands ([`Self::landed`]).
-    fn wrote(&mut self, sent: Vec<Changed>, at: Option<SystemTime>) {
-        self.landing = Some(Landing { sent, at });
-    }
-
-    /// The frame reached the terminal: its transmits are shown.
-    pub(crate) fn landed(&mut self) {
-        if let Some(Landing { sent, at }) = self.landing.take() {
-            if at.is_some() {
-                self.sent_at = at;
-            }
-            self.tiles.sent(&sent);
-        }
-    }
-
-    /// The frame never reached the terminal: nothing it wrote is shown.
-    pub(crate) fn lost(&mut self) {
-        self.landing = None;
+        self.sent_at = Some(now);
+        self.tiles.sent(&sent);
+        Ok(())
     }
 
     /// What encodes this frame's tiles, apart from the sink no thread shares.
@@ -427,54 +394,57 @@ impl TileCutaway {
     }
 
     /// Show every tile in `scene`'s cells of `buf`, before the frame's text
-    /// is drawn: kitty's placeholders, or for SIXEL and iTerm2 a
-    /// [`SENTINEL`] ratatui's diff skips, so the flush never blanks the
-    /// pixels.
+    /// is drawn: each cell [placed](place_image_cell) as kitty's placeholder,
+    /// or for SIXEL and iTerm2 as the [`SENTINEL`].
     pub(crate) fn place(&self, buf: &mut Buffer, scene: Rect) {
         if self.route.protocol() == ImageProtocol::Kitty {
-            let tiles = self
-                .tiles
-                .all()
-                .filter_map(|tile| kitty::placeholders(kitty::image_id(self.base, tile)?, tile));
-            for p in tiles.flatten() {
-                if let Some(cell) = image_cell(buf, scene, p.col, p.row) {
-                    cell.reset();
-                    cell.set_symbol(&p.symbol).set_fg(p.fg);
-                }
+            for (at, placeholder) in self.placeholders() {
+                place_image_cell(buf, scene, at, &placeholder);
             }
             return;
         }
         for tile in self.tiles.all() {
-            for (col, row) in cells(tile) {
-                if let Some(cell) = image_cell(buf, scene, col, row) {
-                    *cell = sentinel();
-                }
+            for at in Rect::new(tile.col, tile.row, tile.cols, tile.rows).positions() {
+                place_image_cell(buf, scene, at, &SENTINEL);
             }
         }
     }
 
-    /// Per tile, its cells text was drawn in since [`Self::place`], each
-    /// handed back to ratatui's diff. Kitty's text needs no room made.
+    /// Per tile, the cells text took since [`Self::place`], every cell
+    /// [carved](carve_image_cell). Kitty's text needs no room made, so it
+    /// reports none.
     pub(crate) fn carve(&self, buf: &mut Buffer, scene: Rect) -> Vec<Carve> {
         if self.route.protocol() == ImageProtocol::Kitty {
+            for (at, placeholder) in self.placeholders() {
+                carve_image_cell(buf, scene, at, &placeholder);
+            }
             return Vec::new();
         }
-        let sentinel = sentinel();
         self.tiles
             .all()
             .map(|tile| {
                 let mut carve = 0;
-                for (col, row) in cells(tile) {
-                    if let Some(cell) = image_cell(buf, scene, col, row)
-                        && *cell != sentinel
-                    {
-                        cell.set_diff_option(CellDiffOption::None);
-                        carve |= tile.bit(col - tile.col, row - tile.row);
+                for at in Rect::new(tile.col, tile.row, tile.cols, tile.rows).positions() {
+                    if carve_image_cell(buf, scene, at, &SENTINEL) {
+                        carve |= tile.bit(at.x - tile.col, at.y - tile.row);
                     }
                 }
                 carve
             })
             .collect()
+    }
+
+    /// Every tile's kitty placeholders, each with the image cell it shows.
+    fn placeholders(&self) -> impl Iterator<Item = (Position, Cell)> {
+        self.tiles
+            .all()
+            .filter_map(|tile| kitty::placeholders(kitty::image_id(self.base, tile)?, tile))
+            .flatten()
+            .map(|p| {
+                let mut cell = Cell::default();
+                cell.set_symbol(&p.symbol).set_fg(p.fg);
+                (Position { x: p.col, y: p.row }, cell)
+            })
     }
 
     /// What the last frame's transmits did.
@@ -520,7 +490,7 @@ impl Encoder<'_> {
     }
 
     /// `c`'s tile in the protocol's escape, carved: one image a
-    /// [piece](Tile::pieces); `None` where it has none.
+    /// [piece](crate::graphics::tiles::Tile::pieces); `None` where it has none.
     fn encode(self, c: Changed) -> Option<Vec<u8>> {
         let _encode = tracing::trace_span!("tile.encode").entered();
         let cut =
@@ -549,23 +519,95 @@ impl Encoder<'_> {
     }
 }
 
-fn sentinel() -> Cell {
-    let mut cell = Cell::new(SENTINEL);
-    cell.set_diff_option(CellDiffOption::Skip);
-    cell
+/// Show image cell `at` of `scene` in `buf` as `image`, the cell the image
+/// puts there, before the frame's text is drawn.
+pub(crate) fn place_image_cell(buf: &mut Buffer, scene: Rect, at: Position, image: &Cell) {
+    if let Some(cell) = image_cell(buf, scene, at) {
+        cell.clone_from(image);
+    }
 }
 
-/// `tile`'s cells, from the image's top-left.
-fn cells(tile: Tile) -> impl Iterator<Item = (u16, u16)> {
-    (tile.row..tile.row + tile.rows)
-        .flat_map(move |row| (tile.col..tile.col + tile.cols).map(move |col| (col, row)))
+/// Whether the frame's text took image cell `at` since [`place_image_cell`]
+/// put `image` there: text replaced its symbol, and the cell is handed back
+/// to ratatui's diff. One whose symbol stayed is `image` again, whatever style
+/// was drawn over it: a drop shadow's dim would rename the image a kitty
+/// placeholder names in its foreground colour
+/// (<https://sw.kovidgoyal.net/kitty/graphics-protocol/>, "Unicode placeholders").
+pub(crate) fn carve_image_cell(buf: &mut Buffer, scene: Rect, at: Position, image: &Cell) -> bool {
+    let Some(cell) = image_cell(buf, scene, at) else {
+        return false;
+    };
+    if cell.symbol() == image.symbol() {
+        cell.clone_from(image);
+        return false;
+    }
+    cell.set_diff_option(CellDiffOption::None);
+    true
 }
 
-/// The cell of `buf` showing image cell `(col, row)`, inside `scene`.
-fn image_cell(buf: &mut Buffer, scene: Rect, col: u16, row: u16) -> Option<&mut Cell> {
+/// Which cells of a frame's scene show the image once the frame's text is
+/// drawn over it, and how dim its backdrop leaves the image: what
+/// [`place_image_cell`] and [`carve_image_cell`] leave of every scene cell.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ImageCells {
+    scene: Rect,
+    /// Row by row from `scene`'s top-left, whether each cell shows the image.
+    image: Vec<bool>,
+    dim: pixtuoid_scene::look::Dim,
+}
+
+impl ImageCells {
+    /// Every cell of `scene` in `buf` [placed](place_image_cell) as the
+    /// [`SENTINEL`], before the frame's text is drawn.
+    pub(crate) fn place(buf: &mut Buffer, scene: Rect) {
+        for at in Self::cells(scene) {
+            place_image_cell(buf, scene, at, &SENTINEL);
+        }
+    }
+
+    /// What of [`Self::place`]'s cells stays image once the frame's text is
+    /// drawn, each [carved](carve_image_cell), under a backdrop of `dim`.
+    pub(crate) fn carve(buf: &mut Buffer, scene: Rect, dim: pixtuoid_scene::look::Dim) -> Self {
+        let image = Self::cells(scene)
+            .map(|at| !carve_image_cell(buf, scene, at, &SENTINEL))
+            .collect();
+        Self { scene, image, dim }
+    }
+
+    /// A frame with no image cell: one too small for the office.
+    pub(crate) fn none() -> Self {
+        Self {
+            scene: Rect::default(),
+            image: Vec::new(),
+            dim: pixtuoid_scene::look::Dim::NONE,
+        }
+    }
+
+    /// `scene`'s cells, row by row, from its top-left.
+    fn cells(scene: Rect) -> ratatui::layout::Positions {
+        Rect::new(0, 0, scene.width, scene.height).positions()
+    }
+
+    /// Whether frame cell `(col, row)` shows the image.
+    pub fn shows(&self, col: u16, row: u16) -> bool {
+        let at = Position { x: col, y: row };
+        self.scene.contains(at)
+            && self.image[usize::from(row - self.scene.y) * usize::from(self.scene.width)
+                + usize::from(col - self.scene.x)]
+    }
+
+    /// How dim the frame's backdrop leaves the image.
+    pub fn dim(&self) -> pixtuoid_scene::look::Dim {
+        self.dim
+    }
+}
+
+/// The cell of `buf` showing image cell `at`, inside `scene`.
+fn image_cell(buf: &mut Buffer, scene: Rect, at: Position) -> Option<&mut Cell> {
     let at = Position {
-        x: scene.x.saturating_add(col),
-        y: scene.y.saturating_add(row),
+        x: scene.x.saturating_add(at.x),
+        y: scene.y.saturating_add(at.y),
     };
     scene.contains(at).then(|| buf.cell_mut(at)).flatten()
 }

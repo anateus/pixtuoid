@@ -108,11 +108,13 @@ impl FloorMeta {
     }
 
     /// This floor under `weather`.
+    #[must_use]
     pub fn with_weather(self, weather: crate::sky::WeatherPolicy) -> Self {
         Self { weather, ..self }
     }
 
     /// This floor moving as `motion` says.
+    #[must_use]
     pub fn with_motion(self, motion: crate::anim::Motion) -> Self {
         Self { motion, ..self }
     }
@@ -225,7 +227,7 @@ impl FloorCtx {
                 l
             }
         };
-        self.router.set_preferred_zone(layout.corridor);
+        self.router.set_preferred_zone(Some(layout.corridor));
         Some(layout)
     }
 
@@ -350,8 +352,6 @@ pub struct PetInputs<'a> {
 pub struct FloorInputs<'a> {
     /// The scene to render (the full live scene, or a projected single-floor one).
     pub scene: &'a SceneState,
-    /// The sprite pack.
-    pub pack: &'a OfficeArt,
     /// This frame's time — a parameter; the engine never reads the clock (wasm).
     pub now: SystemTime,
     /// This floor's index, altitude, and layout seed.
@@ -476,7 +476,7 @@ impl AudioObserver {
 pub struct PerOffice {
     /// Every agent's desk cup + fetch time — survives floor navigation.
     pub coffee: CoffeeState,
-    /// Active speech bubbles keyed by venue (the `VenueKey` carries `floor_idx`).
+    /// In-progress speech bubbles keyed by venue (the `VenueKey` carries `floor_idx`).
     pub(crate) chitchat: HashMap<VenueKey, ActiveChitchat>,
     /// The office-wide [`AudioObserver`] — one cue tracker + reprime latch,
     /// shared across floors.
@@ -561,8 +561,7 @@ impl FloorSession {
     }
 
     /// [`Self::floor`], to seed or inspect its stores.
-    #[cfg(test)]
-    pub(crate) fn floor_mut(&mut self) -> &mut PerFloor {
+    pub fn floor_mut(&mut self) -> &mut PerFloor {
         &mut self.view.floor
     }
 
@@ -631,7 +630,7 @@ impl FloorSession {
     pub fn step(&mut self, world: FloorInputs<'_>, size: Size) -> Option<SteppedFloor> {
         self.evict_missing(world.scene);
         step_floor(
-            &mut self.view.floor.ctx,
+            &mut self.view.floor,
             &mut self.office.coffee,
             &mut self.office.chitchat,
             world,
@@ -642,18 +641,20 @@ impl FloorSession {
 
 /// [`FloorSession::step`] minus eviction, which a projected `world.scene` would turn on other floors.
 pub(crate) fn step_floor(
-    fctx: &mut FloorCtx,
+    floor: &mut PerFloor,
     coffee: &mut CoffeeState,
     chitchat: &mut HashMap<VenueKey, ActiveChitchat>,
     world: FloorInputs<'_>,
     size: Size,
 ) -> Option<SteppedFloor> {
+    let PerFloor { ctx: fctx, raster } = floor;
     let layout = fctx.frame_layout(size.w, size.h, world.floor.floor_seed)?;
     let door_anim_max_ms = fctx.door_anim_max_ms;
     let frame = sim_step(
         &mut fctx.sim_stores(chitchat),
         SimInputs {
             world,
+            pack: raster.pack(),
             layout: &layout,
             coffee: coffee.map(),
             door_anim_max_ms,
@@ -792,7 +793,7 @@ impl NeonLevels {
         power: 1.0,
     };
     /// Agents work, nobody waits.
-    pub(crate) const BUSY: Self = Self {
+    pub(crate) const RUNNING: Self = Self {
         alert: 0.0,
         power: 1.0,
     };
@@ -949,8 +950,7 @@ impl NeonState {
         Self::STUTTER_FLASHES_MS
             .iter()
             .map(|&(start, end)| end - start)
-            .min()
-            .unwrap_or(0)
+            .fold(u64::MAX, u64::min)
     }
 
     /// Advance to `mood` on `timing`; returns this frame's light. A count change
@@ -971,7 +971,7 @@ impl NeonState {
         let now = timing.now;
         let to = match mood {
             OfficeMood::Alert { .. } => NeonLevels::ALERT,
-            OfficeMood::Busy { .. } => NeonLevels::BUSY,
+            OfficeMood::Running { .. } => NeonLevels::RUNNING,
             OfficeMood::Empty if room_dimmed => NeonLevels::EMPTY,
             OfficeMood::Calm | OfficeMood::Empty => NeonLevels::CALM,
         };

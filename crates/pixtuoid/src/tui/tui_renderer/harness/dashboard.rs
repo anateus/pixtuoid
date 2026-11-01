@@ -6,7 +6,7 @@ use crate::panels::dashboard::{DashboardFolds, DashboardFrame, build_dashboard_r
 #[test]
 fn dashboard_popup_renders_labels_states_and_live_tool() {
     let mut r = build(120, 44, vec![]);
-    let mut a = active("/h/alpha.jsonl", 0, "Edit reducer.rs", t0());
+    let mut a = running("/h/alpha.jsonl", 0, "Edit reducer.rs", t0());
     a.label = "cc\u{b7}alpha".into();
     let mut b = idle("/h/beta.jsonl", 1, t0());
     b.label = "cc\u{b7}beta".into();
@@ -26,7 +26,7 @@ fn dashboard_popup_renders_labels_states_and_live_tool() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
 
     let text = frame_text(r.frame_buffer());
     assert!(text.contains("Agents ("), "header missing:\n{text}");
@@ -45,47 +45,48 @@ fn connection_panel_renders_both_facets_borderless() {
     let mut r = build(120, 44, vec![]);
     let scene = scene_with(vec![], 16);
     let rows = vec![
-        ConnectionRow {
-            source_id: "claude",
-            label_prefix: "cc",
-            display_name: "Claude Code",
-            state: ConnState::Connected,
-            config_path: Some(std::path::PathBuf::from("~/.claude/settings.json")),
-            target: None,
-            health: None,
-        },
-        ConnectionRow {
-            source_id: "antigravity",
-            label_prefix: "ag",
-            display_name: "Antigravity",
-            state: ConnState::Disconnected,
-            config_path: None,
-            target: None,
-            health: None,
-        },
-    ];
-    let live = vec![
-        LiveInfo {
-            facet: LiveFacet::Agents {
-                agents: 2,
-                last_event_age: Some(std::time::Duration::from_secs(3)),
+        (
+            ConnectionRow {
+                source_id: "claude",
+                label_prefix: "cc",
+                display_name: "Claude Code",
+                state: ConnState::Connected,
+                config_path: Some(std::path::PathBuf::from("~/.claude/settings.json")),
+                target: None,
+                health: None,
             },
-            dead: false,
-        },
-        LiveInfo {
-            facet: LiveFacet::Agents {
-                agents: 1,
-                last_event_age: Some(std::time::Duration::from_secs(12)),
+            LiveInfo {
+                facet: LiveFacet::Agents {
+                    agents: 2,
+                    last_event_age: Some(std::time::Duration::from_secs(3)),
+                },
+                dead: false,
             },
-            dead: false,
-        },
+        ),
+        (
+            ConnectionRow {
+                source_id: "antigravity",
+                label_prefix: "ag",
+                display_name: "Antigravity",
+                state: ConnState::Disconnected,
+                config_path: None,
+                target: None,
+                health: None,
+            },
+            LiveInfo {
+                facet: LiveFacet::Agents {
+                    agents: 1,
+                    last_event_age: Some(std::time::Duration::from_secs(12)),
+                },
+                dead: false,
+            },
+        ),
     ];
     r.set_frames(
         RenderFrames {
             connection: ConnectionFrame {
                 open: true,
                 rows,
-                live,
                 socket_line: "socket  /tmp/p.sock".into(),
                 ..Default::default()
             },
@@ -93,7 +94,7 @@ fn connection_panel_renders_both_facets_borderless() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
 
     let text = frame_text(r.frame_buffer());
     assert!(text.contains("Sources"), "title missing:\n{text}");
@@ -123,21 +124,23 @@ fn connection_panel_health_flag_and_detail_preempt_the_install_path() {
     use crate::panels::connection::{ConnState, ConnectionRow, LiveInfo};
     let mut r = build(120, 44, vec![]);
     let scene = scene_with(vec![], 16);
-    let rows = vec![ConnectionRow {
-        source_id: "reasonix",
-        label_prefix: "rx",
-        display_name: "Reasonix",
-        state: ConnState::Connected,
-        config_path: Some(std::path::PathBuf::from("~/.reasonix/settings.json")),
-        target: None,
-        health: Some("install broken: shim binary missing".into()), // NO ⚠ prefix
-    }];
+    let rows = vec![(
+        ConnectionRow {
+            source_id: "reasonix",
+            label_prefix: "rx",
+            display_name: "Reasonix",
+            state: ConnState::Connected,
+            config_path: Some(std::path::PathBuf::from("~/.reasonix/settings.json")),
+            target: None,
+            health: Some("install broken: shim binary missing".into()), // NO ⚠ prefix
+        },
+        LiveInfo::default(),
+    )];
     r.set_frames(
         RenderFrames {
             connection: ConnectionFrame {
                 open: true,
                 rows,
-                live: vec![LiveInfo::default()],
                 socket_line: "socket  /tmp/p.sock".into(),
                 ..Default::default()
             },
@@ -145,7 +148,7 @@ fn connection_panel_health_flag_and_detail_preempt_the_install_path() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let text = frame_text(r.frame_buffer());
     assert!(
         text.contains('\u{26a0}'),
@@ -166,21 +169,23 @@ fn connection_panel_armed_shows_confirm_prompt() {
     use crate::panels::connection::{ConnState, ConnectionRow, LiveInfo};
     let mut r = build(120, 44, vec![]);
     let scene = scene_with(vec![], 16);
-    let rows = vec![ConnectionRow {
-        source_id: "codex",
-        label_prefix: "cx",
-        display_name: "Codex",
-        state: ConnState::Connected,
-        config_path: Some(std::path::PathBuf::from("~/.codex/config.toml")),
-        target: None,
-        health: None,
-    }];
+    let rows = vec![(
+        ConnectionRow {
+            source_id: "codex",
+            label_prefix: "cx",
+            display_name: "Codex",
+            state: ConnState::Connected,
+            config_path: Some(std::path::PathBuf::from("~/.codex/config.toml")),
+            target: None,
+            health: None,
+        },
+        LiveInfo::default(),
+    )];
     r.set_frames(
         RenderFrames {
             connection: ConnectionFrame {
                 open: true,
                 rows,
-                live: vec![LiveInfo::default()],
                 confirm: Some(0),
                 ..Default::default()
             },
@@ -188,7 +193,7 @@ fn connection_panel_armed_shows_confirm_prompt() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let text = frame_text(r.frame_buffer());
     assert!(
         text.contains("(y/n)"),
@@ -202,21 +207,23 @@ fn connection_panel_disconnected_selected_shows_connect_hint() {
     use crate::panels::connection::{ConnState, ConnectionRow, LiveInfo};
     let mut r = build(120, 44, vec![]);
     let scene = scene_with(vec![], 16);
-    let rows = vec![ConnectionRow {
-        source_id: "antigravity",
-        label_prefix: "ag",
-        display_name: "Antigravity",
-        state: ConnState::Disconnected,
-        config_path: None,
-        target: None,
-        health: None,
-    }];
+    let rows = vec![(
+        ConnectionRow {
+            source_id: "antigravity",
+            label_prefix: "ag",
+            display_name: "Antigravity",
+            state: ConnState::Disconnected,
+            config_path: None,
+            target: None,
+            health: None,
+        },
+        LiveInfo::default(),
+    )];
     r.set_frames(
         RenderFrames {
             connection: ConnectionFrame {
                 open: true,
                 rows,
-                live: vec![LiveInfo::default()],
                 socket_line: "socket  /tmp/p.sock".into(),
                 ..Default::default()
             },
@@ -224,7 +231,7 @@ fn connection_panel_disconnected_selected_shows_connect_hint() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let text = frame_text(r.frame_buffer());
     assert!(
         text.contains("press t to connect"),
@@ -241,21 +248,23 @@ fn connection_panel_no_cli_selected_shows_not_detected_hint() {
     use crate::panels::connection::{ConnState, ConnectionRow, LiveInfo};
     let mut r = build(120, 44, vec![]);
     let scene = scene_with(vec![], 16);
-    let rows = vec![ConnectionRow {
-        source_id: "codex",
-        label_prefix: "cx",
-        display_name: "Codex",
-        state: ConnState::NoCli { connected: false },
-        config_path: None,
-        target: None,
-        health: None,
-    }];
+    let rows = vec![(
+        ConnectionRow {
+            source_id: "codex",
+            label_prefix: "cx",
+            display_name: "Codex",
+            state: ConnState::NoCli { connected: false },
+            config_path: None,
+            target: None,
+            health: None,
+        },
+        LiveInfo::default(),
+    )];
     r.set_frames(
         RenderFrames {
             connection: ConnectionFrame {
                 open: true,
                 rows,
-                live: vec![LiveInfo::default()],
                 socket_line: "socket  /tmp/p.sock".into(),
                 ..Default::default()
             },
@@ -263,7 +272,7 @@ fn connection_panel_no_cli_selected_shows_not_detected_hint() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let text = frame_text(r.frame_buffer());
     assert!(
         text.contains("not detected on this machine"),
@@ -280,21 +289,23 @@ fn connection_panel_connected_without_config_path_shows_connected() {
     use crate::panels::connection::{ConnState, ConnectionRow, LiveInfo};
     let mut r = build(120, 44, vec![]);
     let scene = scene_with(vec![], 16);
-    let rows = vec![ConnectionRow {
-        source_id: "claude",
-        label_prefix: "cc",
-        display_name: "Claude Code",
-        state: ConnState::Connected,
-        config_path: None,
-        target: None,
-        health: None,
-    }];
+    let rows = vec![(
+        ConnectionRow {
+            source_id: "claude",
+            label_prefix: "cc",
+            display_name: "Claude Code",
+            state: ConnState::Connected,
+            config_path: None,
+            target: None,
+            health: None,
+        },
+        LiveInfo::default(),
+    )];
     r.set_frames(
         RenderFrames {
             connection: ConnectionFrame {
                 open: true,
                 rows,
-                live: vec![LiveInfo::default()],
                 socket_line: "socket  /tmp/p.sock".into(),
                 ..Default::default()
             },
@@ -302,7 +313,7 @@ fn connection_panel_connected_without_config_path_shows_connected() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let text = frame_text(r.frame_buffer());
     assert!(
         text.contains("connected"),
@@ -319,21 +330,23 @@ fn connection_panel_last_result_overrides_per_state_detail() {
     use crate::panels::connection::{ConnState, ConnectionRow, LiveInfo};
     let mut r = build(120, 44, vec![]);
     let scene = scene_with(vec![], 16);
-    let rows = vec![ConnectionRow {
-        source_id: "claude",
-        label_prefix: "cc",
-        display_name: "Claude Code",
-        state: ConnState::Connected,
-        config_path: Some(std::path::PathBuf::from("~/.claude/settings.json")),
-        target: None,
-        health: None,
-    }];
+    let rows = vec![(
+        ConnectionRow {
+            source_id: "claude",
+            label_prefix: "cc",
+            display_name: "Claude Code",
+            state: ConnState::Connected,
+            config_path: Some(std::path::PathBuf::from("~/.claude/settings.json")),
+            target: None,
+            health: None,
+        },
+        LiveInfo::default(),
+    )];
     r.set_frames(
         RenderFrames {
             connection: ConnectionFrame {
                 open: true,
                 rows,
-                live: vec![LiveInfo::default()],
                 result: Some("X-RESULT-SENTINEL".to_string()),
                 socket_line: "socket  /tmp/p.sock".into(),
                 ..Default::default()
@@ -342,7 +355,7 @@ fn connection_panel_last_result_overrides_per_state_detail() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let text = frame_text(r.frame_buffer());
     assert!(
         text.contains("X-RESULT-SENTINEL"),
@@ -369,7 +382,7 @@ fn connection_panel_empty_rows_renders_panel_with_blank_detail() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let text = frame_text(r.frame_buffer());
     assert!(text.contains("Sources"), "title missing:\n{text}");
     assert!(text.contains("j/k move"), "footer missing:\n{text}");
@@ -418,7 +431,7 @@ fn dashboard_collapsed_big_tree_shows_badge_and_hides_children() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
 
     let text = frame_text(r.frame_buffer());
     assert!(text.contains("cc\u{b7}root"), "root row missing:\n{text}");
@@ -452,7 +465,7 @@ fn dashboard_closed_paints_no_popup() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
 
     let text = frame_text(r.frame_buffer());
     assert!(
@@ -545,19 +558,79 @@ fn dash_popup_reads_the_popup_rect_alone() {
 }
 
 #[test]
-fn dashboard_renders_waiting_reason_and_active_without_detail() {
+fn dashboard_renders_a_reasonless_requires_action_as_the_bare_state_words() {
     let mut r = build(120, 44, vec![]);
     let mut w = idle("/h/w.jsonl", 0, t0());
     w.label = "cc\u{b7}wait".into();
-    w.state = ActivityState::Waiting {
-        reason: Arc::from("permission"),
+    w.state = ActivityState::RequiresAction { reason: None };
+    let scene = scene_with(vec![w], 16);
+
+    let rows = build_dashboard_rows(&scene, &DashboardFolds::default());
+    r.set_frames(
+        RenderFrames {
+            dashboard: DashboardFrame {
+                open: true,
+                rows,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        t0(),
+    );
+    r.render(&scene, t0()).unwrap();
+
+    let popup = dash_popup(r.frame_buffer());
+    assert!(popup.contains("requires action"), "{popup}");
+    assert!(!popup.contains("requires action:"), "{popup}");
+}
+
+#[test]
+fn dashboard_shows_a_long_requires_action_reason_whole_on_an_unselected_row() {
+    let mut r = build(120, 44, vec![]);
+    let mut a = running("/h/a.jsonl", 0, "Edit x", t0());
+    a.label = "cc\u{b7}act".into();
+    let mut w = idle("/h/w.jsonl", 1, t0());
+    w.label = "cc\u{b7}wait".into();
+    w.state = ActivityState::RequiresAction {
+        reason: Some(Arc::from("permission: shell")),
+    };
+    let scene = scene_with(vec![a, w], 16);
+
+    let rows = build_dashboard_rows(&scene, &DashboardFolds::default());
+    r.set_frames(
+        RenderFrames {
+            dashboard: DashboardFrame {
+                open: true,
+                rows,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        t0(),
+    );
+    r.render(&scene, t0()).unwrap();
+
+    // The glyph and the tint name the state, so the reason takes the whole cell.
+    let popup = dash_popup(r.frame_buffer());
+    assert!(popup.contains("\u{25d0} permission: shell"), "{popup}");
+}
+
+#[test]
+fn dashboard_renders_requires_action_reason_and_running_without_detail() {
+    let mut r = build(120, 44, vec![]);
+    let mut w = idle("/h/w.jsonl", 0, t0());
+    w.label = "cc\u{b7}wait".into();
+    w.state = ActivityState::RequiresAction {
+        reason: Some(Arc::from("permission")),
     };
     let mut a = idle("/h/a.jsonl", 1, t0());
     a.label = "cc\u{b7}act".into();
-    a.state = ActivityState::Active {
-        tool_use_id: Some(Arc::from("t")),
-        detail: None,
-        kind: ToolKind::Other,
+    a.state = ActivityState::Running {
+        item: Some(ToolUse {
+            tool_use_id: Some(Arc::from("t")),
+            detail: None,
+            kind: ToolKind::Other,
+        }),
     };
     let scene = scene_with(vec![w, a], 16);
 
@@ -573,16 +646,16 @@ fn dashboard_renders_waiting_reason_and_active_without_detail() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
 
     let popup = dash_popup(r.frame_buffer());
     assert!(
-        popup.contains("waiting: permission"),
-        "waiting reason missing:\n{popup}"
+        popup.contains("\u{25d0} permission"),
+        "requires-action reason missing:\n{popup}"
     );
     assert!(
-        popup.contains("\u{25cf} active"),
-        "active-without-detail must render the bare state word:\n{popup}"
+        popup.contains("\u{25cf} running"),
+        "running-without-detail must render the bare state word:\n{popup}"
     );
 }
 
@@ -613,7 +686,7 @@ fn dashboard_scrolls_to_keep_a_deep_selection_visible() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
 
     let buf = r.frame_buffer();
     let text = frame_text(buf);
@@ -643,9 +716,9 @@ fn dashboard_empty_scene_shows_placeholder() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     assert!(
-        frame_text(r.frame_buffer()).contains("No active agents"),
+        frame_text(r.frame_buffer()).contains("No agents"),
         "empty dashboard must show the placeholder"
     );
 }
@@ -682,7 +755,7 @@ fn a_short_terminal_windows_the_dashboard_below_its_row_cap() {
             },
             t0(),
         );
-        r.render(&scene, pack(), t0()).unwrap();
+        r.render(&scene, t0()).unwrap();
         // `dash_popup`, NOT `frame_text`: at a roomy height the OFFICE also renders
         // and paints agent name badges, which a whole-frame scan counts as rows.
         let text = dash_popup(r.frame_buffer());
@@ -735,7 +808,7 @@ fn dashboard_badge_text_present_for_cc_and_cx() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
 
     let popup = dash_popup(r.frame_buffer());
     assert!(popup.contains("[cc]"), "cc badge missing:\n{popup}");
@@ -766,7 +839,7 @@ fn dashboard_overflow_cue_appears_below_when_more_than_viewport() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
 
     let popup = dash_popup(r.frame_buffer());
     assert!(
@@ -798,7 +871,7 @@ fn dashboard_overflow_cue_absent_when_all_visible() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
 
     let popup = dash_popup(r.frame_buffer());
     assert!(
@@ -833,7 +906,7 @@ fn dashboard_overflow_cue_keeps_a_bottom_navigated_selection_visible() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let popup = dash_popup(r.frame_buffer());
     assert!(
         popup.contains("row20"),
@@ -872,7 +945,7 @@ fn dashboard_overflow_no_blank_line_when_selection_is_last_row() {
         },
         t0(),
     );
-    r.render(&scene, pack(), t0()).unwrap();
+    r.render(&scene, t0()).unwrap();
     let popup = dash_popup(r.frame_buffer());
     assert!(
         popup.contains("row16"),

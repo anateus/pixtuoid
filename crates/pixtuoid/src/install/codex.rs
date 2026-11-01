@@ -7,7 +7,7 @@ use crate::install::SENTINEL_KEY;
 use crate::install::host_plugin::{self, NAME};
 use crate::install::io;
 use crate::install::target::{
-    HostRegistration, LegacyConfig, MergeOutcome, PluginCopy, Unregistered,
+    HostRegistration, LegacyConfig, MergeOutcome, Pickup, PluginCopy, Unregistered,
 };
 use crate::install::verify::{SchemaParse, ShimRef};
 
@@ -51,10 +51,10 @@ pub(crate) const HOST: HostRegistration = HostRegistration {
     register,
     unregister,
     is_registered,
-    copy: Some(PluginCopy {
+    pickup: Some(Pickup::Recopy(PluginCopy {
         stale: copy_is_stale,
         refresh: add_plugin,
-    }),
+    })),
     legacy: Some(LegacyConfig {
         path: config_toml,
         strip: merge_uninstall,
@@ -86,7 +86,7 @@ pub(crate) fn hook_command(resolved: &Path, _explicit: bool) -> Result<String> {
     // `_explicit` is Claude's bare-name-vs-absolute switch — Codex always
     // embeds the absolute path, so the flag changes nothing here.
     let p = crate::install::merge::hook_path_str(resolved)?;
-    crate::install::hook_cmd::shell_hook_command(p, "codex")
+    crate::install::hook_cmd::shell_hook_command(p, pixtuoid_core::source::codex::SOURCE_NAME)
 }
 
 pub(crate) fn render_hooks(hook_cmd: &str) -> Result<String> {
@@ -221,7 +221,7 @@ fn unregister(config: &Path) -> Result<Unregistered> {
     // The table `marketplace_moved_from` reads the source from.
     let listed = doc.get(MARKETPLACES).and_then(|m| m.get(NAME)).is_some();
     if !installed && !listed {
-        host_plugin::remove_if_ours(root, &marketplace_manifest(root))?;
+        host_plugin::remove_if_ours(root, &marketplace_manifest(root), host_plugin::names_us)?;
         return Ok(Unregistered::Absent);
     }
     if CLI.locate().is_none() {
@@ -239,7 +239,7 @@ fn unregister(config: &Path) -> Result<Unregistered> {
     if listed {
         remove_marketplace()?;
     }
-    host_plugin::remove_if_ours(root, &marketplace_manifest(root))?;
+    host_plugin::remove_if_ours(root, &marketplace_manifest(root), host_plugin::names_us)?;
     Ok(Unregistered::Removed)
 }
 
@@ -289,12 +289,9 @@ fn group_has_no_hooks(group: &toml::Value) -> bool {
         .is_some_and(|h| h.is_empty())
 }
 
-fn toml_merge_uninstall(mut doc: toml::Value) -> toml::Value {
-    let Some(root) = doc.as_table_mut() else {
-        return doc;
-    };
+fn toml_merge_uninstall(mut root: toml::Table) -> toml::Table {
     let Some(toml::Value::Table(hooks)) = root.get_mut("hooks") else {
-        return doc;
+        return root;
     };
     for (_ev, list) in hooks.iter_mut() {
         if let Some(arr) = list.as_array_mut() {
@@ -317,7 +314,7 @@ fn toml_merge_uninstall(mut doc: toml::Value) -> toml::Value {
     if hooks.is_empty() {
         root.remove("hooks");
     }
-    doc
+    root
 }
 
 #[cfg(test)]
@@ -524,12 +521,6 @@ command = "/hand/written/pixtuoid-hook"
             cmd,
             "PIXTUOID_SOURCE=codex '/Users/Jane Doe/bin/pixtuoid-hook'"
         );
-    }
-
-    #[test]
-    fn uninstall_non_table_doc_returns_unchanged() {
-        let input = toml::Value::Integer(3);
-        assert_eq!(toml_merge_uninstall(input.clone()), input);
     }
 
     #[test]

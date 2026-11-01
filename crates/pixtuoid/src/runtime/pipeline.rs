@@ -25,29 +25,70 @@ use pixtuoid_core::source::manager::{SourceDeath, SourceManager};
 use pixtuoid_core::state::MAX_FLOORS;
 use pixtuoid_core::{AgentEvent, SceneState, Transport};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
 
-use super::ConnectedSources;
 use super::driver::{build_source_set, reducer_task};
+use super::{ConnectedSources, LogQueue, SceneRx, TransitionLog};
 
-/// The live pipeline's caller-facing handles. The spawned source tasks are kept
-/// alive by the caller's tokio RUNTIME, not by `_source_handles` — dropping a
-/// tokio `JoinHandle` DETACHES the task, it doesn't stop it. The field is a
-/// harmless anchor that also lets a future caller `.abort()`/join the sources.
+/// Where [`reducer_task`] publishes the scene after each change it applies.
+pub(crate) enum SceneSink {
+    /// A painter's: it draws the newest scene, so one it never read is gone.
+    Latest(watch::Sender<Arc<SceneState>>),
+    /// Headless's: each change, as its [`TransitionLog`] line.
+    Transitions(LogQueue, TransitionLog),
+}
+
+/// Headless's end of the transition log: the lines to write, and the queue
+/// its own health lines join.
+pub(crate) struct HeadlessLog {
+    pub(crate) lines: mpsc::Receiver<String>,
+    pub(crate) queue: LogQueue,
+}
+
+impl SceneSink {
+    /// A painter's sink, and the watch it draws from, seeded with the empty
+    /// boot scene.
+    pub(crate) fn latest(boot_caps: [usize; MAX_FLOORS]) -> (Self, SceneRx) {
+        let (tx, rx) = watch::channel(Arc::new(SceneState::new(boot_caps)));
+        (Self::Latest(tx), rx)
+    }
+
+    /// Headless's sink, and the log it fills, `capacity` lines deep.
+    pub(crate) fn transitions(capacity: usize) -> (Self, HeadlessLog) {
+        let (queue, lines) = LogQueue::bounded(capacity);
+        (
+            Self::Transitions(queue.clone(), TransitionLog::default()),
+            HeadlessLog { lines, queue },
+        )
+    }
+
+    /// `false` once the reader is gone or stalled.
+    pub(super) fn publish(&mut self, scene: &SceneState) -> bool {
+        match self {
+            Self::Latest(tx) => tx.send(Arc::new(scene.clone())).is_ok(),
+            Self::Transitions(queue, log) => match log.line(scene) {
+                Some(line) => queue.push(line),
+                None => !queue.is_closed(),
+            },
+        }
+    }
+}
+
+/// The live pipeline's caller-facing handles; the scene reaches the caller
+/// through the [`SceneSink`] it handed in.
 pub(crate) struct Pipeline {
-    pub(crate) scene_rx: watch::Receiver<Arc<SceneState>>,
     pub(crate) health_rx: watch::Receiver<Vec<SourceDeath>>,
     pub(crate) floor_caps: Arc<[AtomicUsize; MAX_FLOORS]>,
-    pub(crate) _source_handles: Vec<JoinHandle<()>>,
 }
 
 /// Wire and spawn the whole live pipeline: presence channel + exit watch →
-/// [`build_source_set`] → event/scene/health channels → boot-seeded floor-caps
-/// atomics → [`reducer_task`] → `SourceManager::spawn_with_health`.
+/// [`build_source_set`] → event/health channels → boot-seeded floor-caps
+/// atomics → [`reducer_task`] publishing to `scene` →
+/// `SourceManager::spawn_with_health`.
 pub(crate) fn spawn_pipeline(
     socket_path: PathBuf,
     connected: ConnectedSources,
     boot_caps: [usize; MAX_FLOORS],
+    scene: SceneSink,
 ) -> Pipeline {
     // Daemon-presence SIDE channel (invariant #2: NOT the AgentEvent channel).
     // The demux sends source-tagged presence deltas here and the exit watch drains
@@ -58,12 +99,11 @@ pub(crate) fn spawn_pipeline(
 
     let (tx, rx) =
         mpsc::channel::<(Transport, AgentEvent)>(pixtuoid_core::source::EVENT_CHANNEL_CAPACITY);
-    let (scene_tx, scene_rx) = watch::channel(Arc::new(SceneState::new(boot_caps)));
     let floor_caps: Arc<[AtomicUsize; MAX_FLOORS]> =
         Arc::new(std::array::from_fn(|i| AtomicUsize::new(boot_caps[i])));
     tokio::spawn(reducer_task(
         rx,
-        scene_tx,
+        scene,
         Arc::clone(&floor_caps),
         connected,
         presence_rx,
@@ -78,12 +118,10 @@ pub(crate) fn spawn_pipeline(
     for src in sources {
         manager = manager.with_source(src);
     }
-    let _source_handles = manager.spawn_with_health(tx, health_tx);
+    manager.spawn_with_health(tx, health_tx);
 
     Pipeline {
-        scene_rx,
         health_rx,
         floor_caps,
-        _source_handles,
     }
 }

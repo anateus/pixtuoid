@@ -56,13 +56,13 @@ fn run_shim_inner<S: AsRef<std::ffi::OsStr>>(
     source: Option<&str>,
     args: &[S],
     stdin: &[u8],
-) -> std::process::ExitStatus {
+) -> std::process::Output {
     let mut cmd = Command::new(BIN);
     cmd.env("PIXTUOID_SOCKET", socket)
         .args(args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     match source {
         Some(s) => {
             cmd.env("PIXTUOID_SOURCE", s);
@@ -79,7 +79,7 @@ fn run_shim_inner<S: AsRef<std::ffi::OsStr>>(
         .write_all(stdin)
         .expect("write stdin");
     // stdin dropped here → EOF, so the shim's read_to_string returns.
-    child.wait().expect("wait shim")
+    child.wait_with_output().expect("wait shim")
 }
 
 fn run_shim(
@@ -87,7 +87,7 @@ fn run_shim(
     source: Option<&str>,
     stdin: &[u8],
 ) -> std::process::ExitStatus {
-    run_shim_inner::<&str>(socket, source, &[], stdin)
+    run_shim_inner::<&str>(socket, source, &[], stdin).status
 }
 
 fn run_shim_args(
@@ -95,7 +95,7 @@ fn run_shim_args(
     args: &[&str],
     stdin: &[u8],
 ) -> std::process::ExitStatus {
-    run_shim_inner(socket, None, args, stdin)
+    run_shim_inner(socket, None, args, stdin).status
 }
 
 fn recv_delivered_json(listener: &UnixListener) -> serde_json::Value {
@@ -165,7 +165,7 @@ fn argv_source_flag_stamps_source_without_env() {
 }
 
 #[test]
-fn a_non_utf8_workspace_keys_the_session_not_the_fallback() {
+fn a_non_utf8_workspace_is_kept_lossily() {
     use std::os::unix::ffi::OsStrExt;
     let path = sock_path("cwlossy");
     let listener = UnixListener::bind(&path).expect("bind listener");
@@ -190,12 +190,9 @@ fn a_non_utf8_workspace_keys_the_session_not_the_fallback() {
 
 #[test]
 fn codewhale_event_mode_builds_envelope_from_env_and_ignores_stdin() {
-    // Env-mode MUST NOT read stdin: CodeWhale leaves the child's stdin = the
-    // TUI terminal, which NEVER reaches EOF, and `tool_call_before` runs
-    // SYNCHRONOUSLY — a blind read_to_string would freeze the user's tool call.
-    // So the fixture holds the child's stdin pipe OPEN (never write, never
-    // close) and bounds the wait: a re-added blocking read hangs and trips it,
-    // where an EOF-able pipe would pass.
+    // Env-mode never reads stdin (invariant 5): the fixture holds the child's
+    // stdin pipe OPEN (never write, never close) and bounds the wait, so a
+    // re-added blocking read hangs and trips it, where an EOF-able pipe would pass.
     let path = sock_path("cwevent");
     let listener = UnixListener::bind(&path).expect("bind listener");
     listener.set_nonblocking(true).unwrap();
@@ -221,9 +218,7 @@ fn codewhale_event_mode_builds_envelope_from_env_and_ignores_stdin() {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!(
-                "env-mode shim did not exit within 2s — it must NOT read stdin (the inherited, never-EOF TUI terminal would block it; tool_call_before runs synchronously)"
-            );
+            panic!("env-mode shim did not exit within 2s — it must NOT read stdin (invariant 5)");
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -237,7 +232,7 @@ fn codewhale_event_mode_builds_envelope_from_env_and_ignores_stdin() {
     assert_eq!(v["event"], "tool_call_before");
     assert_eq!(
         v["cwd"], "/repo/myproj",
-        "AgentId key folded from DEEPSEEK_WORKSPACE, not stdin"
+        "cwd folded from DEEPSEEK_WORKSPACE, not stdin"
     );
     assert_eq!(v["tool"], "exec_shell");
     assert_eq!(v["tool_args"], r#"{"command":"ls -la"}"#);
@@ -249,10 +244,17 @@ fn codewhale_event_mode_builds_envelope_from_env_and_ignores_stdin() {
 fn missing_socket_exits_zero_without_blocking() {
     let path = sock_path("nosock");
     let start = Instant::now();
-    let status = run_shim(&path, None, br#"{"hook_event_name":"Stop"}"#);
+    let out = run_shim_inner::<&str>(&path, None, &[], br#"{"hook_event_name":"Stop"}"#);
     assert!(
-        status.success(),
-        "must exit 0 even with no listener; got {status:?}"
+        out.status.success(),
+        "must exit 0 even with no listener; got {:?}",
+        out.status
+    );
+    assert!(
+        out.stdout.is_empty() && out.stderr.is_empty(),
+        "must stay silent: stdout {:?}, stderr {:?}",
+        out.stdout,
+        out.stderr
     );
     // A missing socket makes `connect()` return ConnectionRefused in
     // microseconds, so this guards a regression that adds a blocking
@@ -368,14 +370,16 @@ fn stalled_listener_shim_exits_zero_within_watchdog_bound() {
 }
 
 #[test]
-fn non_utf8_argv_exits_zero() {
+fn non_utf8_argv_still_delivers_the_event() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     // Non-UTF-8 bytes are legal in Unix argv, and `std::env::args()` PANICS
-    // while collecting such an argument — exit 101 + stderr, breaching
-    // invariant #5's silent exit-0 contract.
+    // while collecting such an argument; the panic hook exits 0, so only the
+    // delivered envelope shows `args_os` kept the event.
     let path = sock_path("nonutf8");
-    let status = run_shim_inner(
+    let listener = UnixListener::bind(&path).expect("bind listener");
+    listener.set_nonblocking(true).unwrap();
+    let out = run_shim_inner(
         &path,
         None,
         &[
@@ -385,8 +389,14 @@ fn non_utf8_argv_exits_zero() {
         br#"{"hook_event_name":"Stop"}"#,
     );
     assert!(
-        status.success(),
-        "non-UTF-8 argv must not panic the shim; got {status:?}"
+        out.status.success(),
+        "the shim exits 0; got {:?}",
+        out.status
+    );
+    assert!(out.stderr.is_empty());
+    assert_eq!(
+        recv_delivered_json(&listener)["_pixtuoid_source"],
+        "\u{FFFD}\u{FFFD} not utf8"
     );
 }
 

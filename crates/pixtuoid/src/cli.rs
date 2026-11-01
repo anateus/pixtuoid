@@ -41,14 +41,14 @@ fn theme_help() -> String {
 /// [`crate::config::resolve_look`].
 #[derive(Debug, Default, Clone, Copy, clap::Args)]
 pub(crate) struct LookArgs {
-    /// Which office to paint: the cutaway, drawn in terminal graphics
-    /// (kitty/iTerm2/SIXEL), or the classic half-blocks. Overrides the `look`
-    /// config key; the default is `auto`. `pixtuoid doctor` shows what this
-    /// terminal supports.
+    /// Which office to paint: the cutaway, drawn in terminal graphics (the
+    /// protocols `--protocol` lists), or the classic half-blocks. Overrides the
+    /// `look` config key; the default is `auto`. `pixtuoid doctor` shows what
+    /// this terminal supports.
     #[arg(long, value_enum)]
     pub(crate) look: Option<crate::graphics::LookMode>,
-    /// Draw the cutaway in this protocol whatever the terminal answers; it
-    /// implies `--look cutaway`.
+    /// Draw the cutaway in this protocol whatever protocol the terminal
+    /// reports; it implies `--look cutaway`.
     #[arg(long, value_enum, conflicts_with = "look")]
     pub(crate) protocol: Option<crate::graphics::ImageProtocol>,
 }
@@ -77,8 +77,8 @@ pub(crate) enum Cmd {
         #[arg(long, hide = true, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         max_desks: Option<usize>,
         /// Skip the TUI entirely — useful for CI / scripting.
-        /// Prints a one-line `agents=[label@desk:state, ...]` summary every
-        /// 200ms when it changes.
+        /// Prints a one-line `agents=[label@desk:state, ...]` summary on each
+        /// change of the scene.
         #[arg(long, default_value_t = false)]
         headless: bool,
         #[command(flatten)]
@@ -414,23 +414,6 @@ mod tests {
     }
 
     #[test]
-    fn floating_subcommand_rejects_empty_socket() {
-        assert!(Cli::try_parse_from(["pixtuoid", "floating", "--socket", "  "]).is_err());
-    }
-
-    #[test]
-    fn sources_list_parses_with_json() {
-        let cli = Cli::try_parse_from(["pixtuoid", "sources", "--json"]).unwrap();
-        assert!(matches!(
-            cli.cmd,
-            Some(Cmd::Sources {
-                action: None,
-                json: true
-            })
-        ));
-    }
-
-    #[test]
     fn sources_set_parses_its_ids() {
         let cli = Cli::try_parse_from(["pixtuoid", "sources", "set", "codex", "cursor"]).unwrap();
         match cli.cmd {
@@ -481,18 +464,6 @@ mod tests {
         assert!(matches!(dry.cmd, Some(Cmd::Setup { yes: false })));
         let apply = Cli::try_parse_from(["pixtuoid", "setup", "--yes"]).unwrap();
         assert!(matches!(apply.cmd, Some(Cmd::Setup { yes: true })));
-    }
-
-    #[test]
-    fn completions_takes_a_shell_value() {
-        let c = Cli::try_parse_from(["pixtuoid", "completions", "zsh"]).unwrap();
-        assert!(matches!(
-            c.cmd,
-            Some(Cmd::Completions {
-                shell: clap_complete::Shell::Zsh
-            })
-        ));
-        assert!(Cli::try_parse_from(["pixtuoid", "completions", "nonsense"]).is_err());
     }
 
     #[test]

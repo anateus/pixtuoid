@@ -15,7 +15,7 @@ runs:
     # lock bump from reddening this step. cargo-install, not the default
     # cargo-binstall, which gets the job token and runs prebuilt third-party
     # binaries in a job whose artifact is deployed (install-action README, Security).
-    - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+    - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
       with:
         tool: wasm-bindgen@${{ steps.bindgen.outputs.version }}
         fallback: cargo-install
@@ -25,13 +25,12 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        ver=133
+        ver="$(yq -e -p toml -oy '.tools["aqua:WebAssembly/binaryen"]' mise.toml)"
         url="https://github.com/WebAssembly/binaryen/releases/download/version_$ver/binaryen-version_${ver}-x86_64-linux.tar.gz"
         curl -fsSL --retry 5 --retry-all-errors "$url" -o /tmp/binaryen.tar.gz
         echo "2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489  /tmp/binaryen.tar.gz" | sha256sum -c -
         tar -xzf /tmp/binaryen.tar.gz -C /tmp "binaryen-version_$ver/bin/wasm-opt"
         sudo install -m 0755 "/tmp/binaryen-version_$ver/bin/wasm-opt" /usr/local/bin/wasm-opt
-        wasm-opt --version
 
     - shell: bash
       run: just gen-wasm

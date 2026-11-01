@@ -5,7 +5,7 @@ use super::health::FailureLatch;
 use super::liveness::{ProbeLadder, ProbeSnapshot, emit_session_exit, revouch_gated_files};
 use super::unclaim::drain_child_end_unclaims;
 use super::walk::{
-    TASK_SCAN_BYTES, detect_parent_id, park_if_truncated_below_cursor, scan_root, walk_jsonl,
+    SKIP_RESCAN_BYTES, detect_parent_id, park_if_truncated_below_cursor, scan_root, walk_jsonl,
 };
 use super::*;
 use crate::AgentId;
@@ -346,27 +346,19 @@ fn cc_head_scan_ignores_codex_shaped_payload_cwd() {
     );
 }
 
-fn t_decode(
-    _t: &str,
-    _s: &str,
-    _v: serde_json::Value,
-) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
-    Ok(vec![])
+fn t_decode(_t: &str, _s: &str, _v: serde_json::Value) -> Vec<AgentEvent> {
+    vec![]
 }
-fn t_decode_lifecycle(
-    t: &str,
-    s: &str,
-    v: serde_json::Value,
-) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
+fn t_decode_lifecycle(t: &str, s: &str, v: serde_json::Value) -> Vec<AgentEvent> {
     if v.get("subtype").and_then(|x| x.as_str()) == Some("session_end") {
-        return Ok(vec![AgentEvent::SessionEnd {
+        return vec![AgentEvent::SessionEnd {
             agent_id: AgentId::from_parts(s, t),
             as_child: false,
-        }]);
+        }];
     }
     let agent_id = AgentId::from_parts(s, t);
-    Ok(match v.get("type").and_then(|x| x.as_str()) {
-        Some("tool_use") => vec![AgentEvent::ActivityStart {
+    match v.get("type").and_then(|x| x.as_str()) {
+        Some("tool_use") => vec![AgentEvent::ToolUseStart {
             agent_id,
             tool_use_id: None,
             detail: None,
@@ -376,7 +368,7 @@ fn t_decode_lifecycle(
             fresh_tokens: 1,
         }],
         _ => vec![],
-    })
+    }
 }
 fn t_label(_p: &Path, _s: &str, _c: &Path) -> String {
     "t".to_string()
@@ -434,6 +426,7 @@ async fn walk_once_with_recency(
         tx: &tx,
         window,
         live: &live,
+        follower: None,
     };
     walk_jsonl(path, decoders, &ctx).await;
     drop(tx);
@@ -475,6 +468,7 @@ async fn first_sight_cwd_falls_back_to_the_path_deriver_when_content_has_none() 
             tx: &tx,
             window: Duration::from_secs(3600),
             live: &live,
+            follower: None,
         };
         walk_jsonl(&path, decoders, &ctx).await;
         drop(tx);
@@ -524,6 +518,7 @@ async fn walk_once_live(
         tx: &tx,
         window,
         live: &live,
+        follower: None,
     };
     walk_jsonl(path, decoders, &ctx).await;
     drop(tx);
@@ -828,6 +823,7 @@ async fn walk_jsonl_honors_the_path_filter() {
         tx: &tx,
         window: Duration::from_secs(60),
         live: &live,
+        follower: None,
     };
     walk_jsonl(dir.path(), decoders, &ctx).await;
 
@@ -998,6 +994,7 @@ async fn walk_once_with_head_label(
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
     walk_jsonl(path, decoders, &ctx).await;
     drop(tx);
@@ -1050,6 +1047,7 @@ async fn codex_first_sights(
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
     walk_jsonl(path, decoders, &ctx).await;
     drop(tx);
@@ -1331,7 +1329,7 @@ async fn session_end_ends_its_claim_so_later_activity_re_registers() {
             [
                 (_, AgentEvent::SessionStart { .. }),
                 ..,
-                (_, AgentEvent::ActivityStart { .. })
+                (_, AgentEvent::ToolUseStart { .. })
             ]
         ),
         "a post-end append that decodes to activity must re-register the agent \
@@ -1438,6 +1436,7 @@ async fn session_exit_drains_pending_bytes_so_a_straggler_walk_cannot_resurrect(
         tx: &tx,
         window,
         live: &live,
+        follower: None,
     };
     let id = default_id_from_path(&path);
     emit_session_exit(&id, decoders, &ctx).await;
@@ -1514,6 +1513,7 @@ async fn session_exit_purges_live_so_a_probe_failure_pass_cannot_revouch() {
         tx: &tx,
         window,
         live: &live,
+        follower: None,
     };
 
     walk_jsonl(&path, decoders, &ctx).await;
@@ -1617,6 +1617,7 @@ async fn child_end_unclaim_drains_stragglers_then_ends_the_claim_without_session
         tx: &tx,
         window,
         live: &live,
+        follower: None,
     };
     drain_child_end_unclaims(Some(&unclaims), t_decoders(), &ctx).await;
     let events = drain_events(&mut rx);
@@ -1689,6 +1690,7 @@ async fn an_ended_claim_is_not_revouched_into_a_full_replay() {
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
     drain_child_end_unclaims(Some(&unclaims), t_decoders(), &ctx).await;
     let events = drain_events(&mut rx);
@@ -1773,6 +1775,7 @@ async fn a_decoded_terminators_ended_claim_is_not_revouched_into_a_full_replay()
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
     let mut health = FailureLatch::default();
     scan_root(dir.path(), decoders, &ctx, &mut health).await;
@@ -1811,6 +1814,7 @@ async fn unclaim_for_foreign_id_stays_pending_and_leaves_local_claims_alone() {
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
     drain_child_end_unclaims(Some(&unclaims), t_decoders(), &ctx).await;
     assert_eq!(
@@ -1882,6 +1886,7 @@ async fn child_end_unclaim_ends_only_the_matched_ids_own_path() {
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
     drain_child_end_unclaims(Some(&unclaims), t_decoders(), &ctx).await;
     assert_eq!(
@@ -2024,6 +2029,7 @@ async fn known_oversized_tail_emits_session_end_if_the_skipped_span_ended() {
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
     walk_jsonl(&path, decoders, &ctx).await;
     drop(tx);
@@ -2290,6 +2296,7 @@ async fn scan_pass_re_vouches_a_transiently_gated_live_file() {
         tx: &tx,
         window: Duration::from_secs(60),
         live: &live,
+        follower: None,
     };
 
     let mut health = FailureLatch::default();
@@ -2401,6 +2408,7 @@ async fn revouch_does_not_replay_a_probe_vouched_ended_transcript() {
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
 
     let mut health = FailureLatch::default();
@@ -2533,7 +2541,7 @@ fn task_start_tuids(events: &[(Transport, AgentEvent)]) -> Vec<String> {
     events
         .iter()
         .filter_map(|(t, e)| match e {
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 tool_use_id: Some(tuid),
                 detail: Some(d),
                 ..
@@ -2584,7 +2592,7 @@ async fn oversized_attach_seeds_unmatched_task_dispatch() {
     );
     let task_pos = events
         .iter()
-        .position(|(_, e)| matches!(e, AgentEvent::ActivityStart { .. }))
+        .position(|(_, e)| matches!(e, AgentEvent::ToolUseStart { .. }))
         .expect("checked above");
     assert!(
         start_pos < task_pos,
@@ -2594,6 +2602,109 @@ async fn oversized_attach_seeds_unmatched_task_dispatch() {
         cursors.lock().await.get(&path).copied(),
         Some(full.len() as u64),
         "cursor must land at EOF — the scan seeds tasks, it must not replay the backlog"
+    );
+}
+
+/// The skip may bury a turn's bracket; the window's last one is re-emitted,
+/// start or end, so the turn the session is in shows, and one it left ends
+/// through the ledger's in-order rule.
+#[tokio::test]
+async fn oversized_attach_re_emits_the_last_turn_bracket() {
+    let line = |inner: &str, turn: &str| {
+        serde_json::json!({"type": "event_msg", "payload": {"type": inner, "turn_id": turn}})
+            .to_string()
+            + "\n"
+    };
+    let key = |k: &str| crate::state::TurnKey::Id(k.into());
+    let ended = [line("task_started", "t1"), line("task_complete", "t1")];
+    let started = [line("task_complete", "t1"), line("task_started", "t2")];
+    for (tail, want) in [(&ended, (None, Some("t1"))), (&started, (Some("t2"), None))] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-big.jsonl");
+        tokio::fs::write(&path, oversized_body(tail)).await.unwrap();
+        let (cursors, seen) = Default::default();
+        let events = walk_once_with(
+            &path,
+            Duration::from_secs(3600),
+            crate::source::codex::decode_codex_line,
+            t_ended,
+            &cursors,
+            &seen,
+        )
+        .await;
+        let brackets: Vec<_> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                AgentEvent::TurnStart { turn, .. } => Some((Some(turn.clone()), None)),
+                AgentEvent::TurnEnd { turn, .. } => Some((None, turn.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(brackets, [(want.0.map(key), want.1.map(key))], "{events:?}");
+    }
+}
+
+/// The skip's start goes ahead of its turn's in-flight dispatch, so the
+/// dispatch registers in that turn and the turn's keyed end retires it.
+#[tokio::test]
+async fn oversized_attach_re_emits_a_turns_start_before_its_dispatch() {
+    let started = serde_json::json!({"type": "event_msg",
+        "payload": {"type": "task_started", "turn_id": "t2"}});
+    let spawn = serde_json::json!({"type": "response_item", "payload": {
+        "type": "function_call", "name": "spawn_agent", "arguments": "", "call_id": "call_s"}});
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout-big.jsonl");
+    let tail = [started.to_string() + "\n", spawn.to_string() + "\n"];
+    tokio::fs::write(&path, oversized_body(&tail))
+        .await
+        .unwrap();
+    let (cursors, seen) = Default::default();
+    let events = walk_once_with(
+        &path,
+        Duration::from_secs(3600),
+        crate::source::codex::decode_codex_line,
+        t_ended,
+        &cursors,
+        &seen,
+    )
+    .await;
+    let at = |is: &dyn Fn(&AgentEvent) -> bool| events.iter().position(|(_, e)| is(e));
+    let start = at(&|e| matches!(e, AgentEvent::TurnStart { .. })).expect("t2's start");
+    let dispatch = at(
+        &|e| matches!(e, AgentEvent::ToolUseStart { tool_use_id: Some(c), .. } if c == "call_s"),
+    )
+    .expect("the in-flight dispatch");
+    assert!(start < dispatch, "{events:?}");
+
+    let (mut r, mut scene) = (crate::Reducer::new(), crate::SceneState::uniform(4));
+    let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let id = events[start].1.agent_id();
+    // The walk registers its own slot under its `test` source and deriver, and
+    // `test` sets no `SourceCaps::brackets_turns`; a codex slot does.
+    let codex = AgentEvent::SessionStart {
+        agent_id: id,
+        source: crate::source::codex::SOURCE_NAME.into(),
+        session_id: "s".into(),
+        cwd: "/repo".into(),
+        parent_id: None,
+    };
+    r.apply(&mut scene, codex, t0, Transport::Jsonl);
+    for (from, ev) in events {
+        r.apply(&mut scene, ev, t0, from);
+    }
+    assert!(
+        r.newest_in_flight(&id).is_some(),
+        "the dispatch is in flight"
+    );
+    let end = AgentEvent::TurnEnd {
+        agent_id: id,
+        turn: Some(crate::state::TurnKey::Id("t2".into())),
+    };
+    r.apply(&mut scene, end, t0, Transport::Jsonl);
+    assert_eq!(
+        r.newest_in_flight(&id),
+        None,
+        "t2's end retires its dispatch"
     );
 }
 
@@ -2616,7 +2727,7 @@ async fn oversized_attach_matched_task_is_not_seeded() {
     assert!(
         !events
             .iter()
-            .any(|(_, e)| matches!(e, AgentEvent::ActivityStart { .. })),
+            .any(|(_, e)| matches!(e, AgentEvent::ToolUseStart { .. })),
         "a matched (returned) dispatch must not be seeded — and no other backlog event may leak from the scan, got {events:?}"
     );
 }
@@ -2655,7 +2766,7 @@ async fn pending_span_of_exactly_max_bytes_replays_instead_of_skipping() {
     assert!(
         events
             .iter()
-            .any(|(_, e)| matches!(e, AgentEvent::ActivityStart { .. })),
+            .any(|(_, e)| matches!(e, AgentEvent::ToolUseStart { .. })),
         "an exactly-at-the-cap span must REPLAY (strict >) — the ordinary \
          tool activity must come through, got {events:?}"
     );
@@ -2708,7 +2819,7 @@ async fn oversized_attach_ended_session_skips_task_scan() {
     assert!(
         !events
             .iter()
-            .any(|(_, e)| matches!(e, AgentEvent::ActivityStart { .. })),
+            .any(|(_, e)| matches!(e, AgentEvent::ToolUseStart { .. })),
         "an ended span must not seed Task starts, got {events:?}"
     );
     assert!(
@@ -2753,7 +2864,7 @@ async fn oversized_attach_dispatch_outside_window_is_missed() {
         full.push_str(FILLER_LINE);
     }
     assert!(
-        (full.len() - dispatch_end) as u64 > TASK_SCAN_BYTES,
+        (full.len() - dispatch_end) as u64 > SKIP_RESCAN_BYTES,
         "the dispatch must sit deeper than the scan window"
     );
     tokio::fs::write(&path, &full).await.unwrap();
@@ -2789,14 +2900,14 @@ async fn task_scan_handles_partial_first_line() {
     full.push_str(&task_a);
     full.push_str(&task_b);
     let delta = task_a.len() / 2;
-    let target_len = offset_a + delta + TASK_SCAN_BYTES as usize;
+    let target_len = offset_a + delta + SKIP_RESCAN_BYTES as usize;
     let pad = target_len - full.len();
     assert!(pad > FILLER_LINE.len(), "padding must fit one JSON line");
     full.push_str("{\"type\":\"assistant\"}");
     full.push_str(&" ".repeat(pad - FILLER_LINE.len()));
     full.push('\n');
     assert_eq!(full.len(), target_len);
-    let boundary = full.len() - TASK_SCAN_BYTES as usize;
+    let boundary = full.len() - SKIP_RESCAN_BYTES as usize;
     assert!(
         boundary > offset_a && boundary < offset_a + task_a.len(),
         "the window boundary must split the straddled dispatch mid-line"
@@ -2844,6 +2955,7 @@ async fn walk_refuses_symlinked_entries() {
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
     let mut health = FailureLatch::default();
     scan_root(root.path(), t_decoders(), &ctx, &mut health).await;
@@ -2894,7 +3006,7 @@ async fn session_exit_parks_truncated_transcript_so_a_straggler_walk_cannot_resu
             .any(|(_, e)| matches!(e, AgentEvent::SessionStart { .. }))
     );
 
-    std::fs::write(&path, "{\"type\":\"assistant\"}\n").unwrap();
+    std::fs::write(&path, "{\"type\":\"tool_use\"}\n{\"type\":\"tool_use\"}").unwrap();
     let new_len = std::fs::metadata(&path).unwrap().len();
     assert!(
         *cursors.lock().await.get(&path).unwrap() > new_len,
@@ -2911,28 +3023,27 @@ async fn session_exit_parks_truncated_transcript_so_a_straggler_walk_cannot_resu
         tx: &tx,
         window,
         live: &live,
+        follower: None,
     };
     let id = default_id_from_path(&path);
-    emit_session_exit(&id, t_decoders(), &ctx).await;
+    let decoders = SourceDecoders {
+        decode_line: t_decode_lifecycle,
+        ..t_decoders()
+    };
+    emit_session_exit(&id, decoders, &ctx).await;
     drop(tx);
     let exit_events = drain_events(&mut rx);
     assert!(
         matches!(
-            exit_events.last(),
-            Some((Transport::Jsonl, AgentEvent::SessionEnd { .. }))
+            exit_events.as_slice(),
+            [(Transport::Jsonl, AgentEvent::SessionEnd { .. })]
         ),
-        "the terminator must be emitted (last), got {exit_events:?}"
-    );
-    assert!(
-        !exit_events
-            .iter()
-            .any(|(_, e)| matches!(e, AgentEvent::SessionStart { .. })),
-        "the exit drain must not register anything, got {exit_events:?}"
+        "the exit drain must emit only the terminator — no stale replay, no registration — got {exit_events:?}"
     );
     assert_eq!(
         cursors.lock().await.get(&path).copied(),
         Some(new_len),
-        "a truncated transcript must be PARKED at the new EOF, not reset to 0"
+        "a truncated transcript must be PARKED at the new EOF, past its unterminated tail"
     );
     assert!(
         !seen.lock().await.contains_key(&path),
@@ -2980,7 +3091,7 @@ async fn child_end_unclaim_parks_truncated_transcript_before_the_end() {
             .any(|(_, e)| matches!(e, AgentEvent::SessionStart { .. }))
     );
 
-    std::fs::write(&path, "{\"type\":\"assistant\"}\n").unwrap();
+    std::fs::write(&path, "{\"type\":\"tool_use\"}\n{\"type\":\"tool_use\"}").unwrap();
     let new_len = std::fs::metadata(&path).unwrap().len();
     assert!(
         *cursors.lock().await.get(&path).unwrap() > new_len,
@@ -3001,17 +3112,22 @@ async fn child_end_unclaim_parks_truncated_transcript_before_the_end() {
         tx: &tx,
         window,
         live: &live,
+        follower: None,
     };
-    drain_child_end_unclaims(Some(&unclaims), t_decoders(), &ctx).await;
+    let decoders = SourceDecoders {
+        decode_line: t_decode_lifecycle,
+        ..t_decoders()
+    };
+    drain_child_end_unclaims(Some(&unclaims), decoders, &ctx).await;
     let events = drain_events(&mut rx);
     assert!(
         events.is_empty(),
-        "the un-claim emits NOTHING, truncated or not — got {events:?}"
+        "the un-claim emits NOTHING — no stale replay of the rewrite — got {events:?}"
     );
     assert_eq!(
         cursors.lock().await.get(&path).copied(),
         Some(new_len),
-        "a truncated rollout must be PARKED at the new EOF before the end"
+        "a truncated rollout must be PARKED at the new EOF, past its unterminated tail"
     );
     assert_eq!(
         seen.lock().await.get(&path),
@@ -3058,6 +3174,7 @@ async fn park_if_truncated_below_cursor_lands_exactly_at_new_eof() {
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
 
     park_if_truncated_below_cursor(&path, &ctx).await;
@@ -3094,6 +3211,7 @@ async fn scan_root_on_unreadable_root_latches_failure_and_emits_nothing() {
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
 
     let mut health = FailureLatch::default();
@@ -3126,6 +3244,7 @@ async fn scan_root_on_absent_root_is_healthy_and_emits_nothing() {
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
 
     let mut health = FailureLatch::default();
@@ -3163,6 +3282,7 @@ async fn scan_root_recovers_after_a_failed_root_reports_success_once() {
         tx: &tx,
         window: Duration::from_secs(3600),
         live: &live,
+        follower: None,
     };
 
     let mut health = FailureLatch::default();
@@ -3266,10 +3386,10 @@ async fn walk_jsonl_on_a_missing_path_is_a_silent_no_op() {
 }
 
 #[tokio::test]
-async fn walk_jsonl_resets_cursor_to_zero_when_known_file_truncated_below_cursor() {
+async fn walk_jsonl_rereads_from_zero_when_known_file_truncated_below_cursor() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resync.jsonl");
-    tokio::fs::write(&path, "{\"type\":\"assistant\"}\n")
+    tokio::fs::write(&path, "{\"type\":\"tool_use\"}\n")
         .await
         .unwrap();
     let file_len = tokio::fs::metadata(&path).await.unwrap().len();
@@ -3283,45 +3403,77 @@ async fn walk_jsonl_resets_cursor_to_zero_when_known_file_truncated_below_cursor
     let cursors = Arc::new(Mutex::new(HashMap::from([(path.clone(), 999u64)])));
     let seen = Arc::new(Mutex::new(HashMap::from([(path.clone(), Sight::Claimed)])));
 
-    let events = walk_once(&path, Duration::from_secs(3600), t_ended, &cursors, &seen).await;
+    let events = walk_once_with(
+        &path,
+        Duration::from_secs(3600),
+        t_decode_lifecycle,
+        t_ended,
+        &cursors,
+        &seen,
+    )
+    .await;
     assert!(
-        events.is_empty(),
-        "the truncation resync emits nothing this pass, got {events:?}"
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, AgentEvent::ToolUseStart { .. })),
+        "the rewritten line must be decoded this pass, got {events:?}"
     );
     assert_eq!(
         cursors.lock().await.get(&path).copied(),
-        Some(0),
-        "the normal-walk truncation arm must RESET the cursor to 0 (not park at EOF)"
+        Some(file_len),
+        "the re-read advances the cursor to EOF"
     );
 }
 
 #[tokio::test]
-async fn walk_jsonl_skips_a_line_whose_decoder_errors_and_advances_cursor() {
-    fn err_decode(
-        _t: &str,
-        _s: &str,
-        v: serde_json::Value,
-    ) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
-        if v.get("boom").is_some() {
-            return Err(crate::source::decoder::DecodeError::unsupported(
-                "fixture", "boom",
-            ));
-        }
-        Ok(vec![])
-    }
-
+async fn an_unterminated_last_record_is_held_back_by_the_watcher_and_the_census_alike() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("badline.jsonl");
-    let body = "{\"boom\":1}\n{\"type\":\"assistant\",\"cwd\":\"/r\"}\n";
+    let path = dir.path().join("held-back.jsonl");
+    let body = task_dispatch_line("tu_done") + task_dispatch_line("tu_pending").trim_end();
+    tokio::fs::write(&path, &body).await.unwrap();
+    let cursors = Arc::new(Mutex::new(HashMap::new()));
+    let seen = Arc::new(Mutex::new(HashMap::new()));
+
+    let watched = walk_once_with(
+        &path,
+        Duration::from_secs(3600),
+        crate::source::omp::decode_omp_line,
+        t_ended,
+        &cursors,
+        &seen,
+    )
+    .await;
+    let censused = crate::harness::Drive::transcript_at(crate::source::omp::SOURCE_NAME, &path)
+        .expect("omp is transcript-bearing")
+        .body(body.as_bytes());
+    let census_tuids: Vec<String> = censused
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolUseStart {
+                tool_use_id: Some(t),
+                ..
+            } => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(task_start_tuids(&watched), ["tu_done"]);
+    assert_eq!(census_tuids, task_start_tuids(&watched));
+}
+
+#[tokio::test]
+async fn a_line_the_walker_skips_costs_only_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("skipped.jsonl");
+    let body = b"not json\n\xff\xfe\n{\"type\":\"tool_use\",\"cwd\":\"/r\"}\n";
     tokio::fs::write(&path, body).await.unwrap();
-    let file_len = body.len() as u64;
     let cursors = Arc::new(Mutex::new(HashMap::new()));
     let seen = Arc::new(Mutex::new(HashMap::new()));
 
     let events = walk_once_with(
         &path,
         Duration::from_secs(3600),
-        err_decode,
+        t_decode_lifecycle,
         t_ended,
         &cursors,
         &seen,
@@ -3333,12 +3485,18 @@ async fn walk_jsonl_skips_a_line_whose_decoder_errors_and_advances_cursor() {
             e,
             AgentEvent::SessionStart { agent_id, .. } if *agent_id == expected
         )),
-        "the erroring line is non-fatal; first-sight registration must still run, got {events:?}"
+        "first sight still registers, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(_, e)| matches!(e, AgentEvent::ToolUseStart { .. })),
+        "the line after the skipped ones still decodes, got {events:?}"
     );
     assert_eq!(
         cursors.lock().await.get(&path).copied(),
-        Some(file_len),
-        "the cursor must advance to EOF despite the decode error"
+        Some(body.len() as u64),
+        "the cursor advances to EOF past the skipped lines"
     );
 }
 
@@ -3374,44 +3532,6 @@ async fn task_scan_skips_empty_and_non_utf8_lines_and_still_seeds_a_dispatch() {
         task_start_tuids(&events),
         vec!["tu_x".to_string()],
         "the garbage lines must be skipped and the valid dispatch still seed, got {events:?}"
-    );
-}
-
-#[tokio::test]
-async fn task_scan_skips_a_decoder_error_line_and_still_seeds_a_later_dispatch() {
-    fn deco(
-        t: &str,
-        s: &str,
-        v: serde_json::Value,
-    ) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
-        if v.get("boom").is_some() {
-            return Err(crate::source::decoder::DecodeError::unsupported(
-                "fixture", "x",
-            ));
-        }
-        crate::source::omp::decode_omp_line(t, s, v)
-    }
-
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("deleg-decode-err.jsonl");
-    let full = oversized_body(&["{\"boom\":1}\n".to_string(), task_dispatch_line("tu_y")]);
-    tokio::fs::write(&path, &full).await.unwrap();
-    let cursors = Arc::new(Mutex::new(HashMap::new()));
-    let seen = Arc::new(Mutex::new(HashMap::new()));
-
-    let events = walk_once_with(
-        &path,
-        Duration::from_secs(3600),
-        deco,
-        t_ended,
-        &cursors,
-        &seen,
-    )
-    .await;
-    assert_eq!(
-        task_start_tuids(&events),
-        vec!["tu_y".to_string()],
-        "the decoder-error line must be skipped and the valid dispatch still seed, got {events:?}"
     );
 }
 
@@ -3489,6 +3609,7 @@ async fn revouch_pass_prunes_deleted_files_from_cursors() {
         tx: &tx,
         window: Duration::from_secs(60),
         live: &live,
+        follower: None,
     };
     revouch_gated_files(decoders, &ctx).await;
     assert!(
@@ -3683,4 +3804,658 @@ fn folded_deriver_folds_separators_and_case_on_windows() {
         !id.contains('\\') && id == id.to_lowercase(),
         "the Windows fold must normalize separators AND case, got {id:?}"
     );
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum WatchCall {
+    Watch(PathBuf, RecursiveMode),
+    Refused(PathBuf),
+    /// The watcher dropped, which ends its watch.
+    Unwatch(PathBuf),
+}
+
+type WatchHook = Box<dyn FnOnce(&Path) + Send>;
+
+/// A recording [`notify::Watcher`] factory. Its first `failures` watches fail,
+/// each removing the watched dir first when `remove_on_fail`; a `refuse`d path
+/// always fails; `on_watch` runs once, inside the first watch.
+#[derive(Clone, Default)]
+struct FakeWatcher {
+    calls: Arc<std::sync::Mutex<Vec<WatchCall>>>,
+    failures: Arc<std::sync::Mutex<usize>>,
+    remove_on_fail: bool,
+    refuse: Option<PathBuf>,
+    on_watch: Arc<std::sync::Mutex<Option<WatchHook>>>,
+}
+
+impl FakeWatcher {
+    fn calls(&self) -> Vec<WatchCall> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn attempts(&self, path: &Path) -> usize {
+        self.calls()
+            .iter()
+            .filter(|c| matches!(c, WatchCall::Watch(p, _) | WatchCall::Refused(p) if p == path))
+            .count()
+    }
+
+    /// The paths watched now.
+    fn live(&self) -> Vec<PathBuf> {
+        let mut live = Vec::new();
+        for call in self.calls() {
+            match call {
+                WatchCall::Watch(path, _) => live.push(path),
+                WatchCall::Unwatch(path) => {
+                    let at = live.iter().position(|p| *p == path).unwrap();
+                    live.remove(at);
+                }
+                WatchCall::Refused(_) => {}
+            }
+        }
+        live
+    }
+
+    fn builder(&self) -> root_watch::BuildWatcher {
+        let shared = self.shared_builder();
+        Box::new(move || shared(Path::new("")))
+    }
+
+    fn shared_builder(&self) -> root_watch::BuildShared {
+        let fake = self.clone();
+        Box::new(move |_root: &Path| {
+            Ok(Box::new(FakeInstance {
+                fake: fake.clone(),
+                watched: Vec::new(),
+            }))
+        })
+    }
+}
+
+struct FakeInstance {
+    fake: FakeWatcher,
+    watched: Vec<PathBuf>,
+}
+
+impl Drop for FakeInstance {
+    fn drop(&mut self) {
+        let mut calls = self.fake.calls.lock().unwrap();
+        calls.extend(self.watched.drain(..).map(WatchCall::Unwatch));
+    }
+}
+
+impl notify::Watcher for FakeInstance {
+    fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+        Ok(Self {
+            fake: FakeWatcher::default(),
+            watched: Vec::new(),
+        })
+    }
+
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        if let Some(hook) = self.fake.on_watch.lock().unwrap().take() {
+            hook(path);
+        }
+        let failing = {
+            let mut failures = self.fake.failures.lock().unwrap();
+            let failing = *failures > 0;
+            *failures = failures.saturating_sub(1);
+            failing
+        };
+        if failing || self.fake.refuse.as_deref() == Some(path) {
+            if failing && self.fake.remove_on_fail {
+                std::fs::remove_dir(path).unwrap();
+            }
+            let mut calls = self.fake.calls.lock().unwrap();
+            calls.push(WatchCall::Refused(path.to_path_buf()));
+            return Err(notify::Error::generic("fake watch failure"));
+        }
+        let mut calls = self.fake.calls.lock().unwrap();
+        calls.push(WatchCall::Watch(path.to_path_buf(), mode));
+        self.watched.push(path.to_path_buf());
+        Ok(())
+    }
+
+    fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+        unreachable!("a RootWatch drops a watcher rather than unwatching")
+    }
+
+    fn kind() -> notify::WatcherKind {
+        notify::WatcherKind::NullWatcher
+    }
+}
+
+/// A [`RootWatch`] on split fakes: `root_watcher` for the root, a fresh one
+/// for the anchor.
+fn fake_root_watch(
+    root: &Path,
+    root_watcher: &FakeWatcher,
+) -> (RootWatch, FakeWatcher, tokio::sync::mpsc::Receiver<()>) {
+    fake_root_watch_with(root, root_watcher, FakeWatcher::default())
+}
+
+fn fake_root_watch_with(
+    root: &Path,
+    root_watcher: &FakeWatcher,
+    anchor: FakeWatcher,
+) -> (RootWatch, FakeWatcher, tokio::sync::mpsc::Receiver<()>) {
+    let (nudge, nudges) = Nudge::channel();
+    let backend = root_watch::Backend::Split {
+        root: root_watcher.builder(),
+        anchor: anchor.builder(),
+    };
+    let watch =
+        RootWatch::with_backend(root.to_path_buf(), RecursiveMode::Recursive, backend, nudge);
+    (watch, anchor, nudges)
+}
+
+#[tokio::test]
+async fn root_watch_follows_the_root_through_appearance_and_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = a.join("b");
+    let root = b.join("root");
+    std::fs::create_dir(&a).unwrap();
+    let root_fake = FakeWatcher::default();
+    let (mut watch, anchor, _nudges) = fake_root_watch(&root, &root_fake);
+
+    assert_eq!(
+        watch.reconcile(Wake::Poll).await.unwrap(),
+        Reconciled::Unchanged
+    );
+    assert_eq!(
+        anchor.live(),
+        vec![a.clone()],
+        "an absent chain anchors at its deepest existing ancestor"
+    );
+    assert!(root_fake.live().is_empty());
+
+    std::fs::create_dir_all(&root).unwrap();
+    assert_eq!(
+        watch.reconcile(Wake::Nudge).await.unwrap(),
+        Reconciled::Attached
+    );
+    assert_eq!(
+        anchor.live(),
+        vec![b.clone()],
+        "the chain appearing moves the anchor onto the root's parent"
+    );
+    assert_eq!(root_fake.live(), vec![root.clone()]);
+    let calls = root_fake.calls().len() + anchor.calls().len();
+    assert_eq!(
+        watch.reconcile(Wake::Nudge).await.unwrap(),
+        Reconciled::Unchanged
+    );
+    assert_eq!(root_fake.calls().len() + anchor.calls().len(), calls);
+
+    std::fs::remove_dir(&root).unwrap();
+    assert_eq!(
+        watch.reconcile(Wake::Nudge).await.unwrap(),
+        Reconciled::Detached
+    );
+    assert!(root_fake.live().is_empty(), "a removed root is detached");
+    assert_eq!(
+        anchor.live(),
+        vec![b.clone()],
+        "its parent stays the anchor"
+    );
+
+    std::fs::remove_dir(&b).unwrap();
+    watch.reconcile(Wake::Nudge).await.unwrap();
+    assert_eq!(
+        anchor.live(),
+        vec![a.clone()],
+        "a removed anchor re-anchors one level up"
+    );
+}
+
+/// inotify and Windows drop the watch of a deleted directory, so one deleted
+/// and recreated between two reconciles must be watched afresh.
+#[tokio::test]
+async fn root_watch_reattaches_a_replaced_root_and_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("parent");
+    let root = parent.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let root_fake = FakeWatcher::default();
+    let (mut watch, anchor, _nudges) = fake_root_watch(&root, &root_fake);
+    assert_eq!(
+        watch.reconcile(Wake::Poll).await.unwrap(),
+        Reconciled::Attached
+    );
+
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    assert_eq!(
+        watch.reconcile(Wake::Nudge).await.unwrap(),
+        Reconciled::Attached
+    );
+    assert_eq!(
+        root_fake.attempts(&root),
+        2,
+        "the recreated root is watched afresh"
+    );
+    assert_eq!(root_fake.live(), vec![root.clone()]);
+
+    let anchored = anchor.attempts(&parent);
+    std::fs::remove_dir_all(&parent).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    assert_eq!(
+        watch.reconcile(Wake::Nudge).await.unwrap(),
+        Reconciled::Attached
+    );
+    assert!(
+        anchor.attempts(&parent) > anchored,
+        "a recreated anchor is watched afresh"
+    );
+    assert_eq!(anchor.live(), vec![parent.clone()]);
+}
+
+/// A directory created while the anchor moves is under no watch yet, so the
+/// reconcile re-reads until the anchor stays put.
+#[tokio::test]
+async fn root_watch_reanchors_past_a_dir_created_while_it_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    let b = a.join("b");
+    std::fs::create_dir(&a).unwrap();
+    let anchor = FakeWatcher::default();
+    let mkdir = b.clone();
+    *anchor.on_watch.lock().unwrap() = Some(Box::new(move |_| {
+        std::fs::create_dir(&mkdir).unwrap();
+    }));
+    let (mut watch, anchor, _nudges) =
+        fake_root_watch_with(&b.join("root"), &FakeWatcher::default(), anchor);
+    watch.reconcile(Wake::Poll).await.unwrap();
+    assert_eq!(anchor.live(), vec![b]);
+}
+
+#[tokio::test]
+async fn root_watch_warns_a_failed_attach_once_and_retries_it_on_the_poll() {
+    let (logs, _guard) = crate::test_capture::capture_warns();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let root_fake = FakeWatcher::default();
+    *root_fake.failures.lock().unwrap() = 3;
+    let (mut watch, _anchor, _nudges) = fake_root_watch(&root, &root_fake);
+
+    assert!(
+        watch.reconcile(Wake::Poll).await.is_err(),
+        "a boot attach failure is the caller's"
+    );
+    for wake in [Wake::Poll, Wake::Nudge, Wake::Poll] {
+        assert_eq!(watch.reconcile_logged(wake).await, Reconciled::Unchanged);
+    }
+    assert_eq!(
+        root_fake.attempts(&root),
+        3,
+        "a nudge leaves the failed directory to the poll"
+    );
+    assert_eq!(
+        watch.reconcile_logged(Wake::Poll).await,
+        Reconciled::Attached
+    );
+    assert_eq!(
+        logs.contents()
+            .matches("watch root could not be attached")
+            .count(),
+        1,
+        "a persistent failure warns once: {}",
+        logs.contents()
+    );
+}
+
+#[tokio::test]
+async fn root_watch_keeps_the_root_when_its_anchor_cannot_be_watched() {
+    let (logs, _guard) = crate::test_capture::capture_warns();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let anchor = FakeWatcher {
+        refuse: Some(dir.path().to_path_buf()),
+        ..FakeWatcher::default()
+    };
+    let root_fake = FakeWatcher::default();
+    let (mut watch, anchor, _nudges) = fake_root_watch_with(&root, &root_fake, anchor);
+    assert_eq!(
+        watch.reconcile(Wake::Poll).await.unwrap(),
+        Reconciled::Attached,
+        "an anchor failure never fails the boot attach"
+    );
+    assert_eq!(root_fake.live(), vec![root.clone()]);
+    assert_eq!(
+        watch.reconcile_logged(Wake::Nudge).await,
+        Reconciled::Unchanged
+    );
+    assert_eq!(anchor.attempts(dir.path()), 1, "only the poll retries it");
+    watch.reconcile_logged(Wake::Poll).await;
+    assert_eq!(anchor.attempts(dir.path()), 2);
+    assert_eq!(
+        logs.contents()
+            .matches("watch anchor could not be attached")
+            .count(),
+        1,
+        "a persistent failure warns once: {}",
+        logs.contents()
+    );
+}
+
+/// A shared watcher hosts both watches, the root's first.
+#[tokio::test]
+async fn root_watch_shares_one_watcher_root_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let fake = FakeWatcher::default();
+    let (nudge, _nudges) = Nudge::channel();
+    let backend = root_watch::Backend::Shared(fake.shared_builder());
+    let mut watch = RootWatch::with_backend(root.clone(), RecursiveMode::Recursive, backend, nudge);
+    assert_eq!(
+        watch.reconcile(Wake::Poll).await.unwrap(),
+        Reconciled::Attached
+    );
+    assert_eq!(
+        fake.calls(),
+        vec![
+            WatchCall::Watch(root.clone(), RecursiveMode::Recursive),
+            WatchCall::Watch(dir.path().to_path_buf(), RecursiveMode::NonRecursive),
+        ]
+    );
+}
+
+#[test]
+fn routed_events_reach_the_root_only_from_inside_it() {
+    use notify::EventHandler;
+    use notify::event::{CreateKind, DataChange, ModifyKind, RenameMode};
+    let root = PathBuf::from("/home/u/.claude/projects");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (nudge, mut nudges) = Nudge::channel();
+    let mut routed = root_watch::Routed {
+        root: root.clone(),
+        root_events: {
+            let seen = seen.clone();
+            move |res: notify::Result<notify::Event>| seen.lock().unwrap().push(res.unwrap().paths)
+        },
+        nudge,
+    };
+    let mut send = |kind, paths: &[&str]| {
+        let mut event = notify::Event::new(kind);
+        event.paths = paths.iter().map(PathBuf::from).collect();
+        routed.handle_event(Ok(event));
+        let nudged = nudges.try_recv().is_ok();
+        (std::mem::take(&mut *seen.lock().unwrap()), nudged)
+    };
+    let inside = "/home/u/.claude/projects/p/s.jsonl";
+    let beside = "/home/u/.claude/history.jsonl";
+    let data = notify::EventKind::Modify(ModifyKind::Data(DataChange::Any));
+    let create = notify::EventKind::Create(CreateKind::Any);
+    assert_eq!(
+        send(data, &[inside]),
+        (vec![vec![PathBuf::from(inside)]], false)
+    );
+    assert_eq!(
+        send(data, &[beside]),
+        (vec![], false),
+        "a file beside the root is no transcript"
+    );
+    assert_eq!(
+        send(create, &["/home/u/.claude/projects"]),
+        (vec![], true),
+        "the root itself nudges"
+    );
+    assert_eq!(
+        send(
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[beside, inside]
+        ),
+        (vec![vec![PathBuf::from(inside)]], true)
+    );
+    assert_eq!(
+        send(notify::EventKind::Other, &[]),
+        (vec![], true),
+        "a rescan nudges"
+    );
+}
+
+#[tokio::test]
+async fn root_watch_treats_a_root_removed_mid_attach_as_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let root_fake = FakeWatcher {
+        remove_on_fail: true,
+        ..FakeWatcher::default()
+    };
+    *root_fake.failures.lock().unwrap() = 1;
+    let (mut watch, _anchor, _nudges) = fake_root_watch(&root, &root_fake);
+    assert_eq!(
+        watch.reconcile(Wake::Poll).await.unwrap(),
+        Reconciled::Unchanged
+    );
+    std::fs::create_dir(&root).unwrap();
+    assert_eq!(
+        watch.reconcile(Wake::Nudge).await.unwrap(),
+        Reconciled::Attached,
+        "the race left nothing to wait out"
+    );
+}
+
+#[tokio::test]
+async fn root_watch_never_anchors_a_filesystem_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let top = dir.path().ancestors().last().unwrap();
+    let root = top.join("pixtuoid-no-such-dir-7f3a").join("root");
+    let root_fake = FakeWatcher::default();
+    let (mut watch, anchor, _nudges) = fake_root_watch(&root, &root_fake);
+    assert_eq!(
+        watch.reconcile(Wake::Poll).await.unwrap(),
+        Reconciled::Unchanged
+    );
+    assert!(anchor.calls().is_empty(), "anchored at {top:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_watch_fails_on_a_root_it_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let sealed = dir.path().join("sealed");
+    std::fs::create_dir(&sealed).unwrap();
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let root_fake = FakeWatcher::default();
+    let (mut watch, _anchor, _nudges) = fake_root_watch(&sealed.join("root"), &root_fake);
+    let result = watch.reconcile(Wake::Poll).await;
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(result.is_err(), "an EACCES stat is a watch failure (#157)");
+}
+
+#[test]
+fn nudge_wakes_only_on_a_change_to_which_directories_exist() {
+    use notify::event::{
+        AccessKind, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode,
+    };
+    let (nudge, mut nudges) = Nudge::channel();
+    let woke = |kind: notify::EventKind, nudges: &mut tokio::sync::mpsc::Receiver<()>| {
+        nudge.on_event(&Ok(notify::Event::new(kind)));
+        nudges.try_recv().is_ok()
+    };
+    for quiet in [
+        notify::EventKind::Access(AccessKind::Any),
+        notify::EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+        notify::EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+        notify::EventKind::Modify(ModifyKind::Any),
+    ] {
+        assert!(!woke(quiet, &mut nudges), "{quiet:?} nudged");
+    }
+    for structural in [
+        notify::EventKind::Create(CreateKind::Any),
+        notify::EventKind::Remove(RemoveKind::Any),
+        notify::EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+        notify::EventKind::Any,
+        notify::EventKind::Other,
+    ] {
+        assert!(
+            woke(structural, &mut nudges),
+            "{structural:?} did not nudge"
+        );
+    }
+    nudge.on_event(&Err(notify::Error::generic("lost events")));
+    assert!(nudges.try_recv().is_ok(), "an error may hide a lost event");
+}
+
+#[cfg(target_os = "macos")]
+mod follow {
+    use super::*;
+
+    fn follower() -> Follower {
+        Follower::spawn(|_: notify::Result<notify::Event>| {}).unwrap()
+    }
+
+    /// A walk with the follower follows a first sight it admits, before the
+    /// early return an empty file takes (codex writes its first line after
+    /// `git`).
+    #[tokio::test]
+    async fn an_admitted_first_sight_is_followed_and_a_gated_one_is_not() {
+        let follower = follower();
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.jsonl");
+        std::fs::File::create(&fresh).unwrap();
+        let old = dir.path().join("old.jsonl");
+        std::fs::write(&old, "{}\n").unwrap();
+        backdate_one_hour(&old);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(32);
+        let source: Arc<str> = Arc::from("test");
+        let cursors = Arc::new(Mutex::new(HashMap::new()));
+        let seen = Arc::new(Mutex::new(HashMap::new()));
+        let live = Arc::new(Mutex::new(HashSet::new()));
+        let ctx = WatchCtx {
+            source: &source,
+            cursors: &cursors,
+            seen: &seen,
+            tx: &tx,
+            window: Duration::from_secs(60),
+            live: &live,
+            follower: Some(&follower),
+        };
+        walk_jsonl(&fresh, t_decoders(), &ctx).await;
+        walk_jsonl(&old, t_decoders(), &ctx).await;
+        assert!(
+            follower.follows(&fresh),
+            "the admitted empty file is followed"
+        );
+        assert!(!follower.follows(&old), "the gated file is not");
+    }
+
+    /// Admitted and followed by an event-driven walk, an empty transcript's
+    /// first line may land between the walk's stat and the knote: no note
+    /// carries it, so the walk itself must read it.
+    #[tokio::test]
+    async fn a_write_that_beats_the_knote_is_read_by_the_walk_that_follows() {
+        let follower = follower();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.jsonl");
+        std::fs::File::create(&path).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(32);
+        let source: Arc<str> = Arc::from("test");
+        let cursors = Arc::new(Mutex::new(HashMap::new()));
+        let seen = Arc::new(Mutex::new(HashMap::new()));
+        let live = Arc::new(Mutex::new(HashSet::new()));
+        let ctx = WatchCtx {
+            source: &source,
+            cursors: &cursors,
+            seen: &seen,
+            tx: &tx,
+            window: Duration::from_secs(60),
+            live: &live,
+            follower: Some(&follower),
+        };
+        // `probe_admits` takes `live` after the walk's stat and before its
+        // follow, so holding it parks the walk in that window.
+        let parked = live.lock().await;
+        let first_line = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"{}\n")
+                .unwrap();
+            drop(parked);
+        };
+        tokio::join!(walk_jsonl(&path, t_decoders(), &ctx), first_line);
+        assert!(follower.follows(&path));
+        assert!(
+            drain_events(&mut rx)
+                .iter()
+                .any(|(_, e)| matches!(e, AgentEvent::SessionStart { .. })),
+            "the first line was left for a note that never comes"
+        );
+    }
+
+    /// A scan admits every transcript in the initial window; following them
+    /// all would hold an fd for each.
+    #[tokio::test]
+    async fn a_scan_admits_a_fresh_transcript_without_following_it() {
+        let follower = follower();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(32);
+        let source: Arc<str> = Arc::from("test");
+        let cursors = Arc::new(Mutex::new(HashMap::new()));
+        let seen = Arc::new(Mutex::new(HashMap::new()));
+        let live = Arc::new(Mutex::new(HashSet::new()));
+        let ctx = WatchCtx {
+            source: &source,
+            cursors: &cursors,
+            seen: &seen,
+            tx: &tx,
+            window: Duration::from_secs(60),
+            live: &live,
+            follower: Some(&follower),
+        };
+        scan_root(dir.path(), t_decoders(), &ctx, &mut FailureLatch::default()).await;
+        assert_eq!(seen.lock().await.get(&path), Some(&Sight::Claimed));
+        assert!(!follower.follows(&path));
+    }
+
+    fn vouch_child(_root: &Path) -> Option<ProbeSnapshot> {
+        Some(snap(&[("child", 1)]))
+    }
+
+    /// A multi-turn codex child's claim ends at each turn while its parent
+    /// still holds the rollout open; the pass follows it on the probe's word.
+    #[tokio::test]
+    async fn a_pass_follows_an_ended_transcript_a_live_writer_holds() {
+        let follower = follower();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("child.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let watcher = JsonlWatcher::new(dir.path().to_path_buf(), "test".into(), t_decode, t_ended)
+            .with_root_probe(vouch_child);
+        let decoders = SourceDecoders {
+            id_derive: super::folded::FoldedDeriver::new(stem_id),
+            ..t_decoders()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel::<(Transport, AgentEvent)>(32);
+        let source: Arc<str> = Arc::from("test");
+        let cursors = Arc::new(Mutex::new(HashMap::from([(path.clone(), 3)])));
+        let seen = Arc::new(Mutex::new(HashMap::from([(path.clone(), Sight::Ended)])));
+        let live = Arc::new(Mutex::new(HashSet::new()));
+        let ctx = WatchCtx {
+            source: &source,
+            cursors: &cursors,
+            seen: &seen,
+            tx: &tx,
+            window: Duration::from_secs(60),
+            live: &live,
+            follower: Some(&follower),
+        };
+        let mut scan_state = ScanState::new(Duration::from_secs(60));
+        watcher
+            .run_scan_pass(&ctx, &mut scan_state, None, None, decoders, false)
+            .await;
+        assert!(follower.follows(&path));
+    }
 }

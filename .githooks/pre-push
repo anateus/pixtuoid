@@ -6,6 +6,10 @@
 #   git config core.hooksPath .githooks
 set -euo pipefail
 
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=SCRIPTDIR/../scripts/lib/hook-just.sh
+source "$here/../scripts/lib/hook-just.sh"
+
 # Resolved before the scrub drops GIT_DIR: when the hook's CWD is outside the
 # worktree (`git --git-dir=… push` from elsewhere) that is the only locator.
 toplevel=$(git rev-parse --show-toplevel)
@@ -15,21 +19,13 @@ toplevel=$(git rev-parse --show-toplevel)
 # silently writes into THIS one (#893) — the unset githooks(5) prescribes
 # (https://git-scm.com/docs/githooks), applied here rather than per-script so
 # nothing downstream has to remember it.
-# A failed or empty list would leave the scrub silently not happening, and
-# `unset $(...)` discards the substitution's status so `set -e` never sees it.
-if ! scrub=$(git rev-parse --local-env-vars) || [ -z "$scrub" ]; then
-    printf '\033[31m[pre-push] git gave no local-env-vars — refusing to run unscrubbed\033[0m\n' >&2
-    exit 1
-fi
+# `unset $(...)` would discard the substitution's status, which `set -e` needs.
+scrub=$(git rev-parse --local-env-vars)
 # shellcheck disable=SC2086  # the var list must word-split
 unset $scrub
 
 cd "$toplevel"
 
-if ! command -v just &>/dev/null; then
-    # shellcheck disable=SC2016  # backticks are literal text, not expansion
-    printf '\033[31m[pre-push] `just` not found — install it (brew install just)\033[0m\n' >&2
-    exit 1
-fi
+resolve_just
 
-exec just preflight
+exec "${just[@]}" preflight

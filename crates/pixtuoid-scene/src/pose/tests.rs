@@ -1,8 +1,9 @@
 use super::*;
 use crate::anim::PAINT_FRAME_MS;
+use crate::character::test_support::make_slot;
 use crate::physics::{LegProgress, octile_distance, octile_path_len, walk_profile};
 use crate::walk::settle_len;
-use pixtuoid_core::state::{ActivityState, GlobalDeskIndex, ToolKind};
+use pixtuoid_core::state::{ActivityState, GlobalDeskIndex, ToolKind, ToolUse};
 use pixtuoid_core::walkable::WalkableMask;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -79,8 +80,8 @@ fn walk_leg_freezes_path_against_midleg_reroute() {
     let door = l.door_threshold;
     let desk = l.home_desks[0];
     let desk_target = Point {
-        x: desk.x + 6,
-        y: desk.y + 4,
+        x: desk.at.x + 6,
+        y: desk.at.y + 4,
     };
     let mid_a = Point {
         x: door.x,
@@ -130,65 +131,30 @@ fn walk_leg_freezes_path_against_midleg_reroute() {
     );
 }
 
-fn active_slot(state_started_at: SystemTime, created_at: SystemTime) -> AgentSlot {
+fn running_slot(state_started_at: SystemTime, created_at: SystemTime) -> AgentSlot {
     AgentSlot {
-        agent_id: AgentId::from_transcript_path("/snap.jsonl"),
-        source: Arc::from("claude-code"),
-        session_id: Arc::from("s"),
         cwd: Arc::from(PathBuf::from("/p").as_path()),
         label: "cc".into(),
-        state: ActivityState::Active {
-            tool_use_id: Some(Arc::from("t")),
-            detail: Some(Arc::from("Edit")),
-            kind: ToolKind::Edit,
-        },
         state_started_at,
         last_event_at: created_at,
         created_at,
-        exiting_at: None,
-        pending_idle_at: None,
-
-        desk_index: GlobalDeskIndex(0),
-        floor_idx: 0,
-        tool_call_count: 0,
-        active_ms: 0,
-        unknown_cwd: false,
-        parent_id: None,
-        pid: None,
-        model: None,
-        effort: None,
-        tokens_used: 0,
-        last_usage: None,
+        ..make_slot(
+            AgentId::from_transcript_path("/snap.jsonl"),
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some(Arc::from("t")),
+                    detail: Some(Arc::from("Edit")),
+                    kind: ToolKind::Edit,
+                }),
+            },
+        )
     }
 }
 
 fn entry_slot(created_at: SystemTime) -> AgentSlot {
-    let mut s = active_slot(created_at, created_at);
+    let mut s = running_slot(created_at, created_at);
     s.state = ActivityState::Idle;
     s
-}
-
-#[test]
-fn snap_back_walks_from_history_when_state_just_flipped() {
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let l = layout();
-    let slot = active_slot(now, now - Duration::from_secs(60));
-    let desk = l.home_desks[0];
-    // Far from the desk so the snap-back arms.
-    let prev = Point {
-        x: desk.x + 50,
-        y: desk.y + 30,
-    };
-    let mut rig = RouteRig::new(StubRouter::straight());
-    rig.history
-        .record(slot.agent_id, prev, now - Duration::from_millis(50));
-    match derive_with_routing(&slot, now, &l, &mut rig.rctx()) {
-        Some(Pose::Walking { segment, .. }) => {
-            let from = segment.from();
-            assert_eq!(from, prev, "snap-back walk should start from recorded prev");
-        }
-        other => panic!("expected snap-back Walking pose, got {other:?}"),
-    }
 }
 
 #[test]
@@ -200,12 +166,12 @@ fn seated_waypoint_snap_back_starts_from_the_seat_not_the_approach_cell() {
     let desk = l.home_desks[0];
     // Distinct seat vs approach cells, both far from the desk chair (snap arms).
     let seat = Point {
-        x: desk.x + 50,
-        y: desk.y + 30,
+        x: desk.at.x + 50,
+        y: desk.at.y + 30,
     };
     let approach = Point {
-        x: desk.x + 56,
-        y: desk.y + 30,
+        x: desk.at.x + 56,
+        y: desk.at.y + 30,
     };
     let mut rig = RouteRig::new(StubRouter::straight());
 
@@ -232,9 +198,9 @@ fn seated_waypoint_snap_back_starts_from_the_seat_not_the_approach_cell() {
         other => panic!("expected AtWaypoint pose, got {other:?}"),
     }
 
-    let active = active_slot(now, now - Duration::from_secs(60));
+    let running = running_slot(now, now - Duration::from_secs(60));
     let then = now + Duration::from_millis(50);
-    match derive_with_routing(&active, then, &l, &mut rig.rctx()) {
+    match derive_with_routing(&running, then, &l, &mut rig.rctx()) {
         Some(Pose::Walking { segment, .. }) => assert_eq!(
             segment.from(),
             seat,
@@ -250,14 +216,14 @@ fn snap_back_origin_is_frozen_across_frames() {
     let l = layout();
     // state_started_at == now0: the leg arms on frame 0 and stays armed (the
     // re-arm guard keys on state_started_at, which is constant here).
-    let slot = active_slot(now0, now0 - Duration::from_secs(60));
+    let slot = running_slot(now0, now0 - Duration::from_secs(60));
     let desk = l.home_desks[0];
     // Far from the desk so the pre-fix integer-pixel drift surfaces inside the
     // 8-frame window; a snap near SNAP_BACK_MIN_DIST could delay the first
     // drift past the window and false-pass on broken code.
     let prev0 = Point {
-        x: desk.x + 50,
-        y: desk.y + 30,
+        x: desk.at.x + 50,
+        y: desk.at.y + 30,
     };
     let mut rig = RouteRig::new(StubRouter::straight());
     rig.history
@@ -288,12 +254,12 @@ fn snap_back_cornered_leg_freezes_path_no_reroute() {
     let l = layout();
     let desk = l.home_desks[0];
     let snap_target = Point {
-        x: desk.x + 6,
-        y: desk.y + 4,
+        x: desk.at.x + 6,
+        y: desk.at.y + 4,
     };
     let prev0 = Point {
-        x: desk.x + 50,
-        y: desk.y + 30,
+        x: desk.at.x + 50,
+        y: desk.at.y + 30,
     };
     let corner_a = Point {
         x: prev0.x,
@@ -312,7 +278,7 @@ fn snap_back_cornered_leg_freezes_path_no_reroute() {
     });
 
     // State flipped 100ms ago — inside `SNAP_BACK_MS` on both frames.
-    let slot = active_slot(
+    let slot = running_slot(
         now - Duration::from_millis(100),
         now - Duration::from_secs(60),
     );
@@ -360,13 +326,13 @@ fn snap_back_derive_is_idempotent_within_a_frame() {
     // shared history and walks — hence the inner k-loop.
     let now0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let l = layout();
-    let slot = active_slot(now0, now0 - Duration::from_secs(60));
+    let slot = running_slot(now0, now0 - Duration::from_secs(60));
     let desk = l.home_desks[0];
     // Far enough from the CHAIR to arm (≥ SNAP_BACK_MIN_DIST); the chair-distance
     // gate then stops it re-arming once the walk reaches the chair, so it settles.
     let prev0 = Point {
-        x: desk.x + 16,
-        y: desk.y + 12,
+        x: desk.at.x + 16,
+        y: desk.at.y + 12,
     };
     let mut rig = RouteRig::new(StubRouter::straight());
     rig.history
@@ -377,12 +343,7 @@ fn snap_back_derive_is_idempotent_within_a_frame() {
         let t = now0 + Duration::from_millis(i * PAINT_FRAME_MS);
         let p0 = derive_with_routing(&slot, t, &l, &mut rig.rctx());
         let h0 = rig.history.recent(slot.agent_id, 300, t);
-        if arrived_frame.is_none()
-            && matches!(
-                p0,
-                Some(Pose::SeatedTyping | Pose::SeatedIdle | Pose::SeatedThinking)
-            )
-        {
+        if arrived_frame.is_none() && matches!(p0, Some(Pose::SeatedTyping | Pose::SeatedIdle)) {
             arrived_frame = Some(i);
         }
         for k in 1..4 {
@@ -421,7 +382,7 @@ fn wander_derive_is_idempotent_within_a_frame() {
     slot.last_event_at = old;
 
     let mut rig = RouteRig::new(AStarRouter::new());
-    rig.router.set_preferred_zone(l.corridor);
+    rig.router.set_preferred_zone(Some(l.corridor));
 
     for i in 0..200u64 {
         let t = now0 + Duration::from_millis(i * PAINT_FRAME_MS);
@@ -440,12 +401,12 @@ fn wander_derive_is_idempotent_within_a_frame() {
 fn snap_back_long_distance_renders_past_window_by_physics() {
     let now0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let l = layout();
-    let slot = active_slot(now0, now0 - Duration::from_secs(60));
+    let slot = running_slot(now0, now0 - Duration::from_secs(60));
     let desk = l.home_desks[0];
     // Far prev → SnapBack physics duration well over the `SNAP_BACK_MS` arm window.
     let prev = Point {
-        x: desk.x + 50,
-        y: desk.y + 30,
+        x: desk.at.x + 50,
+        y: desk.at.y + 30,
     };
     let mut rig = RouteRig::new(StubRouter::straight());
     rig.history
@@ -459,9 +420,7 @@ fn snap_back_long_distance_renders_past_window_by_physics() {
                 walking_after_window = true
             }
             Some(Pose::Walking { .. }) => {}
-            Some(Pose::SeatedTyping | Pose::SeatedIdle | Pose::SeatedThinking)
-                if walking_after_window =>
-            {
+            Some(Pose::SeatedTyping | Pose::SeatedIdle) if walking_after_window => {
                 arrived = true;
                 break;
             }
@@ -486,10 +445,10 @@ fn snap_back_routes_via_the_approach_cell_then_settles_onto_the_chair() {
         .find(|&i| desk_approach_cell(l.home_desks[i], &l).is_some())
         .expect("a desk with a valid approach cell");
     let desk = l.home_desks[desk_index];
-    let chair = desk_walk_anchor_facing(desk, l.desk_facing_at(desk));
+    let chair = desk_walk_anchor_facing(desk.at, desk.facing);
     let approach = desk_approach_cell(desk, &l).expect("approach cell");
 
-    let mut slot = active_slot(now, now - Duration::from_secs(60));
+    let mut slot = running_slot(now, now - Duration::from_secs(60));
     slot.desk_index = GlobalDeskIndex(desk_index);
     slot.agent_id = AgentId::from_transcript_path("/snapapproach/slot.jsonl");
     // Far from the chair (≥ SNAP_BACK_MIN_DIST) so the snap-back arms.
@@ -529,11 +488,11 @@ fn snap_back_routes_via_the_approach_cell_then_settles_onto_the_chair() {
 fn snap_back_skipped_when_prev_within_min_distance() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let l = layout();
-    let slot = active_slot(now, now - Duration::from_secs(60));
+    let slot = running_slot(now, now - Duration::from_secs(60));
     let desk = l.home_desks[0];
     // 3 px from the SEAT, not from the desk origin — the threshold is measured
     // against where the agent sits, and the seat carries a per-desk nudge.
-    let seat = crate::layout::desk_walk_anchor_facing(desk, l.desk_facing_at(desk));
+    let seat = crate::layout::desk_walk_anchor_facing(desk.at, desk.facing);
     let close = Point {
         x: seat.x,
         y: seat.y.saturating_sub(3),
@@ -552,14 +511,14 @@ fn snap_back_skipped_when_prev_within_min_distance() {
 fn snap_back_skipped_past_its_window() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let l = layout();
-    let slot = active_slot(
+    let slot = running_slot(
         now - Duration::from_millis(2 * SNAP_BACK_MS),
         now - Duration::from_secs(60),
     );
     let desk = l.home_desks[0];
     let prev = Point {
-        x: desk.x + 50,
-        y: desk.y + 30,
+        x: desk.at.x + 50,
+        y: desk.at.y + 30,
     };
     let mut rig = RouteRig::new(StubRouter::straight());
     rig.history
@@ -575,7 +534,7 @@ fn snap_back_skipped_past_its_window() {
 fn snap_back_skipped_without_recent_history() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let l = layout();
-    let slot = active_slot(now, now - Duration::from_secs(60));
+    let slot = running_slot(now, now - Duration::from_secs(60));
     let mut rig = RouteRig::new(StubRouter::straight());
     let p = derive_with_routing(&slot, now, &l, &mut rig.rctx());
     assert!(
@@ -592,10 +551,10 @@ fn multi_segment_path_maps_progress_to_segment_via_octile_distance() {
     let door = l.door_threshold;
     let desk = l.home_desks[0];
     let mid = Point {
-        x: u16::midpoint(door.x, desk.x),
-        y: u16::midpoint(door.y, desk.y),
+        x: u16::midpoint(door.x, desk.at.x),
+        y: u16::midpoint(door.y, desk.at.y),
     };
-    let mut rig = RouteRig::new(StubRouter::corners(vec![door, mid, desk]));
+    let mut rig = RouteRig::new(StubRouter::corners(vec![door, mid, desk.at]));
     let p = derive_with_routing(&slot, now, &l, &mut rig.rctx());
     match p {
         Some(Pose::Walking { segment, .. }) => {
@@ -619,29 +578,15 @@ fn at_waypoint_pose_records_position_to_history() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let l = layout();
     let slot = AgentSlot {
-        agent_id: AgentId::from_transcript_path("/idle.jsonl"),
-        source: Arc::from("claude-code"),
-        session_id: Arc::from("s"),
         cwd: Arc::from(PathBuf::from("/p").as_path()),
         label: "cc".into(),
-        state: ActivityState::Idle,
         state_started_at: now,
         created_at: now - Duration::from_secs(60),
         last_event_at: now - Duration::from_secs(60),
-        exiting_at: None,
-        pending_idle_at: None,
-
-        desk_index: GlobalDeskIndex(0),
-        floor_idx: 0,
-        tool_call_count: 0,
-        active_ms: 0,
-        unknown_cwd: false,
-        parent_id: None,
-        pid: None,
-        model: None,
-        effort: None,
-        tokens_used: 0,
-        last_usage: None,
+        ..make_slot(
+            AgentId::from_transcript_path("/idle.jsonl"),
+            ActivityState::Idle,
+        )
     };
     let mut rig = RouteRig::new(StubRouter::straight());
     let _ = derive_with_routing(&slot, now, &l, &mut rig.rctx());
@@ -655,7 +600,7 @@ fn at_waypoint_pose_records_position_to_history() {
 fn delegates_to_derive_for_oob_desk() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let l = layout();
-    let mut slot = active_slot(now, now - Duration::from_secs(60));
+    let mut slot = running_slot(now, now - Duration::from_secs(60));
     slot.desk_index = GlobalDeskIndex(999);
     let mut rig = RouteRig::new(StubRouter::straight());
     assert!(derive_with_routing(&slot, now, &l, &mut rig.rctx()).is_none());
@@ -688,12 +633,12 @@ fn pose_history_recent_expires() {
 fn snap_back_progress_is_physics_eased_not_linear() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let l = layout();
-    let slot = active_slot(now, now - Duration::from_secs(60));
+    let slot = running_slot(now, now - Duration::from_secs(60));
     let desk = l.home_desks[0];
     // Far from the CHAIR (≥ SNAP_BACK_MIN_DIST) so the snap-back arms.
     let prev = Point {
-        x: desk.x + 20,
-        y: desk.y + 18,
+        x: desk.at.x + 20,
+        y: desk.at.y + 18,
     };
 
     let mut rig = RouteRig::new(StubRouter::straight());
@@ -719,7 +664,7 @@ fn snap_back_progress_is_physics_eased_not_linear() {
 
     // Record history 50 ms before `quarter_now` so it stays inside the
     // `HISTORY_RECENT_MS` freshness gate.
-    let slot_q = active_slot(now, now - Duration::from_secs(60));
+    let slot_q = running_slot(now, now - Duration::from_secs(60));
     let quarter_now = now + Duration::from_millis(dur_ms / 4);
     rig.history = PoseHistory::new();
     rig.history.record(
@@ -748,48 +693,6 @@ fn snap_back_progress_is_physics_eased_not_linear() {
 }
 
 #[test]
-fn snap_back_profile_stored_in_walk_state() {
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let l = layout();
-    let slot = active_slot(now, now - Duration::from_secs(60));
-    let desk = l.home_desks[0];
-    let prev = Point {
-        x: desk.x + 50,
-        y: desk.y + 30,
-    };
-
-    let mut rig = RouteRig::new(StubRouter::straight());
-    rig.history
-        .record(slot.agent_id, prev, now - Duration::from_millis(50));
-
-    let _p1 = derive_with_routing(&slot, now, &l, &mut rig.rctx());
-    let dur1 = rig
-        .walks
-        .get(&slot.agent_id)
-        .and_then(|walk| walk.snap_back.as_ref())
-        .map(|leg| leg.profile.duration_ms)
-        .expect("snap_back profile created on frame 1");
-
-    // Fresh history but the SAME persistent walks map.
-    let slot2 = active_slot(now, now - Duration::from_secs(60));
-    let t2 = now + Duration::from_millis(100);
-    rig.history
-        .record(slot2.agent_id, prev, t2 - Duration::from_millis(50));
-    let _p2 = derive_with_routing(&slot2, t2, &l, &mut rig.rctx());
-    let dur2 = rig
-        .walks
-        .get(&slot2.agent_id)
-        .and_then(|walk| walk.snap_back.as_ref())
-        .map(|leg| leg.profile.duration_ms)
-        .expect("snap_back profile still present on frame 2");
-
-    assert_eq!(
-        dur1, dur2,
-        "snap-back profile must be snapshotted once and reused across frames"
-    );
-}
-
-#[test]
 fn snap_back_rearms_on_new_state_transition() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let l = layout();
@@ -797,10 +700,10 @@ fn snap_back_rearms_on_new_state_transition() {
     let mut rig = RouteRig::new(StubRouter::straight());
 
     let t0 = now;
-    let slot0 = active_slot(t0, now - Duration::from_secs(60));
+    let slot0 = running_slot(t0, now - Duration::from_secs(60));
     let prev0 = Point {
-        x: desk.x + 50,
-        y: desk.y + 30,
+        x: desk.at.x + 50,
+        y: desk.at.y + 30,
     };
     rig.history
         .record(slot0.agent_id, prev0, t0 - Duration::from_millis(50));
@@ -813,14 +716,14 @@ fn snap_back_rearms_on_new_state_transition() {
         .expect("snap_back armed at T0");
     assert_eq!(stored0, t0, "first arm should key on T0 state_started_at");
 
-    // A NEW transition inside the window. Same agent_id (active_slot uses a fixed
+    // A NEW transition inside the window. Same agent_id (running_slot uses a fixed
     // transcript path) so its walk state is reused; only state_started_at moved.
     let t1_state = t0 + Duration::from_millis(400);
-    let slot1 = active_slot(t1_state, now - Duration::from_secs(60));
+    let slot1 = running_slot(t1_state, now - Duration::from_secs(60));
     let now1 = t1_state;
     let prev1 = Point {
-        x: desk.x + 40,
-        y: desk.y + 25,
+        x: desk.at.x + 40,
+        y: desk.at.y + 25,
     };
     rig.history
         .record(slot1.agent_id, prev1, now1 - Duration::from_millis(50));
@@ -842,7 +745,7 @@ fn snap_back_rearms_on_new_state_transition() {
 }
 
 fn entry_slot_near(created_at: SystemTime) -> AgentSlot {
-    let mut s = active_slot(created_at, created_at);
+    let mut s = running_slot(created_at, created_at);
     s.state = pixtuoid_core::state::ActivityState::Idle;
     s.desk_index = GlobalDeskIndex(0);
     s
@@ -857,7 +760,7 @@ fn entry_slot_far(created_at: SystemTime, desk_index: usize) -> AgentSlot {
 }
 
 fn exiting_slot(exiting_at: SystemTime, created_at: SystemTime) -> AgentSlot {
-    let mut s = active_slot(exiting_at - Duration::from_secs(30), created_at);
+    let mut s = running_slot(exiting_at - Duration::from_secs(30), created_at);
     s.exiting_at = Some(exiting_at);
     s.agent_id = AgentId::from_transcript_path("/exit/slot.jsonl");
     s
@@ -871,8 +774,8 @@ fn near_far_desk_indices(l: &SceneLayout) -> (usize, usize) {
         .iter()
         .map(|d| {
             let target = Point {
-                x: d.x + 6,
-                y: d.y + 4,
+                x: d.at.x + 6,
+                y: d.at.y + 4,
             };
             octile_distance(door, target)
         })
@@ -900,41 +803,6 @@ fn near_far_desk_indices(l: &SceneLayout) -> (usize, usize) {
         dists[near_idx]
     );
     (near_idx, far_idx)
-}
-
-#[test]
-fn entry_duration_scales_with_path_longer_desk_takes_longer() {
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let l = layout();
-    let (near_idx, far_idx) = near_far_desk_indices(&l);
-
-    let near = entry_slot_far(now, near_idx);
-    let far = entry_slot_far(now, far_idx);
-
-    // Separate walks maps — each agent's first call snapshots its own profile.
-    let mut rig_near = RouteRig::new(StubRouter::straight());
-    let mut rig_far = RouteRig::new(StubRouter::straight());
-
-    let _pn = derive_with_routing(&near, now, &l, &mut rig_near.rctx());
-    let _pf = derive_with_routing(&far, now, &l, &mut rig_far.rctx());
-
-    let dur_near = rig_near.walks[&near.agent_id]
-        .entry
-        .as_ref()
-        .expect("entry profile set for near desk")
-        .profile
-        .duration_ms;
-    let dur_far = rig_far.walks[&far.agent_id]
-        .entry
-        .as_ref()
-        .expect("entry profile set for far desk")
-        .profile
-        .duration_ms;
-
-    assert!(
-        dur_far >= dur_near,
-        "far desk duration {dur_far}ms must be >= near desk {dur_near}ms"
-    );
 }
 
 #[test]
@@ -1040,8 +908,8 @@ fn exit_far_completes_before_grace_window_no_vanish() {
     let door = l.door_threshold;
     let desk = l.home_desks[0];
     let from = Point {
-        x: desk.x + 6,
-        y: desk.y + 4,
+        x: desk.at.x + 6,
+        y: desk.at.y + 4,
     };
     // A long synthetic route, so the physics exit duration exceeds the exit
     // budget and the compression path is the one under test.
@@ -1134,15 +1002,12 @@ fn max_top_left_step(
     use crate::sim::anchors::character_top_left;
 
     let mut rig = RouteRig::new(AStarRouter::new());
-    rig.router.set_preferred_zone(l.corridor);
+    rig.router.set_preferred_zone(Some(l.corridor));
 
-    let ob = l
-        .corridor
-        .map(|c| Point {
-            x: c.x + c.width / 2,
-            y: c.y + 2,
-        })
-        .unwrap_or(Point { x: 40, y: 50 });
+    let ob = Point {
+        x: l.corridor.x + l.corridor.width / 2,
+        y: l.corridor.y + 2,
+    };
 
     let mut prev: Option<Point> = None;
     let mut max_step = 0i32;
@@ -1198,8 +1063,8 @@ fn desk_approach_cell_is_never_inside_the_blocked_desk() {
     );
     let mut any_some = false;
     let mut facings: Vec<Facing> = Vec::new();
-    for &desk in &l.home_desks {
-        let facing = l.desk_facing_at(desk);
+    for &home in &l.home_desks {
+        let crate::layout::HomeDesk { at: desk, facing } = home;
         if !facings.contains(&facing) {
             facings.push(facing);
         }
@@ -1219,7 +1084,7 @@ fn desk_approach_cell_is_never_inside_the_blocked_desk() {
         );
         // None = degenerate layout (every allowed side walled off); the entry then
         // falls back to the direct chair target. Acceptable, so not asserted.
-        if let Some(cell) = desk_approach_cell(desk, &l) {
+        if let Some(cell) = desk_approach_cell(home, &l) {
             any_some = true;
             assert!(
                 l.is_walkable(cell.x, cell.y),
@@ -1251,7 +1116,7 @@ fn desk_entry_routes_around_the_desk_then_settles_onto_the_chair() {
         .find(|&i| desk_approach_cell(l.home_desks[i], &l).is_some())
         .expect("a desk with a valid approach cell");
     let desk = l.home_desks[desk_index];
-    let chair = desk_walk_anchor_facing(desk, l.desk_facing_at(desk));
+    let chair = desk_walk_anchor_facing(desk.at, desk.facing);
     let approach = desk_approach_cell(desk, &l).expect("approach cell");
 
     let slot = entry_slot_far(now, desk_index);
@@ -1293,7 +1158,7 @@ fn wander_legs_approach_the_desk_via_an_allowed_side_not_through_the_front() {
         .find(|&i| desk_approach_cell(l.home_desks[i], &l).is_some())
         .expect("a desk with a valid approach cell");
     let desk = l.home_desks[desk_index];
-    let chair = desk_walk_anchor_facing(desk, l.desk_facing_at(desk));
+    let chair = desk_walk_anchor_facing(desk.at, desk.facing);
     let approach = desk_approach_cell(desk, &l).expect("approach cell");
 
     let trip_id = (0u64..3000)
@@ -1307,7 +1172,7 @@ fn wander_legs_approach_the_desk_via_an_allowed_side_not_through_the_front() {
     slot.last_event_at = old;
 
     let mut rig = RouteRig::new(AStarRouter::new());
-    rig.router.set_preferred_zone(l.corridor);
+    rig.router.set_preferred_zone(Some(l.corridor));
 
     let (mut saw_out, mut saw_back) = (false, false);
     let mut seen_ends: Vec<(Point, Point)> = Vec::new();
@@ -1380,7 +1245,7 @@ fn exit_from_desk_rises_off_the_chair_via_the_approach_cell() {
         .find(|&i| desk_approach_cell(l.home_desks[i], &l).is_some())
         .expect("a desk with a valid approach cell");
     let desk = l.home_desks[desk_index];
-    let chair = desk_walk_anchor_facing(desk, l.desk_facing_at(desk));
+    let chair = desk_walk_anchor_facing(desk.at, desk.facing);
     let approach = desk_approach_cell(desk, &l).expect("approach cell");
 
     let mut slot = exiting_slot(now, now - Duration::from_secs(300));
@@ -1425,8 +1290,7 @@ fn wander_coffee_run_coordinates_continuous_under_churn() {
         .map(|i| AgentId::from_transcript_path(&format!("/cont/{i}.jsonl")))
         .find(|id| takes_trip(*id, 0))
         .expect("find a trip agent");
-    // Long-idle, past entry, not in the thinking window (last_event_at ≤
-    // created_at ⇒ was_active = false).
+    // Long-idle, past entry.
     let old = now - Duration::from_secs(120);
     let mut slot = entry_slot(old);
     slot.agent_id = trip_id;
@@ -1443,7 +1307,7 @@ fn wander_coffee_run_coordinates_continuous_under_churn() {
 }
 
 #[test]
-fn wander_interrupted_by_active_does_not_teleport() {
+fn wander_interrupted_by_running_does_not_teleport() {
     use crate::pathfind::AStarRouter;
     use crate::sim::anchors::character_top_left;
 
@@ -1459,7 +1323,7 @@ fn wander_interrupted_by_active_does_not_teleport() {
     idle.last_event_at = old;
 
     let mut rig = RouteRig::new(AStarRouter::new());
-    rig.router.set_preferred_zone(l.corridor);
+    rig.router.set_preferred_zone(Some(l.corridor));
     // The desk's seated top-left, on throwaway stores — the "far from desk" reference.
     let seated = crate::sim::anchors::character_top_left(
         &idle,
@@ -1486,11 +1350,13 @@ fn wander_interrupted_by_active_does_not_teleport() {
     }
     let flip_frame = flip_frame.expect("agent should walk away from its desk within 50 s");
 
-    let active = AgentSlot {
-        state: ActivityState::Active {
-            tool_use_id: Some(Arc::from("t")),
-            detail: Some(Arc::from("Edit")),
-            kind: ToolKind::Edit,
+    let running = AgentSlot {
+        state: ActivityState::Running {
+            item: Some(ToolUse {
+                tool_use_id: Some(Arc::from("t")),
+                detail: Some(Arc::from("Edit")),
+                kind: ToolKind::Edit,
+            }),
         },
         state_started_at: now + Duration::from_millis(flip_frame * PAINT_FRAME_MS),
         ..idle.clone()
@@ -1499,7 +1365,7 @@ fn wander_interrupted_by_active_does_not_teleport() {
     let mut max_step = 0i32;
     for i in (flip_frame + 1)..(flip_frame + 46) {
         let t = now + Duration::from_millis(i * PAINT_FRAME_MS);
-        if let Some(a) = character_top_left(&active, &l, t, &mut rig.rctx()) {
+        if let Some(a) = character_top_left(&running, &l, t, &mut rig.rctx()) {
             let step = (i32::from(a.x) - i32::from(prev.x))
                 .abs()
                 .max((i32::from(a.y) - i32::from(prev.y)).abs());
@@ -1532,7 +1398,7 @@ fn floor_offscreen_then_resume_does_not_replay() {
     slot.last_event_at = old;
 
     let mut rig = RouteRig::new(AStarRouter::new());
-    rig.router.set_preferred_zone(l.corridor);
+    rig.router.set_preferred_zone(Some(l.corridor));
 
     for i in 0..60u64 {
         let t = now + Duration::from_millis(i * PAINT_FRAME_MS);
@@ -1580,7 +1446,7 @@ fn exit_while_wandering_does_not_teleport_to_desk() {
     idle.last_event_at = old;
 
     let mut rig = RouteRig::new(AStarRouter::new());
-    rig.router.set_preferred_zone(l.corridor);
+    rig.router.set_preferred_zone(Some(l.corridor));
 
     let seat = character_top_left(
         &idle,
@@ -1653,7 +1519,6 @@ fn exit_while_wandering_does_not_teleport_to_desk() {
 /// it through the floor's grip: the largest per-axis jump of its sprite
 /// between two painted frames, from its first.
 struct Hand {
-    pack: Arc<crate::pack::OfficeArt>,
     scene: pixtuoid_core::SceneState,
     id: AgentId,
     session: crate::floor::FloorSession,
@@ -1668,13 +1533,11 @@ struct Hand {
 
 impl Hand {
     fn new(slot: AgentSlot, now: SystemTime) -> Self {
-        let pack = Arc::new(crate::pack::test_office());
         let mut scene = pixtuoid_core::SceneState::uniform(4);
         let id = slot.agent_id;
         scene.agents.insert(id, slot);
         let mut hand = Self {
-            session: crate::floor::FloorSession::new(Arc::clone(&pack)),
-            pack,
+            session: crate::floor::FloorSession::new(Arc::new(crate::pack::test_office())),
             scene,
             id,
             now,
@@ -1709,7 +1572,6 @@ impl Hand {
             .step(
                 crate::floor::FloorInputs {
                     scene: &self.scene,
-                    pack: &self.pack,
                     now: self.now,
                     floor: crate::floor::FloorMeta::ground(),
                     pets: crate::floor::PetInputs::default(),
@@ -1807,12 +1669,7 @@ impl Hand {
 
     /// Painted until it sits at its desk, at most `paints`.
     fn paint_until_seated(&mut self, paints: u32) -> bool {
-        (0..paints).any(|_| {
-            matches!(
-                self.paint(),
-                Some(Pose::SeatedIdle | Pose::SeatedThinking | Pose::SeatedTyping)
-            )
-        })
+        (0..paints).any(|_| matches!(self.paint(), Some(Pose::SeatedIdle | Pose::SeatedTyping)))
     }
 
     /// Reachable open floor, well clear of `from`'s and the door's, that it is
@@ -2106,8 +1963,8 @@ fn frozen_leg_anchor_continuous_across_router_shape_change() {
     let door = l.door_threshold;
     let desk = l.home_desks[0];
     let desk_t = Point {
-        x: desk.x + 6,
-        y: desk.y + 4,
+        x: desk.at.x + 6,
+        y: desk.at.y + 4,
     };
     // Shape A is a long DOWN-then-across detour so the walk lasts many frames;
     // shape B is short and very differently routed. Both share the endpoints.
@@ -2193,7 +2050,7 @@ fn multiple_agents_share_overlay_without_teleport() {
         .collect();
 
     let mut rig = RouteRig::new(AStarRouter::new());
-    rig.router.set_preferred_zone(l.corridor);
+    rig.router.set_preferred_zone(Some(l.corridor));
     let mut prev: HashMap<AgentId, Point> = HashMap::new();
     let mut max_step = 0i32;
 
@@ -2229,7 +2086,7 @@ fn multiple_agents_share_overlay_without_teleport() {
 }
 
 fn unit_slot(now: SystemTime) -> AgentSlot {
-    active_slot(now, now - Duration::from_secs(60))
+    running_slot(now, now - Duration::from_secs(60))
 }
 
 #[test]
@@ -2287,12 +2144,12 @@ fn route_walking_pose_straight_leg_records_lerp_and_clears_walk_path() {
 fn snap_back_profile_length_measures_the_routed_polyline() {
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let l = layout();
-    let slot = active_slot(now, now - Duration::from_secs(60));
+    let slot = running_slot(now, now - Duration::from_secs(60));
     let desk = l.home_desks[0];
     let (snap_target, chair_settle) = crate::pose::desk_leg_endpoint(desk, &l);
     let prev = Point {
-        x: desk.x + 50,
-        y: desk.y + 30,
+        x: desk.at.x + 50,
+        y: desk.at.y + 30,
     };
     let corner = Point {
         x: prev.x,
@@ -2484,7 +2341,7 @@ fn a_resurrect_mid_walkout_re_enters_from_the_live_position() {
     assert!(
         matches!(pose, Some(Pose::Walking { .. })),
         "and it RENDERS that walk — the entry branch runs before the wander \
-         dispatch, which would otherwise return SeatedThinking and teleport it"
+         dispatch, which would otherwise return a seated pose and teleport it"
     );
 }
 

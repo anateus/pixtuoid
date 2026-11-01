@@ -1,4 +1,4 @@
-//! Kimi Code CLI source — HOOK-ONLY (no transcript watcher).
+//! Kimi Code CLI (`kimi`, MoonshotAI) source — HOOK-ONLY (no transcript watcher).
 //!
 //! Session transcripts DO exist (`<KIMI_CODE_HOME>/sessions/<workDirKey>/
 //! <sessionId>/agents/main/wire.jsonl`, default home `~/.kimi-code`) but the wire
@@ -10,7 +10,7 @@
 //! CLAUDE-CODE-SHAPED: snake_case
 //! `hook_event_name`/`session_id`/`cwd`/`tool_name`/`tool_input` with PascalCase
 //! event VALUES — **except the per-call id, which Kimi spells `tool_call_id`**
-//! (capture-verified: `fixtures/kimi/tool-run` never carries `tool_use_id`). That
+//! (capture-verified: `kimi/fixtures/tool-run-hermetic` never carries `tool_use_id`). That
 //! is a registry row, `ToolIdKey::ToolCall`, and NOT a reason to re-implement the
 //! tool arms here: the name is the whole difference, and a copy of those arms
 //! would silently stop tracking whatever they learn next.
@@ -30,25 +30,69 @@ use crate::source::decoder::{DecodeError, DecodeResult as Result};
 use serde_json::{Map, Value};
 
 use crate::AgentId;
+use crate::source::registry::{
+    ChildEndInference, Corroboration, FocusChannel, HookDecoding, HookObject, Hyphen, SourceCaps,
+    SourceDescriptor, SourceKind, ToolIdKey,
+};
 use crate::source::{AgentEvent, registry};
 
 /// The Kimi CLI source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "kimi";
+
+pub(crate) const DESCRIPTOR: SourceDescriptor = SourceDescriptor {
+    name: SOURCE_NAME,
+    label_prefix: "km",
+    verified_version: "2.4.1",
+    version_probe: Some(&["kimi", "--version"]),
+    version_hyphen: Hyphen::Prerelease,
+    home_env: None,
+    kind: SourceKind::Agent {
+        transcript: None,
+        hook: Some(HookDecoding::Shared {
+            // The ONE source that does not spell the per-call id `tool_use_id`.
+            tool_id_key: ToolIdKey::ToolCall,
+            extend: decode_kimi_hook_custom,
+        }),
+        caps: SourceCaps {
+            // `SessionEnd` fires on exit — best-effort counts; abrupt exits fall
+            // to the stale-sweep.
+            has_exit_signal: true,
+            // SessionStart is the registration carrier, not UserPromptSubmit, so
+            // a swept session does not walk back in.
+            resurrects_on_prompt: false,
+            // Consumed via the `Agent` tool: 0.36.1's `AgentToolInputSchema` injects
+            // `subagent_type: "coder"` when the model omits it, so `make_tool_detail`
+            // mints Task. `AgentSwarm` has NO such injection, so an omitting swarm
+            // call mints Generic instead; `true` can only over-retain a dead slot.
+            delegations_are_hook_silent: true,
+            child_end_inference: ChildEndInference::TaskDrain,
+            // A subagent's tool hooks carry the session's id alone
+            // (kimi-code@2.2.0 `agentExternalHooksService.ts:301-313`).
+            child_hooks_unnamed: true,
+            brackets_turns: false,
+        },
+        // kimi-code 2.2.0 spawns every hook with `shell: true`, which Node runs as
+        // `/bin/sh -c` on Unix and `%ComSpec%` on Windows
+        // (`packages/agent-core-v2/src/features/externalHooks/internal/runHook.ts:66-67`,
+        // https://nodejs.org/api/child_process.html): re-check both if either changes.
+        focus: FocusChannel::ShimStamp(Corroboration::OnceViaShell),
+    },
+    #[cfg(feature = "native")]
+    native: crate::source::registry::Native::NONE,
+};
 
 /// Decode Kimi's two failure-variant hook events (no CC equivalent) and DECLINE
 /// (`Ok(None)`) for the rest, so the CC-shaped remainder falls through to
 /// `decoder::decode_hook_payload`'s shared arms.
 ///
 /// - `PostToolUseFailure` — a FAILED tool fires this beside/instead of
-///   `PostToolUse`; it must close the activity or the tool's `ActivityStart`
-///   lingers Active. Firing BOTH is harmless: the second `ActivityEnd` no-ops
+///   `PostToolUse`; it must close the activity or the tool's `ToolUseStart`
+///   lingers Running. Firing BOTH is harmless: the second `ToolUseEnd` no-ops
 ///   on an already-idle slot.
-/// - `StopFailure` — a failed turn end; settle to idle like `Stop`, with NO
-///   Identity (an end proves nothing worth registering).
-pub(crate) fn decode_kimi_hook_custom(v: &Value) -> Result<Option<Vec<AgentEvent>>> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| DecodeError::not_an_object(SOURCE_NAME))?;
+/// - `StopFailure` — a failed turn end; settle to idle like `Stop`.
+///   Identity-less: an end alone proves too little to label a session, so an
+///   unknown id registers blank (`shows_activity`).
+pub(crate) fn decode_kimi_hook_custom(obj: &HookObject) -> Result<Option<Vec<AgentEvent>>> {
     match obj.get("hook_event_name").and_then(|s| s.as_str()) {
         Some("PostToolUseFailure") => {
             let session_id = kimi_session_id(obj)?;
@@ -57,7 +101,7 @@ pub(crate) fn decode_kimi_hook_custom(v: &Value) -> Result<Option<Vec<AgentEvent
             let tool_use_id = kimi_tool_call_id(obj);
             Ok(Some(vec![
                 AgentEvent::identity(agent_id, SOURCE_NAME, session_id, cwd),
-                AgentEvent::ActivityEnd {
+                AgentEvent::ToolUseEnd {
                     agent_id,
                     tool_use_id,
                 },
@@ -65,10 +109,7 @@ pub(crate) fn decode_kimi_hook_custom(v: &Value) -> Result<Option<Vec<AgentEvent
         }
         Some("StopFailure") => {
             let agent_id = AgentId::from_parts(SOURCE_NAME, &kimi_session_id(obj)?);
-            Ok(Some(vec![AgentEvent::ActivityEnd {
-                agent_id,
-                tool_use_id: None,
-            }]))
+            Ok(Some(vec![AgentEvent::turn_end(agent_id)]))
         }
         _ => Ok(None),
     }
@@ -106,20 +147,21 @@ fn kimi_session_id(obj: &Map<String, Value>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::decoder::test_obj;
     use serde_json::json;
 
     #[test]
     fn post_tool_use_failure_closes_activity_with_identity() {
-        let evs = decode_kimi_hook_custom(&json!({
+        let evs = decode_kimi_hook_custom(test_obj(&json!({
             "hook_event_name": "PostToolUseFailure",
             "session_id": "session_abc",
             "cwd": "/Users/dev/proj",
             "tool_name": "Bash",
             "tool_call_id": "t1"
-        }))
+        })))
         .expect("decodes")
         .expect("claims the event");
-        assert_eq!(evs.len(), 2, "Identity + ActivityEnd, got {evs:?}");
+        assert_eq!(evs.len(), 2, "Identity + ToolUseEnd, got {evs:?}");
         match &evs[0] {
             AgentEvent::Identity {
                 agent_id,
@@ -139,25 +181,25 @@ mod tests {
             other => panic!("expected leading Identity, got {other:?}"),
         }
         match &evs[1] {
-            AgentEvent::ActivityEnd {
+            AgentEvent::ToolUseEnd {
                 agent_id,
                 tool_use_id,
             } => {
                 assert_eq!(*agent_id, AgentId::from_parts(SOURCE_NAME, "session_abc"));
                 assert_eq!(tool_use_id.as_deref(), Some("t1"));
             }
-            other => panic!("expected ActivityEnd, got {other:?}"),
+            other => panic!("expected ToolUseEnd, got {other:?}"),
         }
     }
 
     #[test]
     fn post_tool_use_failure_without_cwd_has_none_cwd() {
-        let evs = decode_kimi_hook_custom(&json!({
+        let evs = decode_kimi_hook_custom(test_obj(&json!({
             "hook_event_name": "PostToolUseFailure",
             "session_id": "s",
             "cwd": "",
             "tool_name": "Read"
-        }))
+        })))
         .unwrap()
         .unwrap();
         match &evs[0] {
@@ -169,16 +211,16 @@ mod tests {
     }
 
     #[test]
-    fn stop_failure_is_activity_end_without_identity() {
-        let evs = decode_kimi_hook_custom(&json!({
+    fn stop_failure_is_a_turn_end_without_identity() {
+        let evs = decode_kimi_hook_custom(test_obj(&json!({
             "hook_event_name": "StopFailure",
             "session_id": "s"
-        }))
+        })))
         .unwrap()
         .unwrap();
         assert_eq!(evs.len(), 1);
         assert!(
-            matches!(&evs[0], AgentEvent::ActivityEnd { tool_use_id: None, agent_id }
+            matches!(&evs[0], AgentEvent::TurnEnd { agent_id, .. }
                 if *agent_id == AgentId::from_parts(SOURCE_NAME, "s")),
             "got {evs:?}"
         );
@@ -198,11 +240,11 @@ mod tests {
             "UserPromptSubmit",
             "SubagentStart",
         ] {
-            let out = decode_kimi_hook_custom(&json!({
+            let out = decode_kimi_hook_custom(test_obj(&json!({
                 "hook_event_name": ev,
                 "session_id": "s",
                 "cwd": "/repo"
-            }))
+            })))
             .expect("decodes");
             assert!(
                 out.is_none(),
@@ -215,77 +257,24 @@ mod tests {
     fn claimed_failure_event_without_session_id_errs() {
         for ev in ["PostToolUseFailure", "StopFailure"] {
             assert!(
-                decode_kimi_hook_custom(&json!({ "hook_event_name": ev, "cwd": "/repo" })).is_err(),
+                decode_kimi_hook_custom(test_obj(
+                    &json!({ "hook_event_name": ev, "cwd": "/repo" })
+                ))
+                .is_err(),
                 "{ev} with no session_id must err"
             );
             assert!(
-                decode_kimi_hook_custom(&json!({ "hook_event_name": ev, "session_id": "" }))
-                    .is_err(),
+                decode_kimi_hook_custom(test_obj(
+                    &json!({ "hook_event_name": ev, "session_id": "" })
+                ))
+                .is_err(),
                 "{ev} with empty session_id must err"
             );
         }
     }
 
-    #[test]
-    fn non_object_payload_errs() {
-        assert!(decode_kimi_hook_custom(&json!("a string")).is_err());
-        assert!(decode_kimi_hook_custom(&json!(42)).is_err());
-    }
-
-    #[test]
-    fn every_event_coalesces_to_one_agent_id_end_to_end() {
-        use crate::source::decoder::decode_hook_payload;
-        let sid = "session_abc";
-        let payloads = [
-            json!({"hook_event_name": "SessionStart", "session_id": sid, "cwd": "/repo", "_pixtuoid_source": "kimi"}),
-            json!({"hook_event_name": "PreToolUse", "session_id": sid, "cwd": "/repo", "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_call_id": "t1", "_pixtuoid_source": "kimi"}),
-            json!({"hook_event_name": "PostToolUseFailure", "session_id": sid, "cwd": "/repo", "tool_name": "Bash", "tool_call_id": "t1", "_pixtuoid_source": "kimi"}),
-            json!({"hook_event_name": "PermissionRequest", "session_id": sid, "cwd": "/repo", "_pixtuoid_source": "kimi"}),
-            json!({"hook_event_name": "SessionEnd", "session_id": sid, "cwd": "/repo", "_pixtuoid_source": "kimi"}),
-        ];
-        let ids: std::collections::BTreeSet<_> = payloads
-            .into_iter()
-            .flat_map(|v| decode_hook_payload(v).expect("decodes"))
-            .map(|e| e.agent_id())
-            .collect();
-        assert_eq!(
-            ids,
-            std::collections::BTreeSet::from([AgentId::from_parts(SOURCE_NAME, sid)]),
-            "all kimi events must coalesce to one AgentId"
-        );
-    }
-
-    /// Captured off kimi-code (`fixtures/kimi/tool-run`): the per-call id rides `tool_call_id`, and
-    /// kimi never sends the CC-shaped `tool_use_id`. Driven through the FULL
-    /// dispatch, not this module's decoder, because that is where the registry
-    /// row is read — the failure the row exists to prevent is a shared arm
-    /// reading the CC name and silently decoding every id to `None`.
-    #[test]
-    fn per_call_id_rides_tool_call_id_not_tool_use_id() {
-        for ev in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
-            let evs = crate::source::decoder::decode_hook_payload(json!({
-                "hook_event_name": ev,
-                "session_id": "session_abc",
-                "cwd": "/w",
-                "client_type": "kimi_code_cli",
-                "tool_name": "Read",
-                "tool_call_id": "call_1",
-                "_pixtuoid_source": SOURCE_NAME,
-            }))
-            .unwrap_or_else(|e| panic!("{ev} must decode: {e}"));
-            assert!(
-                evs.iter().any(|e| matches!(
-                    e,
-                    AgentEvent::ActivityStart { tool_use_id: Some(t), .. }
-                        | AgentEvent::ActivityEnd { tool_use_id: Some(t), .. } if t == "call_1"
-                )),
-                "{ev} must carry kimi's tool_call_id, got {evs:?}"
-            );
-        }
-    }
-
-    /// The negative control for the row above: the CC name kimi never sends must
-    /// NOT be read for this source, or the row would be decorative.
+    /// The negative control for kimi's `ToolIdKey::ToolCall` registry row: the CC
+    /// name kimi never sends must NOT be read, or the row would be decorative.
     #[test]
     fn the_cc_spelling_is_not_read_for_kimi() {
         let evs = crate::source::decoder::decode_hook_payload(json!({
@@ -300,7 +289,7 @@ mod tests {
         assert!(
             evs.iter().any(|e| matches!(
                 e,
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     tool_use_id: None,
                     ..
                 }

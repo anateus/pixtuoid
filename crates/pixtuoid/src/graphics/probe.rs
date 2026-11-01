@@ -5,7 +5,7 @@
 //! both ways are [`super::wire`]'s, and only [`probe`] touches the terminal.
 
 use super::wire::{self, Answer, Passthrough, Question, Reader};
-use super::{CellSize, Detected, ImageProtocol, Probe, TermEnv, env_set, env_text};
+use super::{CellSize, Detected, ImageProtocol, Probe, TermEnv, env_set};
 
 /// The capability query's kitty image: kitty's own example's id (kitty's
 /// graphics protocol, "Querying support and available transmission mediums").
@@ -136,7 +136,7 @@ impl EnvHints {
     fn read() -> Self {
         Self {
             env: TermEnv::read(),
-            lc_terminal: env_text("LC_TERMINAL"),
+            lc_terminal: pixtuoid_core::platform::text_env("LC_TERMINAL"),
             wezterm: env_set("WEZTERM_EXECUTABLE"),
             konsole: env_set("KONSOLE_VERSION"),
             iterm_session: env_set("ITERM_SESSION_ID"),
@@ -317,19 +317,13 @@ fn reads_shared_memory() -> bool {
 }
 
 /// Our pane's `allow-passthrough`, inherited value included (tmux(1)
-/// `show-options -A`); `None` when tmux cannot say within
-/// [`GRAPHICS_PROBE_TIMEOUT`](super::GRAPHICS_PROBE_TIMEOUT). Asked only where
+/// `show-options -A`); `None` when tmux cannot say. Asked only where
 /// [`EnvHints::our_tmux_pane`] holds.
 fn tmux_passthrough() -> Option<bool> {
-    use std::process::{Command, Stdio};
-    let out = crate::output_within(
-        Command::new("tmux")
-            .args(["show-options", "-Apv", "allow-passthrough"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null()),
-        super::GRAPHICS_PROBE_TIMEOUT,
-    )?;
+    let out = std::process::Command::new("tmux")
+        .args(["show-options", "-Apv", "allow-passthrough"])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

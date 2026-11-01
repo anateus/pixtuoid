@@ -11,7 +11,7 @@ use pixtuoid_core::AgentId;
 use pixtuoid_core::state::AgentSlot;
 use pixtuoid_core::walkable::{OccupancyOverlay, WalkableMask};
 
-use crate::layout::{Point, SceneLayout, WaypointKind};
+use crate::layout::{HomeDesk, Point, SceneLayout, WaypointKind};
 use crate::pathfind::Router;
 use crate::pose::{
     SpotClaims, WANDER_DWELL_EST_MS, dwell_ms, est_wander_cycle_ms, seated_dwell_ms,
@@ -270,6 +270,7 @@ pub(crate) fn advance_wander(
     slot: &AgentSlot,
     now: SystemTime,
     layout: &SceneLayout,
+    desk: HomeDesk,
     router: &mut dyn Router,
     overlay: &OccupancyOverlay,
     walks: &mut HashMap<AgentId, WalkState>,
@@ -283,12 +284,7 @@ pub(crate) fn advance_wander(
     // A fresh WalkState's epoch `phase_started_at` is below any real
     // `state_started_at`; we also re-seed when the slot (re-)entered Idle after a
     // different state.
-    let is_fresh = walk
-        .wander
-        .phase_started_at
-        .checked_add(Duration::from_millis(1))
-        .map(|t| t <= slot.state_started_at)
-        .unwrap_or(true);
+    let is_fresh = walk.wander.phase_started_at + Duration::from_millis(1) <= slot.state_started_at;
 
     // Stale resume: advanced before, but more than a full wander cycle ago — its
     // floor was off-screen (only the current floor renders) or `now` was frozen
@@ -334,23 +330,15 @@ pub(crate) fn advance_wander(
             if may_transition && elapsed_phase >= seated_dur {
                 if !takes_trip(id, walk.wander.cycle_n) || layout.waypoints.is_empty() {
                     walk.wander.cycle_n += 1;
-                    walk.wander.phase_started_at = walk
-                        .wander
-                        .phase_started_at
-                        .checked_add(Duration::from_millis(seated_dur))
-                        .unwrap_or(now);
+                    walk.wander.phase_started_at += Duration::from_millis(seated_dur);
                 } else {
                     // The origin must match pose::pure::idle_pose's `desk` so the
                     // stateless/stateful destinations stay in lockstep.
-                    let desk_pt = layout.home_desk(slot.desk_index.single_floor_local());
-                    let origin = desk_pt.unwrap_or(Point { x: 0, y: 0 });
-                    let target =
-                        pick_wander_dest(id, walk.wander.cycle_n, layout, origin, &claimed);
+                    let target = pick_wander_dest(id, walk.wander.cycle_n, layout, desk, &claimed);
                     walk.wander.target = target;
                     let dest = target.dest;
                     let seat = target.kind.seat();
 
-                    let desk = desk_pt.unwrap_or(dest);
                     let (from, chair_settle) = desk_leg_endpoint(desk, layout);
                     walk.wander.phase = WanderPhase::WalkingOut(snapshot_leg_profile(
                         router,
@@ -364,11 +352,7 @@ pub(crate) fn advance_wander(
                             intent: WalkIntent::WanderOut,
                         },
                     ));
-                    walk.wander.phase_started_at = walk
-                        .wander
-                        .phase_started_at
-                        .checked_add(Duration::from_millis(seated_dur))
-                        .unwrap_or(now);
+                    walk.wander.phase_started_at += Duration::from_millis(seated_dur);
                 }
             }
             (walk.wander.phase, LegProgress::ZERO)
@@ -380,9 +364,9 @@ pub(crate) fn advance_wander(
                 WalkLegStatus::Arrived { walk_total } => {
                     // Snapshot the walk-back profile now — the overlay may differ
                     // by the time the dwell ends.
-                    let back = snapshot_back_profile(slot, walk, layout, router, overlay);
+                    let back = snapshot_back_profile(slot, walk, layout, desk, router, overlay);
                     walk.wander.phase = WanderPhase::AtWaypoint(back);
-                    advance_phase_clock(walk, walk_total, now);
+                    advance_phase_clock(walk, walk_total);
                     (WanderPhase::AtWaypoint(back), LegProgress::ZERO)
                 }
             }
@@ -391,11 +375,7 @@ pub(crate) fn advance_wander(
         WanderPhase::AtWaypoint(back) => {
             if may_transition && elapsed_phase >= dwell_dur {
                 walk.wander.phase = WanderPhase::WalkingBack(back);
-                walk.wander.phase_started_at = walk
-                    .wander
-                    .phase_started_at
-                    .checked_add(Duration::from_millis(dwell_dur))
-                    .unwrap_or(now);
+                walk.wander.phase_started_at += Duration::from_millis(dwell_dur);
             }
             (walk.wander.phase, LegProgress::ZERO)
         }
@@ -409,7 +389,7 @@ pub(crate) fn advance_wander(
                     walk.wander.cycle_n += 1;
                     walk.wander.target.kind = WanderKind::Aimless;
                     walk.wander.phase = WanderPhase::Seated;
-                    advance_phase_clock(walk, walk_total, now);
+                    advance_phase_clock(walk, walk_total);
                     (WanderPhase::Seated, LegProgress::ZERO)
                 }
             }
@@ -454,12 +434,8 @@ fn poll_walk_leg(profile: &WalkProfile, elapsed_phase: u64, may_transition: bool
 
 /// Advance the phase clock from its CURRENT anchor — not from `now` — so the
 /// next phase starts exactly when this one's wall-time budget elapsed.
-fn advance_phase_clock(walk: &mut WalkState, walk_total: u64, now: SystemTime) {
-    walk.wander.phase_started_at = walk
-        .wander
-        .phase_started_at
-        .checked_add(Duration::from_millis(walk_total))
-        .unwrap_or(now);
+fn advance_phase_clock(walk: &mut WalkState, walk_total: u64) {
+    walk.wander.phase_started_at += Duration::from_millis(walk_total);
 }
 
 /// Delegates to the ONE stateless resolver `crate::pose::resolve_wander_target`,
@@ -470,7 +446,7 @@ fn pick_wander_dest(
     id: AgentId,
     cycle_n: u64,
     layout: &SceneLayout,
-    origin: Point,
+    origin: HomeDesk,
     claimed: &SpotClaims,
 ) -> WanderTarget {
     crate::pose::resolve_wander_target(id, cycle_n, layout, origin, claimed)
@@ -575,12 +551,10 @@ fn snapshot_back_profile(
     slot: &AgentSlot,
     walk: &WalkState,
     layout: &SceneLayout,
+    desk: HomeDesk,
     router: &mut dyn Router,
     overlay: &OccupancyOverlay,
 ) -> WalkProfile {
-    let desk = layout
-        .home_desk(slot.desk_index.single_floor_local())
-        .unwrap_or(walk.wander.target.dest);
     let (snap_to, chair_settle) = desk_leg_endpoint(desk, layout);
     snapshot_leg_profile(
         router,

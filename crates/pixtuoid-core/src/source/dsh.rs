@@ -1,31 +1,82 @@
-//! DeepSeek Harness (`dsh`) source. Hook-only: the transcript is not
-//! line-readable (the `DSH` registry row owns that story), so the only plane
-//! is a pixtuoid-owned cordis plugin (`pixtuoid/src/install/dsh_plugin.mjs`)
-//! mounted through the home-level `$DSH_HOME/cordis.patch.yml`, forwarding
-//! emit-only events through the shim. A REMOTE subagent provider
+//! DeepSeek Harness (`dsh`) source. Hook-only: dsh persists a session as
+//! zstd-compressed concatenated frames (`session.jsonl.zstd`, format v0 with no
+//! migration promise), which no line reader can tail, so the only plane is a
+//! pixtuoid-owned cordis plugin (`pixtuoid/src/install/dsh_plugin.mjs`; its
+//! mount and never-block stories live on the template and its tests) mounted
+//! through the home-level `$DSH_HOME/cordis.patch.yml`, forwarding emit-only
+//! events through the shim. A REMOTE subagent provider
 //! (`dsh-subagent-claude-code`/`-codex`/`-acp`) publishes no local child
 //! session, so such a delegation paints nothing here — at most the spawned
-//! CLI's own source shows a parentless sprite while the dsh parent stays
-//! Active on the dispatch call. Wire shape: upstream `packages/core/session/src/types.ts` (the
+//! CLI's own source shows a parentless sprite. Wire shape: upstream `packages/core/session/src/types.ts` (the
 //! `session/event` feed), `packages/interaction/user-approval/src/types.ts`
 //! (the log-only approval audit pair), `packages/core/agent/src/runtime-types.ts`
 //! (#928). One dsh process hosts MANY sessions (the `web` profile is a
-//! server), so `sessionId` is the identity and `_pid` only drives liveness.
-
-use serde_json::Value;
+//! server; the opencode pid model), so `sessionId` is the identity and `_pid`
+//! only drives liveness.
 
 use crate::AgentId;
-use crate::source::decoder::{MAX_DECODED_FIELD_CHARS, ellipsize};
-use crate::source::{AgentEvent, ToolDetail};
+use crate::source::decoder::{MAX_DECODED_FIELD_CHARS, ellipsize, non_empty};
+use crate::source::registry::{
+    ChildEndInference, FocusChannel, HookDecoding, HookObject, Hyphen, SourceCaps,
+    SourceDescriptor, SourceKind,
+};
+use crate::source::{AgentEvent, RequestKeys, ToolDetail};
 
-/// Stable source id; MUST equal the registry row's `name`.
+/// The dsh source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "dsh";
+
+pub(crate) const DESCRIPTOR: SourceDescriptor = SourceDescriptor {
+    name: SOURCE_NAME,
+    label_prefix: "ds",
+    verified_version: "0.2.1-rc.5",
+    version_probe: Some(&["dsh", "--version"]),
+    version_hyphen: Hyphen::Prerelease,
+    // `DSH_HOME` is honored INSTALLER-side (the plugin file + patch row live
+    // under it); hook-only, so core resolves no root to relocate.
+    home_env: None,
+    kind: SourceKind::Agent {
+        transcript: None,
+        hook: Some(HookDecoding::ClaimsAll(decode_dsh_payload)),
+        caps: SourceCaps {
+            // `agent/disposed` + the plugin's own effect-disposer sweep fire
+            // on clean quit AND signal shutdown (dsh runs disposers there
+            // too); SIGKILL and an uncaught crash (upstream installs no
+            // `uncaughtException` handler, so no disposer runs) fall to
+            // `HookPidWatch` via the stamped pid.
+            has_exit_signal: true,
+            // Sessions are persistent; a `--resume` boots a NEW dsh whose
+            // plugin emits a fresh `session_start` on the same id — the
+            // SessionStart arm's ordinary re-registration, not this flag.
+            resurrects_on_prompt: false,
+            delegations_are_hook_silent: false,
+            // The dispatch returns the child's id at launch, and the child's
+            // own `session_end` ends it (`packages/subagent/tool-subagent/src/index.ts:215`
+            // at `dsh-v0.2.1-rc.2`; the delegation capture).
+            child_end_inference: ChildEndInference::None,
+            child_hooks_unnamed: false,
+            // A Ctrl-C'd turn's `turn/end` is written only as the `agents`
+            // service unloads (`packages/core/agent-loop/src/index.ts:544-580`
+            // at `dsh-v0.2.1-rc.2`). Our plugin consumes that service, and a
+            // consumer unloads before its provider
+            // (`packages/session/session-persistence-jsonl/src/index.ts:1814-1817`,
+            // same tag), so the plugin never sees that end.
+            brackets_turns: false,
+        },
+        // The plugin runs in-process (a cordis plugin in the launcher's one
+        // root context; no worker mode exists for plugins), so its stamped
+        // `process.pid` is dsh's own.
+        focus: FocusChannel::PluginStamp,
+    },
+    #[cfg(feature = "native")]
+    native: crate::source::registry::Native::NONE,
+};
 
 /// The payload types the plugin sends — one per subscribed upstream event.
 /// The plugin owns the upstream-name → wire-name mapping; the decoder owns
 /// nothing upstream-shaped, so an upstream rename lands in ONE file.
 const SESSION_START: &str = "session_start";
 const SESSION_END: &str = "session_end";
+const TURN_END: &str = "turn_end";
 const TOOL_CALL: &str = "tool_call";
 const TOOL_RESULT: &str = "tool_result";
 const APPROVAL_ASKED: &str = "approval_asked";
@@ -38,9 +89,9 @@ const USAGE: &str = "usage";
 const OUTCOME_ALLOWED: &str = "allowed-once";
 
 /// dsh's subagent dispatch tools. The first is capture-verified
-/// (`delegation/fixtures/dsh`: the parent streams a `tool_call` naming it,
+/// (`dsh/fixtures/subagent-hermetic`: the parent streams a `tool_call` naming it,
 /// the child arrives as its own `parentSession`-linked session, and the
-/// parent's `tool_result` lands only after the child's `session_end`). The
+/// parent's `tool_result` lands at launch, before the child's first request). The
 /// second is preset-verified: the tool NAME is
 /// per-instance config (`dsh-tool-subagent` `toolName`, default `subagent`),
 /// and the standard preset ships BOTH instances enabled
@@ -54,12 +105,6 @@ const OUTCOME_ALLOWED: &str = "allowed-once";
 /// allowlist forwards only `callId`/`toolName` for a tool call, so no
 /// argument — spoofed or real — ever reaches this decoder.
 const SUBAGENT_TOOLS: &[&str] = &["subagent", "subagent_fork"];
-
-fn field<'v>(obj: &'v serde_json::Map<String, Value>, key: &str) -> Option<&'v str> {
-    obj.get(key)
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-}
 
 /// Decode one plugin payload into `AgentEvent`s (`HookDecoding::ClaimsAll`).
 ///
@@ -76,34 +121,34 @@ fn field<'v>(obj: &'v serde_json::Map<String, Value>, key: &str) -> Option<&'v s
 /// # Errors
 ///
 /// Never: the `Result` is the `HookDecoding::ClaimsAll` decoder signature, and a malformed payload decodes to `vec![]`.
-pub fn decode_dsh_payload(v: &Value) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
-    let Some(obj) = v.as_object() else {
-        return Ok(vec![]);
-    };
+#[doc(hidden)]
+pub fn decode_dsh_payload(
+    obj: &HookObject,
+) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
     let Some(ty) = obj.get("type").and_then(|t| t.as_str()) else {
         crate::source::drift::missing_field(SOURCE_NAME, "plugin", "type");
         return Ok(vec![]);
     };
-    let Some(session_id) = field(obj, "sessionId") else {
+    let Some(session_id) = non_empty(obj, "sessionId") else {
         crate::source::drift::missing_field(SOURCE_NAME, ty, "sessionId");
         return Ok(vec![]);
     };
     let agent_id = AgentId::from_parts(SOURCE_NAME, session_id);
-    let parent_id = field(obj, "parentSession").map(|p| AgentId::from_parts(SOURCE_NAME, p));
+    let parent_id = non_empty(obj, "parentSession").map(|p| AgentId::from_parts(SOURCE_NAME, p));
     let cwd = || {
         obj.get("cwd")
             .and_then(|c| c.as_str())
             .map(std::path::PathBuf::from)
     };
     let identity = || AgentEvent::identity(agent_id, SOURCE_NAME, session_id.to_string(), cwd());
-    let call_id = || field(obj, "callId").map(str::to_string);
+    let call_id = || non_empty(obj, "callId").map(str::to_string);
     let tool_display = || {
-        field(obj, "toolName")
+        non_empty(obj, "toolName")
             .map(|t| ellipsize(t, MAX_DECODED_FIELD_CHARS))
             .unwrap_or_default()
     };
     let tool_detail = || {
-        if field(obj, "toolName").is_some_and(|t| SUBAGENT_TOOLS.contains(&t)) {
+        if non_empty(obj, "toolName").is_some_and(|t| SUBAGENT_TOOLS.contains(&t)) {
             ToolDetail::Task
         } else {
             ToolDetail::Generic {
@@ -127,16 +172,17 @@ pub fn decode_dsh_payload(v: &Value) -> crate::source::decoder::DecodeResult<Vec
             agent_id,
             as_child: parent_id.is_some(),
         }]),
+        TURN_END => Ok(vec![identity(), AgentEvent::turn_end(agent_id)]),
         TOOL_CALL => {
-            if field(obj, "callId").is_none() {
+            if non_empty(obj, "callId").is_none() {
                 crate::source::drift::missing_field(SOURCE_NAME, TOOL_CALL, "callId");
             }
-            if field(obj, "toolName").is_none() {
+            if non_empty(obj, "toolName").is_none() {
                 crate::source::drift::missing_field(SOURCE_NAME, TOOL_CALL, "toolName");
             }
             Ok(vec![
                 identity(),
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id,
                     tool_use_id: call_id(),
                     detail: Some(tool_detail()),
@@ -144,19 +190,19 @@ pub fn decode_dsh_payload(v: &Value) -> crate::source::decoder::DecodeResult<Vec
             ])
         }
         TOOL_RESULT => {
-            if field(obj, "callId").is_none() {
+            if non_empty(obj, "callId").is_none() {
                 crate::source::drift::missing_field(SOURCE_NAME, TOOL_RESULT, "callId");
             }
             Ok(vec![
                 identity(),
-                AgentEvent::ActivityEnd {
+                AgentEvent::ToolUseEnd {
                     agent_id,
                     tool_use_id: call_id(),
                 },
             ])
         }
         APPROVAL_ASKED => {
-            let reason = match (field(obj, "toolName"), field(obj, "reason")) {
+            let reason = match (non_empty(obj, "toolName"), non_empty(obj, "reason")) {
                 (Some(t), Some(r)) => format!("{t}: {r}"),
                 (Some(t), None) => t.to_string(),
                 (None, Some(r)) => r.to_string(),
@@ -164,18 +210,21 @@ pub fn decode_dsh_payload(v: &Value) -> crate::source::decoder::DecodeResult<Vec
             };
             Ok(vec![
                 identity(),
-                AgentEvent::Waiting {
+                AgentEvent::user_action_request(
                     agent_id,
-                    reason: ellipsize(&reason, MAX_DECODED_FIELD_CHARS),
-                    tool_use_id: call_id(),
-                },
+                    Some(ellipsize(&reason, MAX_DECODED_FIELD_CHARS)),
+                    RequestKeys {
+                        tool_use_id: call_id(),
+                        ..RequestKeys::default()
+                    },
+                ),
             ])
         }
         APPROVAL_DECIDED => {
             // A renamed/dropped `outcome` would fail CLOSED (every grant
             // decodes as the deny arm's End) — breadcrumb it, because no
             // event-name drift row can see a field rename.
-            let outcome = field(obj, "outcome");
+            let outcome = non_empty(obj, "outcome");
             if outcome.is_none() {
                 crate::source::drift::missing_field(SOURCE_NAME, APPROVAL_DECIDED, "outcome");
             }
@@ -186,9 +235,9 @@ pub fn decode_dsh_payload(v: &Value) -> crate::source::decoder::DecodeResult<Vec
                 // pre-pass keyed this tuid at the original `tool_call`
                 // (Delegating already entered), and a second Task Start for
                 // a known tuid is treated as a replay — `handled_by_task_start`
-                // skips the Waiting→Active resume arm and the slot would
-                // strand in Waiting for the whole delegation.
-                AgentEvent::ActivityStart {
+                // skips the RequiresAction→Running resume arm and the slot would
+                // strand in RequiresAction for the whole delegation.
+                AgentEvent::ToolUseStart {
                     agent_id,
                     tool_use_id: call_id(),
                     detail: Some(ToolDetail::Generic {
@@ -197,7 +246,7 @@ pub fn decode_dsh_payload(v: &Value) -> crate::source::decoder::DecodeResult<Vec
                 }
             } else {
                 // rejected | cancelled | unavailable: the call never runs.
-                AgentEvent::ActivityEnd {
+                AgentEvent::ToolUseEnd {
                     agent_id,
                     tool_use_id: call_id(),
                 }
@@ -208,8 +257,8 @@ pub fn decode_dsh_payload(v: &Value) -> crate::source::decoder::DecodeResult<Vec
             identity(),
             AgentEvent::ModelInfo {
                 agent_id,
-                model: field(obj, "model").map(|m| ellipsize(m, MAX_DECODED_FIELD_CHARS)),
-                effort: field(obj, "reasoningEffort")
+                model: non_empty(obj, "model").map(|m| ellipsize(m, MAX_DECODED_FIELD_CHARS)),
+                effort: non_empty(obj, "reasoningEffort")
                     .map(|e| ellipsize(e, MAX_DECODED_FIELD_CHARS)),
             },
         ]),
@@ -237,12 +286,13 @@ pub fn decode_dsh_payload(v: &Value) -> crate::source::decoder::DecodeResult<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::source::decoder::test_obj;
+    use serde_json::{Value, json};
 
     const SID: &str = "01b00000-0000-7000-8000-000000000001";
 
     fn decode(v: Value) -> Vec<AgentEvent> {
-        decode_dsh_payload(&v).unwrap()
+        decode_dsh_payload(test_obj(&v)).unwrap()
     }
 
     fn id() -> AgentId {
@@ -319,7 +369,7 @@ mod tests {
         match &evs[..] {
             [
                 AgentEvent::Identity { .. },
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     tool_use_id: Some(t),
                     detail: Some(ToolDetail::Generic { display }),
                     ..
@@ -335,7 +385,7 @@ mod tests {
         }));
         assert!(matches!(
             &evs[..],
-            [AgentEvent::Identity { .. }, AgentEvent::ActivityEnd { tool_use_id: Some(t), .. }]
+            [AgentEvent::Identity { .. }, AgentEvent::ToolUseEnd { tool_use_id: Some(t), .. }]
                 if t == "call_1"
         ));
     }
@@ -350,13 +400,13 @@ mod tests {
         match &evs[..] {
             [
                 AgentEvent::Identity { .. },
-                AgentEvent::Waiting {
+                AgentEvent::UserActionRequest {
                     reason,
                     tool_use_id: Some(t),
                     ..
                 },
             ] => {
-                assert_eq!(reason, "bash: rm -rf");
+                assert_eq!(reason.as_deref(), Some("bash: rm -rf"));
                 assert_eq!(t, "call_9");
             }
             other => panic!("unexpected: {other:?}"),
@@ -368,12 +418,12 @@ mod tests {
         }));
         assert!(matches!(
             &evs[..],
-            [AgentEvent::Identity { .. }, AgentEvent::ActivityStart { tool_use_id: Some(t), .. }]
+            [AgentEvent::Identity { .. }, AgentEvent::ToolUseStart { tool_use_id: Some(t), .. }]
                 if t == "call_9"
         ));
         // A GATED dispatch resumes GENERIC on purpose: the Task pre-pass
         // keyed the tuid at the original `tool_call`, so a second Task Start
-        // for it reads as a replay and would strand the slot in Waiting (the
+        // for it reads as a replay and would strand the slot in RequiresAction (the
         // decoder arm's comment owns the mechanism).
         let evs = decode(json!({
             "type": "approval_decided", "sessionId": SID,
@@ -384,12 +434,24 @@ mod tests {
             &evs[..],
             [
                 _,
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     detail: Some(ToolDetail::Generic { .. }),
                     ..
                 }
             ]
         ));
+    }
+
+    /// dsh's turn ends name no turn here: it does not bracket its turns
+    /// (its `DESCRIPTOR` says why).
+    #[test]
+    fn a_turns_end_ends_the_agents_work() {
+        let evs = decode(json!({"type": "turn_end", "sessionId": SID}));
+        assert!(
+            matches!(&evs[..], [AgentEvent::Identity { .. }, AgentEvent::TurnEnd { turn: None, agent_id }]
+                if *agent_id == id()),
+            "{evs:?}"
+        );
     }
 
     #[test]
@@ -402,7 +464,7 @@ mod tests {
             assert!(
                 matches!(
                     &evs[..],
-                    [AgentEvent::Identity { .. }, AgentEvent::ActivityEnd { tool_use_id: Some(t), .. }]
+                    [AgentEvent::Identity { .. }, AgentEvent::ToolUseEnd { tool_use_id: Some(t), .. }]
                         if t == "call_9"
                 ),
                 "{outcome}: {evs:?}"
@@ -452,7 +514,7 @@ mod tests {
                 &evs[..],
                 [
                     _,
-                    AgentEvent::ActivityStart {
+                    AgentEvent::ToolUseStart {
                         detail: Some(ToolDetail::Task),
                         ..
                     }
@@ -469,7 +531,7 @@ mod tests {
                 &evs[..],
                 [
                     _,
-                    AgentEvent::ActivityStart {
+                    AgentEvent::ToolUseStart {
                         detail: Some(ToolDetail::Task),
                         ..
                     }
@@ -486,7 +548,7 @@ mod tests {
                 &evs[..],
                 [
                     _,
-                    AgentEvent::ActivityStart {
+                    AgentEvent::ToolUseStart {
                         detail: Some(ToolDetail::Generic { .. }),
                         ..
                     }
@@ -501,7 +563,6 @@ mod tests {
         let quiet = crate::test_capture::capture_logs(|| {
             assert!(decode(json!({"type": "mystery_event", "sessionId": SID})).is_empty());
             assert!(decode(json!({"type": "tool_call"})).is_empty());
-            assert!(decode(json!("bare string")).is_empty());
         });
         assert!(
             quiet.contains("unknown_event") && quiet.contains("mystery_event"),

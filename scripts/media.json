@@ -1,85 +1,37 @@
 [
  {
-  "id": "screenshot",
-  "kind": "render",
-  "targets": [
-   "docs"
-  ],
-  "cols": 192,
-  "rows": 64,
-  "hour": 19,
-  "day": 1,
-  "theme": "normal",
-  "scale": 2
- },
- {
-  "id": "dashboard",
-  "kind": "render",
-  "targets": [
-   "docs"
-  ],
-  "cols": 192,
-  "rows": 64,
-  "hour": 19,
-  "day": 1,
-  "theme": "normal",
-  "scale": 2,
-  "extra": [
-   "--dashboard"
-  ]
- },
- {
-  "id": "connection",
-  "kind": "render",
-  "targets": [
-   "docs"
-  ],
-  "cols": 192,
-  "rows": 64,
-  "hour": 19,
-  "day": 1,
-  "theme": "normal",
-  "scale": 2,
-  "extra": [
-   "--connection"
-  ]
- },
- {
   "id": "themes-composite",
   "kind": "composite",
   "targets": [
    "docs"
   ],
+  "caption": "Every built-in theme, one slice each.",
   "over": "@themes.json",
   "slant": -0.2,
+  "look": "cutaway",
   "cols": 192,
   "rows": 64,
   "hour": 19,
   "day": 1
  },
  {
-  "id": "reference",
-  "kind": "render",
+  "id": "looks-composite",
+  "kind": "composite",
   "targets": [
    "docs"
   ],
+  "caption": "The same moment as the detailed cutaway (left) and the simpler classic look (right).",
+  "axis": "look",
+  "over": [
+   "cutaway",
+   "classic"
+  ],
+  "slant": -0.2,
   "cols": 192,
   "rows": 64,
+  "hour": 19,
   "day": 1,
-  "frames": [
-   {
-    "name": "reference-screenshot",
-    "theme": "normal",
-    "hour": 19,
-    "weather": "clear"
-   },
-   {
-    "name": "reference-night",
-    "theme": "cyberpunk",
-    "hour": 1,
-    "weather": "clear"
-   }
-  ]
+  "theme": "normal"
  },
  {
   "id": "demo",
@@ -87,12 +39,30 @@
   "targets": [
    "docs"
   ],
+  "caption": "Agents walk in, get to work and doze off as the day turns into a snowy night.",
+  "href": "/",
+  "look": "cutaway",
   "cols": 192,
   "rows": 64,
-  "hour": 19,
   "day": 1,
   "theme": "normal",
-  "duration": 15,
+  "segments": [
+   {
+    "hour": 13,
+    "weather": "clear",
+    "duration": 5
+   },
+   {
+    "hour": 18,
+    "weather": "clear",
+    "duration": 5
+   },
+   {
+    "hour": 22,
+    "weather": "snow",
+    "duration": 5
+   }
+  ],
   "fps": 10,
   "colors": 128
  },
@@ -267,7 +237,7 @@
   "poster": 3,
   "extra": [
    "--openclaw",
-   "busy",
+   "running",
    "--agents",
    "5"
   ]
@@ -286,6 +256,6 @@
   "duration": 26,
   "fps": 12,
   "poster": 10.0,
-  "fixture": "crates/pixtuoid-core/tests/sources/fixtures/claude-code/proof-session/01000000-0000-7000-8000-0000000000f4.jsonl"
+  "session": "crates/pixtuoid/examples/snapshot/proof-session/01000000-0000-7000-8000-0000000000f4.jsonl"
  }
 ]

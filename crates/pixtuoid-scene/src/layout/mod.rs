@@ -39,6 +39,7 @@ pub(crate) use rooms::walls::Doorway;
 pub(crate) use rooms::walls::{WALL_THICK_H, WALL_THICK_V, WallPiece};
 pub use rooms::{MeetingRoom, MeetingTrio, PantryRoom};
 pub use roster::Station;
+pub(crate) use roster::StationArt;
 pub(crate) use roster::{
     CLOCK, Depth, Fixture, NEON_PANEL, NEON_PANEL_BORDER, Tie, desk_chair_fixtures,
     desk_chair_sort_row, desk_chair_top_left, desk_fixtures, pod_decor_fixtures,
@@ -48,7 +49,7 @@ pub use roster::{
     NEON_PANEL_W,
 };
 #[cfg(test)]
-pub(crate) use roster::{NEON_PANEL_H, coffee_machine_cols, desk_has_cabinet};
+pub(crate) use roster::{NEON_PANEL_H, coffee_machine_cols};
 // Painter tests tile walls no `SceneLayout` has.
 pub(crate) use windows::{
     NEON_DOOR_WALL_W, WINDOW_TOP, WindowBay, door_x, glass_rows, wall_trim_row, window_frame,
@@ -265,6 +266,16 @@ impl Lounge {
     }
 }
 
+/// An agent's home desk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HomeDesk {
+    /// Its top-left, where the pod grid places it.
+    pub at: Point,
+    /// Which way its occupant faces — the ONE authority painters and the
+    /// approach/walk geometry share, so a seat is never drawn off its routed side.
+    pub facing: Facing,
+}
+
 /// The computed office geometry for one floor — quadrant bounds, per-agent
 /// desks, waypoints, decor, walls, and the walkability mask. Built once per
 /// `(buf_w, buf_h, max_desks)`.
@@ -280,11 +291,9 @@ pub struct SceneLayout {
     /// the appliance-placement region (vending/printer). Keep it distinct from
     /// `corridor`: same y/height, different x-extent.
     pub cubicle_aisle: Bounds,
-    /// Per-agent home-desk anchor positions, indexed floor-locally (read via
+    /// Per-agent home desks, indexed floor-locally (read via
     /// [`Self::home_desk`]).
-    pub home_desks: Vec<Point>,
-    /// Facing per home desk, parallel to [`Self::home_desks`].
-    pub(crate) desk_facings: Vec<Facing>,
+    pub home_desks: Vec<HomeDesk>,
     /// Named stops (lounge seats, appliances, meeting slots) agents walk to.
     pub waypoints: Vec<Waypoint>,
     /// Placed potted plants.
@@ -318,8 +327,8 @@ pub struct SceneLayout {
     /// band (and its carpet apron).
     pub top_margin: u16,
     /// The full-width horizontal corridor below the desk pods — the A\* router's
-    /// preferred zone and the pet/mascot path; `None` when it doesn't fit.
-    pub(crate) corridor: Option<Bounds>,
+    /// preferred zone and the pet/mascot path.
+    pub(crate) corridor: Bounds,
     /// Per-pixel walkability mask — the ground footprint every obstacle stamps,
     /// the surface routing runs over.
     pub walkable: WalkableMask,
@@ -346,10 +355,14 @@ const TIGHT_PAD_PX: u16 = 1;
 
 /// The north wall+window band's visual bottom sits this many px ABOVE
 /// `top_margin`; the rows in between render as carpet apron, not wall, so the
-/// mask blocks only down to the band bottom. The renderer derives
-/// `top_wall_h = top_margin - this`, so the mask and the visual MUST read this
-/// one source or they drift.
+/// mask blocks only down to the band bottom. The mask and the visual read it
+/// through [`wall_band_h`], or they drift.
 pub(crate) const WALL_BAND_TO_TOP_MARGIN: u16 = 4;
+
+/// The visible north wall band's height in px for a `top_margin`.
+pub(crate) const fn wall_band_h(top_margin: u16) -> u16 {
+    top_margin - WALL_BAND_TO_TOP_MARGIN
+}
 
 /// How many pixels of the pantry counter actually sit on the floor: only the
 /// southern base contacts the ground, the receding cabinet tops + backsplash
@@ -474,6 +487,7 @@ pub(crate) const INTER_POD_AISLE_Y: u16 = 18;
 impl SceneLayout {
     /// Returns `None` if the buffer is too small for even one cubicle plus the
     /// fixed lounge area — the caller paints a "terminal too small" message.
+    /// Panics where [`Self::compute_with_seed`] does.
     pub fn compute(buf_w: u16, buf_h: u16, max_desks: Option<usize>) -> Option<Self> {
         Self::compute_with_seed(buf_w, buf_h, max_desks, 0)
     }
@@ -482,6 +496,11 @@ impl SceneLayout {
     /// physical capacity, `Some(n)` caps at `n` for deterministic
     /// tests/snapshots. The pod grid geometry is always the room's true
     /// capacity regardless of the cap.
+    ///
+    /// # Panics
+    ///
+    /// If the office is still sealed once the #566 guard has dropped every
+    /// decor that can seal it: a layout bug no production floor seed is known to reach.
     pub fn compute_with_seed(
         buf_w: u16,
         buf_h: u16,
@@ -496,10 +515,10 @@ impl SceneLayout {
         self.walkable.is_walkable(x, y)
     }
 
-    /// Typed accessor for a floor's home-desk anchor. `home_desks` is a
+    /// Typed accessor for a floor's home desk. `home_desks` is a
     /// FLOOR-LOCAL vector — index it through a `FloorLocalDeskIndex`, never
     /// with an `AgentSlot.desk_index` directly.
-    pub fn home_desk(&self, i: FloorLocalDeskIndex) -> Option<Point> {
+    pub fn home_desk(&self, i: FloorLocalDeskIndex) -> Option<HomeDesk> {
         self.home_desks.get(i.0).copied()
     }
 
@@ -552,30 +571,10 @@ impl SceneLayout {
         })
     }
 
-    /// Which way the desk AT `pos` seats its occupant (an O(desks) scan).
-    pub(crate) fn desk_facing_at(&self, pos: Point) -> Facing {
-        self.home_desks
-            .iter()
-            .position(|&d| d == pos)
-            .map_or(Facing::South, |i| self.desk_facing(FloorLocalDeskIndex(i)))
-    }
-
-    /// Which way desk `i`'s occupant faces — the ONE authority painters and the
-    /// approach/walk geometry share, so a seat is never drawn off its routed side.
-    pub fn desk_facing(&self, i: FloorLocalDeskIndex) -> Facing {
-        debug_assert_eq!(
-            self.desk_facings.len(),
-            self.home_desks.len(),
-            "desk_facings is index-parallel to home_desks; a short one seats the tail viewer-facing and passes every geometry invariant"
-        );
-        self.desk_facings.get(i.0).copied().unwrap_or(Facing::South)
-    }
-
-    /// The visible top window-wall band height in px (`compute` names the same
-    /// quantity `top_wall_h`). Post-construction render sites read it here so
-    /// the derivation lives once.
+    /// The visible top window-wall band height in px: [`wall_band_h`] of this
+    /// layout's margin, for the render sites that only hold the layout.
     pub(crate) fn wall_band_h(&self) -> u16 {
-        self.top_margin.saturating_sub(WALL_BAND_TO_TOP_MARGIN)
+        wall_band_h(self.top_margin)
     }
 
     /// The bounds of meeting room `room_id` — the id IS the

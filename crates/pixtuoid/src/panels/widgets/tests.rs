@@ -1,6 +1,6 @@
 use super::*;
 use footer::{build_status_spans, build_status_summary, footer_context};
-use pixtuoid_core::state::ActivityState;
+use pixtuoid_core::state::{ActivityState, ToolUse};
 use pixtuoid_core::{AgentId, AgentSlot, GlobalDeskIndex, SceneState};
 use pixtuoid_scene::display::text::cells;
 use pixtuoid_scene::footer::{FooterFloor, FooterInputs};
@@ -21,11 +21,10 @@ fn stat_slot(path: &str, state: ActivityState, exiting: bool) -> AgentSlot {
         created_at: now,
         last_event_at: now,
         exiting_at: exiting.then_some(now),
-        pending_idle_at: None,
         desk_index: GlobalDeskIndex(0),
         floor_idx: 0,
         tool_call_count: 0,
-        active_ms: 0,
+        running_ms: 0,
         unknown_cwd: false,
         parent_id: None,
         pid: None,
@@ -39,19 +38,21 @@ fn stat_slot(path: &str, state: ActivityState, exiting: bool) -> AgentSlot {
 #[test]
 fn scene_stats_buckets_exiting_first_and_totals() {
     use pixtuoid_core::state::ToolKind;
-    let active = || ActivityState::Active {
-        tool_use_id: None,
-        detail: None,
-        kind: ToolKind::Other,
+    let running = || ActivityState::Running {
+        item: Some(ToolUse {
+            tool_use_id: None,
+            detail: None,
+            kind: ToolKind::Other,
+        }),
     };
     let mut scene = SceneState::uniform(16);
     for s in [
-        stat_slot("/exiting-active.jsonl", active(), true),
-        stat_slot("/live-active.jsonl", active(), false),
+        stat_slot("/exiting-active.jsonl", running(), true),
+        stat_slot("/live-active.jsonl", running(), false),
         stat_slot(
             "/waiting.jsonl",
-            ActivityState::Waiting {
-                reason: Arc::from("perm"),
+            ActivityState::RequiresAction {
+                reason: Some(Arc::from("perm")),
             },
             false,
         ),
@@ -62,14 +63,14 @@ fn scene_stats_buckets_exiting_first_and_totals() {
     let c = scene_stats(&scene);
     assert_eq!(
         c.exiting, 1,
-        "an exiting agent buckets as exiting even mid-Active"
+        "an exiting agent buckets as exiting even mid-Running"
     );
-    assert_eq!(c.active, 1, "only the LIVE Active counts as active");
-    assert_eq!(c.waiting, 1);
+    assert_eq!(c.running, 1, "only the LIVE Running counts as running");
+    assert_eq!(c.requires_action, 1);
     assert_eq!(c.idle, 1);
     assert_eq!(c.total, 4);
     assert_eq!(
-        c.active + c.waiting + c.idle + c.exiting,
+        c.running + c.requires_action + c.idle + c.exiting,
         c.total,
         "the four buckets must partition the total"
     );
@@ -95,7 +96,10 @@ fn state_vocab_is_total_and_distinct() {
     assert_eq!(words.len(), 4, "each state has a distinct word");
     let t = &pixtuoid_scene::theme::NORMAL;
     let tone = |k| pixtuoid_scene::tooltip::TipTone::Rung(k).rgb(t);
-    assert_eq!(tone(StateKind::Waiting), Some(t.ui.label_waiting));
+    assert_eq!(
+        tone(StateKind::RequiresAction),
+        Some(t.ui.label_requires_action)
+    );
     assert_eq!(tone(StateKind::Exiting), Some(t.ui.label_exiting));
 }
 
@@ -155,29 +159,32 @@ fn footer_vocabulary_is_single_column_so_scene_chars_count_matches_cells() {
 #[test]
 fn state_count_maps_each_kind() {
     let c = StateCounts {
-        active: 3,
-        waiting: 2,
+        running: 3,
+        requires_action: 2,
         idle: 7,
         exiting: 1,
         total: 13,
     };
-    assert_eq!(StateKind::Active.count(c), 3);
-    assert_eq!(StateKind::Waiting.count(c), 2);
+    assert_eq!(StateKind::Running.count(c), 3);
+    assert_eq!(StateKind::RequiresAction.count(c), 2);
     assert_eq!(StateKind::Idle.count(c), 7);
     assert_eq!(StateKind::Exiting.count(c), 1);
 }
 
-// Busy needs a placeholder in-flight run key because Busy is DERIVED from the run
+// Running needs a placeholder in-flight turn key because Running is DERIVED from the turn
 // set, never stored — without one the fixture is silently Idle.
 fn daemon(state: pixtuoid_core::state::DaemonState) -> pixtuoid_core::state::DaemonPresence {
     use pixtuoid_core::state::{DaemonLiveness, DaemonState};
-    let (liveness, in_flight_runs) = match state {
+    let (liveness, in_flight_turns) = match state {
         DaemonState::Idle => (DaemonLiveness::UP, Default::default()),
-        DaemonState::Busy => (
+        DaemonState::Running => (
             DaemonLiveness::UP,
-            [("fixture-run".to_string(), SystemTime::UNIX_EPOCH)]
-                .into_iter()
-                .collect::<std::collections::BTreeMap<String, SystemTime>>(),
+            [(
+                pixtuoid_core::state::TurnKey::Id("fixture-run".into()),
+                SystemTime::UNIX_EPOCH,
+            )]
+            .into_iter()
+            .collect::<std::collections::HashMap<pixtuoid_core::state::TurnKey, SystemTime>>(),
         ),
         DaemonState::Degraded => (DaemonLiveness::Up { degraded: true }, Default::default()),
         DaemonState::Down => (DaemonLiveness::Down, Default::default()),
@@ -187,7 +194,7 @@ fn daemon(state: pixtuoid_core::state::DaemonState) -> pixtuoid_core::state::Dae
         active_sessions: 0,
         last_seen: SystemTime::UNIX_EPOCH,
         entered_at: SystemTime::UNIX_EPOCH,
-        in_flight_runs,
+        in_flight_turns,
         current_pid: None,
     }
 }
@@ -196,10 +203,10 @@ fn daemon(state: pixtuoid_core::state::DaemonState) -> pixtuoid_core::state::Dae
 fn gateway_rollup_is_worst_of() {
     use pixtuoid_core::state::DaemonState;
     assert_eq!(gateway_rollup(std::iter::empty()), None);
-    let busy = daemon(DaemonState::Busy);
+    let running = daemon(DaemonState::Running);
     assert_eq!(
-        gateway_rollup(std::iter::once(&busy)),
-        Some(DaemonState::Busy)
+        gateway_rollup(std::iter::once(&running)),
+        Some(DaemonState::Running)
     );
     let (idle, degraded, down) = (
         daemon(DaemonState::Idle),
@@ -207,7 +214,7 @@ fn gateway_rollup_is_worst_of() {
         daemon(DaemonState::Down),
     );
     assert_eq!(
-        gateway_rollup([&busy, &idle, &degraded, &down].into_iter()),
+        gateway_rollup([&running, &idle, &degraded, &down].into_iter()),
         Some(DaemonState::Down)
     );
     assert_eq!(
@@ -219,10 +226,12 @@ fn gateway_rollup_is_worst_of() {
 #[test]
 fn per_floor_buckets_by_floor_idx() {
     use pixtuoid_core::state::ToolKind;
-    let active = || ActivityState::Active {
-        tool_use_id: None,
-        detail: None,
-        kind: ToolKind::Other,
+    let running = || ActivityState::Running {
+        item: Some(ToolUse {
+            tool_use_id: None,
+            detail: None,
+            kind: ToolKind::Other,
+        }),
     };
     let mut scene = SceneState::uniform(16);
     let add = |scene: &mut SceneState, path, state, exiting, floor: usize| {
@@ -230,23 +239,26 @@ fn per_floor_buckets_by_floor_idx() {
         s.floor_idx = floor;
         scene.agents.insert(s.agent_id, s);
     };
-    add(&mut scene, "/f0a.jsonl", active(), false, 0);
-    add(&mut scene, "/f0b.jsonl", active(), false, 0);
+    add(&mut scene, "/f0a.jsonl", running(), false, 0);
+    add(&mut scene, "/f0b.jsonl", running(), false, 0);
     add(
         &mut scene,
         "/f1w.jsonl",
-        ActivityState::Waiting {
-            reason: Arc::from("p"),
+        ActivityState::RequiresAction {
+            reason: Some(Arc::from("p")),
         },
         false,
         1,
     );
-    add(&mut scene, "/f1x.jsonl", active(), true, 1); // exiting on floor 1
+    add(&mut scene, "/f1x.jsonl", running(), true, 1); // exiting on floor 1
     add(&mut scene, "/f2i.jsonl", ActivityState::Idle, false, 2);
 
     let pf = per_floor_counts(&scene);
-    assert_eq!((pf[0].active, pf[0].total), (2, 2));
-    assert_eq!((pf[1].waiting, pf[1].exiting, pf[1].total), (1, 1, 2));
+    assert_eq!((pf[0].running, pf[0].total), (2, 2));
+    assert_eq!(
+        (pf[1].requires_action, pf[1].exiting, pf[1].total),
+        (1, 1, 2)
+    );
     assert_eq!((pf[2].idle, pf[2].total), (1, 1));
     assert_eq!(pf[3], StateCounts::default(), "an untouched floor is zero");
 }
@@ -333,12 +345,11 @@ fn slot_with(state: ActivityState, label: &str) -> AgentSlot {
         created_at: SystemTime::UNIX_EPOCH,
         last_event_at: SystemTime::UNIX_EPOCH,
         exiting_at: None,
-        pending_idle_at: None,
 
         desk_index: GlobalDeskIndex(0),
         floor_idx: 0,
         tool_call_count: 0,
-        active_ms: 0,
+        running_ms: 0,
         unknown_cwd: false,
         parent_id: None,
         pid: None,
@@ -348,20 +359,22 @@ fn slot_with(state: ActivityState, label: &str) -> AgentSlot {
         last_usage: None,
     }
 }
-fn active_with(detail: &str, label: &str) -> AgentSlot {
+fn running_with(detail: &str, label: &str) -> AgentSlot {
     slot_with(
-        ActivityState::Active {
-            tool_use_id: Some(Arc::from("t")),
-            detail: Some(Arc::from(detail)),
-            kind: pixtuoid_core::state::ToolKind::from_display(detail),
+        ActivityState::Running {
+            item: Some(ToolUse {
+                tool_use_id: Some(Arc::from("t")),
+                detail: Some(Arc::from(detail)),
+                kind: pixtuoid_core::state::ToolKind::from_display(detail),
+            }),
         },
         label,
     )
 }
-fn waiting(label: &str) -> AgentSlot {
+fn requires_action(label: &str) -> AgentSlot {
     slot_with(
-        ActivityState::Waiting {
-            reason: Arc::from("perm"),
+        ActivityState::RequiresAction {
+            reason: Some(Arc::from("perm")),
         },
         label,
     )
@@ -369,12 +382,14 @@ fn waiting(label: &str) -> AgentSlot {
 fn idle(label: &str) -> AgentSlot {
     slot_with(ActivityState::Idle, label)
 }
-fn active_kind(detail: &str, kind: pixtuoid_core::state::ToolKind, label: &str) -> AgentSlot {
+fn running_kind(detail: &str, kind: pixtuoid_core::state::ToolKind, label: &str) -> AgentSlot {
     slot_with(
-        ActivityState::Active {
-            tool_use_id: Some(Arc::from("t")),
-            detail: Some(Arc::from(detail)),
-            kind,
+        ActivityState::Running {
+            item: Some(ToolUse {
+                tool_use_id: Some(Arc::from("t")),
+                detail: Some(Arc::from(detail)),
+                kind,
+            }),
         },
         label,
     )
@@ -465,19 +480,19 @@ fn footer_single_idle_agent() {
 #[test]
 fn footer_full_width_mixed_states() {
     let s = scene_of(vec![
-        active_with("Edit src/a.rs", "a"),
-        active_with("Edit src/b.rs", "b"),
-        active_with("Bash: ls", "c"),
-        waiting("d"),
-        waiting("e"),
+        running_with("Edit src/a.rs", "a"),
+        running_with("Edit src/b.rs", "b"),
+        running_with("Bash: ls", "c"),
+        requires_action("d"),
+        requires_action("e"),
         idle("f"),
         idle("g"),
         idle("h"),
     ]);
     let line = footer_line(&s, 120, None, None);
     for frag in [
-        "\u{25cf}3 A",
-        "\u{25d0}2 W",
+        "\u{25cf}3 R",
+        "\u{25d0}2 A",
         "\u{25cb}3 I",
         "Edit\u{d7}2",
         "Bash\u{d7}1",
@@ -490,13 +505,13 @@ fn footer_full_width_mixed_states() {
 #[test]
 fn footer_medium_width_compact() {
     let s = scene_of(vec![
-        active_with("Edit src/a.rs", "a"),
-        waiting("b"),
+        running_with("Edit src/a.rs", "a"),
+        requires_action("b"),
         idle("c"),
     ]);
     let line = footer_line(&s, 60, None, None);
     assert!(!line.contains("Edit"), "medium drops tools: {line}");
-    assert!(line.contains("\u{25cf}1A"), "compact active rung: {line}");
+    assert!(line.contains("\u{25cf}1R"), "compact running rung: {line}");
     insta::assert_snapshot!(line);
 }
 
@@ -520,12 +535,12 @@ fn footer_quit_only_below_threshold() {
 #[test]
 fn footer_caps_tools_at_four() {
     let s = scene_of(vec![
-        active_with("Edit x", "a"),
-        active_with("Bash x", "b"),
-        active_with("Read x", "c"),
-        active_with("Write x", "d"),
-        active_with("Grep x", "e"),
-        active_with("Glob x", "f"),
+        running_with("Edit x", "a"),
+        running_with("Bash x", "b"),
+        running_with("Read x", "c"),
+        running_with("Write x", "d"),
+        running_with("Grep x", "e"),
+        running_with("Glob x", "f"),
     ]);
     let line = footer_line(&s, 200, None, None);
     let crosses = line.matches('\u{00d7}').count();
@@ -534,8 +549,13 @@ fn footer_caps_tools_at_four() {
 }
 
 #[test]
-fn footer_minimal_leads_with_waiting_alarm() {
-    let s = scene_of(vec![waiting("a"), waiting("b"), idle("c"), idle("d")]);
+fn footer_minimal_leads_with_requires_action_alarm() {
+    let s = scene_of(vec![
+        requires_action("a"),
+        requires_action("b"),
+        idle("c"),
+        idle("d"),
+    ]);
     let w = QUIT_SUFFIX.len() + 10;
     let line = footer_line(&s, w as u16, None, None);
     assert!(
@@ -545,8 +565,8 @@ fn footer_minimal_leads_with_waiting_alarm() {
 }
 
 #[test]
-fn footer_death_keeps_the_waiting_alarm() {
-    let s = scene_of(vec![waiting("a"), waiting("b"), idle("c")]);
+fn footer_death_keeps_the_requires_action_alarm() {
+    let s = scene_of(vec![requires_action("a"), requires_action("b"), idle("c")]);
     let line = footer_line(&s, 120, None, Some("codex disconnected"));
     assert!(line.contains('\u{26a0}'), "warning present: {line}");
     assert!(
@@ -629,8 +649,8 @@ fn footer_spans_text(
 fn status_spans_text_matches_summary_across_tiers() {
     let theme = &pixtuoid_scene::theme::NORMAL;
     let s = scene_of(vec![
-        active_with("Edit src/a.rs", "a"),
-        waiting("b"),
+        running_with("Edit src/a.rs", "a"),
+        requires_action("b"),
         idle("c"),
         idle("d"),
     ]);
@@ -651,37 +671,40 @@ fn status_spans_text_matches_summary_across_tiers() {
 fn status_spans_color_code_state_segments() {
     let theme = &pixtuoid_scene::theme::NORMAL;
     let s = scene_of(vec![
-        active_with("Edit src/a.rs", "a"),
-        waiting("b"),
+        running_with("Edit src/a.rs", "a"),
+        requires_action("b"),
         idle("c"),
     ]);
     let spans = build_status_spans(&inputs(&s, None, None), 120, theme);
-    let active = spans
+    let running = spans
         .iter()
         .find(|sp| sp.content.contains('\u{25cf}'))
         .unwrap();
-    let waiting = spans
+    let requires_action = spans
         .iter()
         .find(|sp| sp.content.contains('\u{25d0}'))
         .unwrap();
-    assert_eq!(active.style.fg, Some(to_color(theme.ui.label_active)));
-    assert_eq!(waiting.style.fg, Some(to_color(theme.ui.label_waiting)));
+    assert_eq!(running.style.fg, Some(to_color(theme.ui.label_running)));
+    assert_eq!(
+        requires_action.style.fg,
+        Some(to_color(theme.ui.label_requires_action))
+    );
 }
 
 #[test]
 fn footer_counts_agree_with_board_on_walkout() {
-    let mut gone = active_with("Edit x", "gone");
+    let mut gone = running_with("Edit x", "gone");
     gone.exiting_at = Some(SystemTime::UNIX_EPOCH);
     let s = scene_of(vec![
-        active_with("Edit a", "a"),
-        active_with("Bash b", "b"),
+        running_with("Edit a", "a"),
+        running_with("Bash b", "b"),
         gone,
     ]);
     let c = scene_stats(&s);
-    assert_eq!((c.active, c.exiting, c.total), (2, 1, 3), "shared spine");
+    assert_eq!((c.running, c.exiting, c.total), (2, 1, 3), "shared spine");
     let line = footer_line(&s, 160, None, None);
     assert!(
-        line.contains(" 3 \u{b7} \u{25cf}2 A"),
+        line.contains(" 3 \u{b7} \u{25cf}2 R"),
         "total incl. exiting: {line}"
     );
     assert!(
@@ -695,7 +718,7 @@ fn footer_tool_hue_reads_kind_field() {
     // A Task dispatch DISPLAYS "Delegating" but its typed kind is Task, so the hue
     // must never come from a re-parse of the displayed string.
     let theme = &pixtuoid_scene::theme::NORMAL;
-    let s = scene_of(vec![active_kind(
+    let s = scene_of(vec![running_kind(
         "Delegating",
         pixtuoid_core::state::ToolKind::Task,
         "lead",
@@ -735,17 +758,17 @@ fn footer_gateway_chip_reflects_rollup_and_suppresses_when_absent() {
 }
 
 #[test]
-fn footer_cross_floor_alarm_points_at_waiting_floor() {
-    // The waiting agent sits on floor 2 (index 1) while floor 1 is the one shown —
+fn footer_cross_floor_alarm_points_at_requires_action_floor() {
+    // The requires-action agent sits on floor 2 (index 1) while floor 1 is the one shown —
     // `per_floor` is office-wide, not the projected floor.
     let s = scene_of(vec![idle("a")]);
     let mut footer = inputs(&s, Some(fi(1, 3, 2)), None);
-    footer.context.per_floor[1].waiting = 1;
+    footer.context.per_floor[1].requires_action = 1;
     footer.context.per_floor[1].total = 1;
     let line = build_status_summary(&footer, 160);
     assert!(
         line.contains("\u{25b2}F2"),
-        "cross-floor waiting cue: {line}"
+        "cross-floor requires-action cue: {line}"
     );
 }
 

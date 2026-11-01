@@ -22,7 +22,7 @@ real-world headings. Pin this and stop re-deriving it:
 - East = +x (right), West = −x (left).
 
 A piece's approach set is canonical (facing-South) then rotated by live
-`Facing` — `layout.desk_facing(i)` is the authority; never assume the
+`Facing` — a `HomeDesk`'s `facing` is the authority; never assume the
 canonical set is the live one. (The compass stays screen-space even where
 real-world geography disagrees — flipping it would invert the z-sort/"south
 row" vocabulary across the crate for zero behavior change.)
@@ -45,9 +45,9 @@ follows whatever color replaces `H`. `of` must name a key with an opaque color i
 A pack can also redraw an animation on a denser grid, registered as
 `<name>@<N>x` (`desk@4x` is `desk` drawn on a 4x grid). Each frame is exactly
 `N` times the size of the matching base frame, and the frame counts match,
-or the pack does not load. The classic renderers — the half-block terminal office and the site's
-live office — draw the base art. Variants are for the pixel-graphics cutaway,
-which the `floating` window paints, and `run` over kitty's
+or the pack does not load. The classic renderer, the half-block terminal office,
+draws the base art. Variants are for the pixel-graphics cutaway,
+which the `floating` window and the site's live office paint, and `run` over kitty's
 graphics protocol, SIXEL or iTerm2's inline images: it takes the
 densest variant whose `N` divides its render scale and draws it as it is — a
 variant carries its own front, where a desk's top-down base art gets a front
@@ -68,13 +68,12 @@ bottom-left. `desk_front` is drawn over a `desk`'s props on the desk's own
 canvas: whatever of the desk stands between the viewer and its sitter's props,
 its monitor.
 
-A symbol in text is an icon, `[icons.<name>]` under the name
-`display::Icon::art` gives it, drawn in one frame per place text is: `world`
-in a cell of the office's own text (a glyph's width, a line's height), and
-`screen` in a screen cell less its gap. Either is as many cells wide as its
-terminal glyph takes. Its pixels in key `ι` (`pack::ICON_INK_KEY`), and that
-key's ramps, take the text's ink; every other key keeps the pack's colour.
-The icon tests pin both sizes and that every icon draws in the ink.
+A symbol in text is an icon, `[icons] <name> = "<file>"` under the name
+`display::Icon::art` gives it: one frame a line tall, as many cells wide as its
+terminal glyph takes less the last cell's gap. Its pixels in key `ι` (`pack::ICON_INK_KEY`), and
+that key's ramps, take the text's ink; every other key keeps the pack's
+colour. Screen text finds an icon by its glyph, so icons that write one glyph
+draw one art. The icon tests pin the size, the ink and the shared art.
 
 A walk (a person's `walking`, `walking_back` and `walking_coffee`, a pet's
 `cat_walk` and `dog_walk`, the gateway mascot's `lobster_walk`) takes

@@ -302,7 +302,7 @@ pub(crate) static DRACULA: Theme = Theme {
             g: 64,
             b: 80,
         },
-        waiting_bubble: Rgb {
+        requires_action_bubble: Rgb {
             r: 241,
             g: 250,
             b: 140,
@@ -335,7 +335,7 @@ pub(crate) static DRACULA: Theme = Theme {
             b: 123,
         },
         // The palette's one unclaimed accent: it must not collide with `edit`,
-        // or `ToolKind::Other` and a THINKING agent glow like an editing one.
+        // or `ToolKind::Other` and a turn between items glow like an edit.
         default: Rgb {
             r: 241,
             g: 250,
@@ -343,12 +343,22 @@ pub(crate) static DRACULA: Theme = Theme {
         },
     },
     ui: UiColors {
-        label_active: Rgb {
+        label_running: Rgb {
             r: 80,
             g: 250,
             b: 123,
         },
-        label_waiting: Rgb {
+        label_ok: Rgb {
+            r: 80,
+            g: 250,
+            b: 123,
+        },
+        label_requires_action: Rgb {
+            r: 241,
+            g: 250,
+            b: 140,
+        },
+        label_warn: Rgb {
             r: 241,
             g: 250,
             b: 140,

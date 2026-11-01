@@ -3,16 +3,17 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use image::codecs::gif::{GifEncoder, Repeat};
-use image::{Delay, Frame as GifFrame, Rgb as ImgRgb, RgbImage, Rgba, RgbaImage};
-use pixtuoid::dev::{DrawCtx, draw_scene};
+use image::{Delay, Frame as GifFrame, Rgba, RgbaImage};
+use pixtuoid::dev::{DrawCtx, draw_over_image, draw_scene};
 use pixtuoid_core::SceneState;
-use pixtuoid_scene::cutaway::{Canvas, CellPx, Face, GridInk, paint_grid};
-use pixtuoid_scene::floor::{FloorMeta, PerFloor};
+use pixtuoid_scene::cutaway::{Canvas, CellPx, GridInk, paint_grid};
+use pixtuoid_scene::floor::{FloorMeta, FloorSession, PerFloor};
 use pixtuoid_scene::pack::OfficeArt;
 use pixtuoid_scene::theme::Theme;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
+use crate::cutaway::{CutawayOffice, CutawaySession};
 use crate::{CELL_H, CELL_W, SnapshotArgs, due_navigations};
 
 /// Print a connectedness report for the walkable mask: a BFS from the door threshold,
@@ -127,17 +128,7 @@ pub(crate) fn compute_crop_rect(
     // silently writing the full uncropped PNG defeats the point of the flag.
     let target_pixel: pixtuoid_scene::layout::Point = if let Some(ref agent_label) = args.crop_agent
     {
-        let slot = scene
-            .agents
-            .values()
-            .find(|s| s.label.as_ref() == agent_label)
-            .ok_or_else(|| {
-                let labels: Vec<&str> = scene.agents.values().map(|s| s.label.as_ref()).collect();
-                anyhow::anyhow!(
-                    "--crop-agent {agent_label:?} not found in scene; labels: {}",
-                    labels.join(", ")
-                )
-            })?;
+        let slot = crate::scenes::agent_named(scene, "--crop-agent", agent_label)?;
         // `PoseHistory` records only waypoint and walking poses, so every
         // desk-seated agent — the majority, and every seated pose — has no entry.
         // Fall back to the seat the painter would draw them on rather than widen
@@ -164,9 +155,9 @@ pub(crate) fn compute_crop_rect(
                     anyhow::anyhow!("agent {agent_label:?} is neither placed nor at a home desk")
                 })?;
                 pixtuoid_scene::sim::seated_top_left(
-                    desk,
+                    desk.at,
                     pixtuoid_scene::layout::CHARACTER_SPRITE_W,
-                    layout.desk_facing(idx),
+                    desk.facing,
                 )
             }
         }
@@ -180,7 +171,7 @@ pub(crate) fn compute_crop_rect(
         )
         .ok_or_else(|| anyhow::anyhow!("scene too small to compute a layout"))?;
         let found = match furniture_str.to_lowercase().as_str() {
-            "desk" => layout.home_desks.first().copied(),
+            "desk" => layout.home_desks.first().map(|d| d.at),
             name => {
                 let kind = crate::scenes::waypoint_target(name).ok_or_else(|| {
                     anyhow::anyhow!(
@@ -207,15 +198,15 @@ pub(crate) fn compute_crop_rect(
 /// The `--crop-*` window, in cells.
 const CROP_WINDOW: ratatui::layout::Size = ratatui::layout::Size::new(40, 24);
 
-/// A [`CROP_WINDOW`] centered on `target`, clamped to stay inside the cols x rows
-/// terminal (shrinks only when the terminal itself is smaller).
+/// A [`CROP_WINDOW`] centered on `target`, a half-block buffer pixel, clamped
+/// to stay inside the cols x rows terminal (shrinks only when the terminal
+/// itself is smaller).
 pub(crate) fn centered_crop(
     target: pixtuoid_scene::layout::Point,
     cols: u16,
     rows: u16,
 ) -> ratatui::layout::Rect {
-    // `target` is a half-block buffer pixel: one per cell across, two per cell down.
-    let (cell_x, cell_y) = (target.x, target.y / 2);
+    let (cell_x, cell_y) = (target.x, target.y / pixtuoid_scene::layout::CELL_ROWS);
     let crop_w = CROP_WINDOW.width.min(cols);
     let crop_h = CROP_WINDOW.height.min(rows);
 
@@ -234,30 +225,57 @@ pub(crate) fn centered_crop(
     }
 }
 
+/// [`compose`]'s frame of `area` to the PNG at `path`.
 pub(crate) fn save_backend_as_png(
     term: &Terminal<TestBackend>,
-    path: &PathBuf,
+    path: &Path,
     area: ratatui::layout::Rect,
+    cutaway: Option<&CutawayOffice<FloorSession>>,
 ) -> Result<()> {
-    let mut img = RgbImage::from_pixel(
-        u32::from(area.width) * CELL_W,
-        u32::from(area.height) * CELL_H,
-        ImgRgb(TERMINAL_BG),
-    );
-    rasterize_cells(&mut img, term.backend().buffer(), area);
-    img.save(path)?;
+    let frame = compose(term.backend().buffer(), area, cutaway);
+    // Every pixel is opaque, so the PNG carries no alpha.
+    image::DynamicImage::from(frame).into_rgb8().save(path)?;
     Ok(())
 }
 
-pub(crate) fn cells_to_rgba(term_buf: &ratatui::buffer::Buffer) -> RgbaImage {
-    let area = term_buf.area;
+/// [`cells_to_rgba`], `cutaway`'s office over its scene cells where there is
+/// one: the frame every still and `--gif` capture writes.
+pub(crate) fn compose<S: CutawaySession>(
+    term_buf: &ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    cutaway: Option<&CutawayOffice<S>>,
+) -> RgbaImage {
+    let mut img = cells_to_rgba(term_buf, area);
+    if let Some(cutaway) = cutaway {
+        cutaway.paint(&mut img);
+    }
+    img
+}
+
+/// `area`'s cells of `term_buf` from the image's origin, one [`terminal_cell`]
+/// each, in the window's face: the ONE rasterizer. A cell with no colour of
+/// its own shows [`TERMINAL_BG`] and takes [`TERMINAL_FG`].
+pub(crate) fn cells_to_rgba(
+    term_buf: &ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+) -> RgbaImage {
     let [r, g, b] = TERMINAL_BG;
     let mut rgba = RgbaImage::from_pixel(
         u32::from(area.width) * CELL_W,
         u32::from(area.height) * CELL_H,
         Rgba([r, g, b, 255]),
     );
-    rasterize_cells(&mut rgba, term_buf, area);
+    paint_grid(
+        &mut ImageCanvas(&mut rgba),
+        &pixtuoid::dev::grid_of(term_buf, area),
+        ((0, 0), terminal_cell()),
+        crate::icons(),
+        GridInk {
+            text: TERMINAL_FG,
+            halo: None,
+            shadow: None,
+        },
+    );
     rgba
 }
 
@@ -269,32 +287,12 @@ const TERMINAL_FG: pixtuoid_core::sprite::Rgb = pixtuoid_core::sprite::Rgb {
     b: 220,
 };
 
-/// Paint `area`'s cells of `term_buf` onto `img` from its origin, one
-/// [`CELL_W`]×[`CELL_H`] cell each, in the window's screen face: the ONE
-/// rasterizer behind the PNG and RGBA outputs. A cell with no colour of its
-/// own leaves `img`'s ground and takes [`TERMINAL_FG`].
-fn rasterize_cells<I: image::GenericImage>(
-    img: &mut I,
-    term_buf: &ratatui::buffer::Buffer,
-    area: ratatui::layout::Rect,
-) where
-    I::Pixel: image::Pixel<Subpixel = u8>,
-{
-    let cell = CellPx {
+/// One terminal cell of the frames, [`CELL_W`]×[`CELL_H`].
+pub(crate) fn terminal_cell() -> CellPx {
+    CellPx {
         w: u16::try_from(CELL_W).expect("a cell is small"),
         h: u16::try_from(CELL_H).expect("a cell is small"),
-    };
-    paint_grid(
-        &mut ImageCanvas(img),
-        &pixtuoid::dev::grid_of(term_buf, area),
-        ((0, 0), cell),
-        (Face::Screen, crate::icons()),
-        GridInk {
-            text: TERMINAL_FG,
-            halo: None,
-            shadow: None,
-        },
-    );
+    }
 }
 
 /// A capture's frame clock — `secs` of frames at `fps` from `start` — shared by
@@ -338,7 +336,6 @@ pub(crate) enum FrameSink {
     /// Lossless PNGs for a consumer that re-encodes (gen-media's clips and their
     /// posters): the GIF encoder NeuQuant-quantises every frame past 256 colours
     /// (`gif::Frame::from_rgba_speed`), and a re-encode of the GIF inherits that loss.
-    /// Named `f%04d.png` from 1, as gen-media.py's `poster_frame` reads.
     Pngs { dir: PathBuf, written: usize },
 }
 
@@ -363,6 +360,12 @@ impl FrameSink {
         })
     }
 
+    /// Frame `n`'s file in a [`Self::Pngs`] `dir`, counted from 1: the name
+    /// gen-media.py's `FRAME_PATTERN` matches.
+    pub(crate) fn frame_path(dir: &Path, n: usize) -> PathBuf {
+        dir.join(format!("f{n:04}.png"))
+    }
+
     pub(crate) fn push(&mut self, rgba: RgbaImage) -> Result<()> {
         match self {
             Self::Gif { encoder, delay } => {
@@ -370,7 +373,7 @@ impl FrameSink {
             }
             Self::Pngs { dir, written } => {
                 *written += 1;
-                rgba.save(dir.join(format!("f{written:04}.png")))?;
+                rgba.save(Self::frame_path(dir, *written))?;
             }
         }
         Ok(())
@@ -391,13 +394,13 @@ pub(crate) struct AnimJob<'a> {
 
 impl AnimJob<'_> {
     /// Call `render` once per frame on `state` — `skip_ms` of pre-roll first,
-    /// rendered but not encoded — then encode the cell buffer `cells` reads back.
+    /// rendered but not encoded — then encode the image `image` reads back.
     fn encode<S>(
         &self,
         skip_ms: u64,
         state: &mut S,
         mut render: impl FnMut(&mut S, SystemTime, u64) -> Result<()>,
-        cells: impl Fn(&S) -> &ratatui::buffer::Buffer,
+        image: impl Fn(&S) -> RgbaImage,
     ) -> Result<()> {
         let Timeline { fps, secs, .. } = self.timeline;
         let frame_count = self.timeline.frame_count();
@@ -411,7 +414,7 @@ impl AnimJob<'_> {
             if i < skip_frames {
                 continue;
             }
-            sink.push(cells_to_rgba(cells(state)))?;
+            sink.push(image(state))?;
             let cap = i + 1 - skip_frames;
             if cap.is_multiple_of(fps as usize) {
                 eprint!("\r  encoding: {}/{secs}s", cap / fps as usize);
@@ -423,13 +426,19 @@ impl AnimJob<'_> {
 }
 
 /// Drive the real TuiRenderer (slide transition, footer floor chip, pet motion) frame by
-/// frame and encode its TestBackend cell buffer.
+/// frame and encode its TestBackend cell buffer; with `cutaway`, a second
+/// office navigated as the renderer's is painted over its office cells.
 pub(crate) fn save_renderer_animation(
     job: &AnimJob,
     term: Terminal<TestBackend>,
     navigations: &[(u64, usize)],
     pets: Vec<pixtuoid_scene::pet::Pet>,
+    cutaway: bool,
 ) -> Result<()> {
+    let size = term.size()?;
+    let cutaway = cutaway
+        .then(|| CutawayOffice::of_renderer(job.pack, size.width, size.height, pets.clone()))
+        .transpose()?;
     let mut r =
         pixtuoid::dev::TuiRenderer::new(term, job.theme, pets, std::sync::Arc::clone(job.pack));
     r.set_weather(job.weather);
@@ -439,18 +448,44 @@ pub(crate) fn save_renderer_animation(
     // --navigate-at schedule off the encoded clip's t=0.
     job.encode(
         0,
-        &mut r,
-        |r, now, elapsed_ms| {
+        &mut (r, cutaway),
+        |(r, cutaway), now, elapsed_ms| {
             for floor in due_navigations(navigations, &mut fired, elapsed_ms) {
                 r.navigate_floor(floor, now);
+                if let Some(cutaway) = cutaway {
+                    cutaway.navigate(floor, now);
+                }
             }
-            r.render(job.scene, job.pack, now)
+            r.render(job.scene, now)?;
+            if let Some(cutaway) = cutaway {
+                cutaway.render(r.office_world(job.scene, now), job.theme, None)?;
+            }
+            Ok(())
         },
-        |r| r.terminal.backend().buffer(),
+        |(r, cutaway)| {
+            let cells = r.terminal.backend().buffer();
+            compose(cells, cells.area, cutaway.as_ref())
+        },
     )
 }
 
-/// Drive `draw_scene` over one floor and encode it; `skip_ms` (from --anim,
+/// One frame of `ctx`'s floor: `draw_scene`'s, or `cutaway`'s office under
+/// the frame's text, as the TUI's cutaway draws it. What the classic frame
+/// answers a pointer with.
+pub(crate) fn draw_frame(
+    term: &mut Terminal<TestBackend>,
+    ctx: &mut DrawCtx<'_>,
+    cutaway: Option<&mut CutawayOffice<FloorSession>>,
+) -> Result<Option<pixtuoid_scene::look::Hits>> {
+    let Some(cutaway) = cutaway else {
+        return draw_scene(term, ctx);
+    };
+    let under = draw_over_image(term, ctx)?;
+    cutaway.render(ctx.world, ctx.theme, Some(under))?;
+    Ok(None)
+}
+
+/// Drive [`draw_frame`] over one floor and encode it; `skip_ms` (from --anim,
 /// --meeting or --warmup-secs) starts the clip mid-action.
 pub(crate) fn save_animation(
     job: &AnimJob,
@@ -459,28 +494,24 @@ pub(crate) fn save_animation(
     floor_meta: FloorMeta,
     skip_ms: u64,
     debug_walkable: bool,
+    cutaway: Option<CutawayOffice<FloorSession>>,
 ) -> Result<()> {
     let scene = job.scene;
     let mut office = pixtuoid_scene::floor::PerOffice::new();
     job.encode(
         skip_ms,
-        term,
-        |term, now, _| {
+        &mut (term, cutaway),
+        |(term, cutaway), now, _| {
             let mut draw_ctx = DrawCtx {
                 debug_walkable,
-                ..DrawCtx::offscreen(
-                    floor,
-                    office.stores(),
-                    job.theme,
-                    scene,
-                    job.pack,
-                    now,
-                    floor_meta,
-                )
+                ..DrawCtx::offscreen(floor, office.stores(), job.theme, scene, now, floor_meta)
             };
-            draw_scene(term, &mut draw_ctx).map(drop)
+            draw_frame(term, &mut draw_ctx, cutaway.as_mut()).map(drop)
         },
-        |term| term.backend().buffer(),
+        |(term, cutaway)| {
+            let cells = term.backend().buffer();
+            compose(cells, cells.area, cutaway.as_ref())
+        },
     )
 }
 

@@ -6,9 +6,9 @@ use std::borrow::Cow;
 
 use serde_json::Value;
 
-use super::AIMOCK_V1;
+use super::{AIMOCK_V1, SECOND_TURN};
 use crate::harness::hermetic::{
-    HostConfig, Package, PerOs, Profile, Scenario, Shape, Surface, Turn, tui,
+    ConfigFile, HostConfig, Package, PerOs, Profile, Scenario, Second, Shape, Surface, Turn, tui,
 };
 
 /// grok's TUI. Its default mode asks before a shell command off the read-only
@@ -17,22 +17,23 @@ const TUI: tui::Tui = tui::Tui {
     args: &["--permission-mode", "default"],
     composer: tui::Composer {
         marker: "  │ ❯",
-        above: tui::Above::Rule {
+        border: tui::Border::Rule {
             glyph: '─',
             corners: Some(('╭', '╮')),
         },
     },
     gates: &[tui::Gate {
         shows: "No, reject (type to add feedback)",
-        deny: &[tui::Key::Text("4")],
+        keys: &[tui::Key::Text("4")],
         dwell: std::time::Duration::ZERO,
     }],
+    cancel: &[],
     // `/exit` is `/quit`'s alias
     // (`crates/codegen/xai-grok-pager/docs/user-guide/04-slash-commands.md:71-73`).
     quit: &[tui::Key::Text("/exit"), tui::Key::Enter],
     // It clears the alternate screen and paints nothing more (`hermetic.yml`'s
     // Windows leg, run 39177894288's `grok/permission/tui.log`).
-    renders_under_conpty: false,
+    conpty: tui::ConPty::PaintsNothing,
 };
 
 /// The registration a grok envelope's `hookEventName` answers to: the wire
@@ -55,8 +56,9 @@ fn event(v: &Value) -> Option<Cow<'_, str>> {
 }
 
 pub(crate) const PROFILE: Profile = Profile {
-    source: "grok",
+    source: crate::source::grok::SOURCE_NAME,
     package: Package::Npm("@xai-official/grok"),
+    plugin_types: &[],
     // Headless automation runs always-approve
     // (`crates/codegen/xai-grok-pager/docs/user-guide/22-permissions-and-safety.md:76-94`),
     // which a blocking spawn needs: `-p` cancels every prompt
@@ -114,7 +116,14 @@ pub(crate) const PROFILE: Profile = Profile {
     // (`crates/codegen/xai-grok-agent/src/repo.rs:23-52`), which the
     // recorder's `git init` makes the workspace.
     ancestor_config: &[],
-    config: &[],
+    // The TUI asks to trust a folder its home's trust store does not name,
+    // keyed on the git root's realpath (at main 2bdd1d6a:
+    // `crates/codegen/xai-grok-permission-rules/src/trust.rs:7-12`, `:389-397`, `:447-450`).
+    config: &[ConfigFile {
+        home: "GROK_HOME",
+        path: "trusted_folders.toml",
+        template: "[folders.'{workspace}']\ntrusted = true\n",
+    }],
     scenarios: &[
         Scenario {
             name: "tool-run",
@@ -128,7 +137,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "Stop",
                 "SessionEnd",
             ],
-            fixture: "fixtures/grok/tool-run-hermetic",
             turn: Turn::PROFILE,
         },
         // A tool that fails to dispatch fires PostToolUseFailure, a built-in's
@@ -148,7 +156,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "Stop",
                 "SessionEnd",
             ],
-            fixture: "fixtures/grok/tool-error-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -165,16 +172,12 @@ pub(crate) const PROFILE: Profile = Profile {
                 "Stop",
                 "SessionEnd",
             ],
-            fixture: "grok/fixtures/subagent-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
             name: "permission",
             shape: Shape::Permission,
-            surface: Surface::Tui {
-                row: &TUI,
-                answer: tui::Answer::Deny,
-            },
+            surface: Surface::Tui { row: &TUI },
             expects: &[
                 "SessionStart",
                 "UserPromptSubmit",
@@ -185,7 +188,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "SessionEnd",
                 "Stop",
             ],
-            fixture: "fixtures/grok/permission-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -193,7 +195,6 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::ModelError,
             surface: Surface::Headless,
             expects: &["SessionStart", "UserPromptSubmit", "StopFailure"],
-            fixture: "fixtures/grok/model-error-hermetic",
             turn: Turn::PROFILE,
         },
         // A question headless cannot answer: the shell fires the
@@ -213,8 +214,24 @@ pub(crate) const PROFILE: Profile = Profile {
                 "Stop",
                 "SessionEnd",
             ],
-            fixture: "fixtures/grok/ask-user-hermetic",
             turn: Turn::PROFILE,
+        },
+        Scenario {
+            name: "two-turn",
+            shape: Shape::ToolRun,
+            surface: Surface::Tui { row: &TUI },
+            expects: &[
+                "SessionStart",
+                "UserPromptSubmit",
+                "PreToolUse",
+                "PostToolUse",
+                "Stop",
+                "SessionEnd",
+            ],
+            turn: Turn {
+                second: Some(Second::Prompt(SECOND_TURN)),
+                ..Turn::PROFILE
+            },
         },
     ],
     script_vars: &[],
@@ -226,6 +243,8 @@ pub(crate) const PROFILE: Profile = Profile {
     result_unseen: false,
     live: None,
     daemon: None,
+    server_stop: None,
+    turn_exits: &[],
 };
 
 #[cfg(test)]

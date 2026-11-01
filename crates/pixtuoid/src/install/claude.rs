@@ -38,7 +38,7 @@ pub(crate) const HOST: HostRegistration = HostRegistration {
     register,
     unregister,
     is_registered,
-    copy: None,
+    pickup: None,
     legacy: Some(LegacyConfig {
         path: settings_path,
         strip: merge::flat_json_uninstall,
@@ -123,7 +123,7 @@ fn unregister(config: &Path) -> Result<Unregistered> {
             return Ok(Unregistered::Unreachable);
         }
         let (_, root) = host_plugin::layout(config, host_plugin::HOOKS_FILE)?;
-        host_plugin::remove_if_ours(root, &marketplace_manifest(root))?;
+        host_plugin::remove_if_ours(root, &marketplace_manifest(root), host_plugin::names_us)?;
         return Ok(Unregistered::Absent);
     }
     let listed = CLI.run(&[
@@ -142,7 +142,7 @@ fn unregister(config: &Path) -> Result<Unregistered> {
             NAME.as_ref(),
         ])?;
     }
-    host_plugin::remove_if_ours(root, &marketplace_manifest(root))?;
+    host_plugin::remove_if_ours(root, &marketplace_manifest(root), host_plugin::names_us)?;
     Ok(if found {
         Unregistered::Removed
     } else {
@@ -194,8 +194,7 @@ pub(crate) fn hook_command(resolved: &Path, explicit: bool) -> Result<String> {
         // CC's Unix entry carries no `args` key, so it runs through a SHELL and
         // the env prefix every other source uses works here too. It was bare for
         // years, which made "no `_pixtuoid_source`" mean "probably CC" — the
-        // guess `decoder` still has to make for installs written before this, and
-        // the reason an unstamped cursor invocation landed on CC's arms at all.
+        // guess `decoder` still has to make for installs written before this.
         let p = if explicit {
             merge::hook_path_str(resolved)?
         } else {

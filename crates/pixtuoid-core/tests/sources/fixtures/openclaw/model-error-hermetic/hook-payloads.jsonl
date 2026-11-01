@@ -1,6 +1,0 @@
-{"type":"gateway_start","gatewayPort":49259,"_pid":11938,"_shim_ts_ms":1792503706503,"_pixtuoid_source":"openclaw"}
-{"type":"session_start","sessionId":"","gatewayPort":49259,"_pid":11938,"_shim_ts_ms":1792503715076,"_pixtuoid_source":"openclaw"}
-{"type":"before_agent_run","runId":"63c05008-61fa-4032-be95-78dc554c7aaf","sessionId":"","gatewayPort":49259,"_pid":11938,"_shim_ts_ms":1792503720862,"_pixtuoid_source":"openclaw"}
-{"type":"agent_end","runId":"63c05008-61fa-4032-be95-78dc554c7aaf","sessionId":"","gatewayPort":49259,"_pid":11938,"errored":true,"_shim_ts_ms":1792503721966,"_pixtuoid_source":"openclaw"}
-{"type":"gateway_stop","gatewayPort":49259,"_pid":11938,"_shim_ts_ms":1792503723578,"_pixtuoid_source":"openclaw"}
-{"type":"session_end","sessionId":"","gatewayPort":49259,"_pid":11938,"_shim_ts_ms":1792503723579,"_pixtuoid_source":"openclaw"}

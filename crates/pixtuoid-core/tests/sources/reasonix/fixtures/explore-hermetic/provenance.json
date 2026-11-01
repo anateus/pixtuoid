@@ -1,15 +1,15 @@
 {
   "origin": "recorded",
   "cli": "reasonix",
-  "version": "reasonix v2.44.0",
-  "captured": "2026-10-20",
+  "version": "reasonix v2.56.0",
+  "captured": "2026-10-30",
   "command": "just hermetic --record reasonix",
   "deidentified": {
     "method": "decoder-allowlist",
     "blanked": 12
   },
-  "aimock": "1.45.1",
-  "script": "tests/sources/hermetic/reasonix/explore.json",
+  "aimock": "1.47.0",
+  "script": "tests/sources/reasonix/hermetic/explore.json",
   "dropped": {
     "os": "macos",
     "at": {}

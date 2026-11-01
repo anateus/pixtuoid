@@ -30,12 +30,12 @@ in [`CONTRIBUTING.md`](docs/CONTRIBUTING.md#releasing).
 
 Terminal-native, multi-agent pixel-art visualizer for AI coding agents: each
 running CC session is an animated sprite in an ASCII office. Rust workspace,
-five crates. Overview: [`README.md`](README.md).
+six crates. Overview: [`README.md`](README.md).
 
 ## Layout
 
 ```
-crates/   DAG: pixtuoid-core ← pixtuoid-scene ← {pixtuoid, pixtuoid-web}  (+ standalone pixtuoid-hook)
+crates/   DAG: pixtuoid-core ← pixtuoid-scene ← {pixtuoid, pixtuoid-web, pixtuoid-web-music}  (+ standalone pixtuoid-hook)
 ├── pixtuoid-core/   headless lib — no terminal deps; `native` feature gates the async
 │                    source runtime (off = wasm32-clean decode/reduce)
 ├── pixtuoid-scene/  render+sim engine — terminal- AND window-free BY CRATE BOUNDARY
@@ -43,8 +43,9 @@ crates/   DAG: pixtuoid-core ← pixtuoid-scene ← {pixtuoid, pixtuoid-web}  (+
 ├── pixtuoid/        binary — two thin painters over pixtuoid-scene: `tui/`, `floating/`
 ├── pixtuoid-web/    third painter — wasm canvas, publish=false; a SITE BUILD INPUT
 │                    (`just gen-wasm` → gitignored site/public/wasm/, built in CI)
+├── pixtuoid-web-music/ the site's ♩ lofi in its own wasm, so the office's carries none
 └── pixtuoid-hook/   tiny shim CC invokes — stdin JSON → socket/named pipe
-scripts/  gen-media.py (the ONE driver for the README's committed media and the site's CI-rendered demos), gen-art.py (the generated sprites: every @Nx + the 1x pieces it owns), capture drivers and the openclaw tier (lib/)
+scripts/  gen-media.py (the ONE driver for the README's committed media and the site's CI-rendered demos), gen-art.py (the generated sprites: every @Nx + the 1x pieces it owns), each shipped plugin's selftest, and in lib/ its harness and the openclaw tier
 policy/   CI contracts no linter sees (jq over yq) + behavior tests of workflow shell
 site/     Astro landing page; integrations/raycast/  Raycast extension
 ```
@@ -63,12 +64,12 @@ cargo run --profile release-local --example snapshot -- /tmp/snap.png   # the sa
 - Touched `--json` / `SourceStatus` / `OutcomeRow` / the source roster → `just gen-contract` (regenerates schemas + Raycast types).
 - Look-changing PR → `just gen`, commit everything it rewrote. Media is not a PR's: the site's demos render in CI, the README's `docs/images` in `media-regen.yml` from main.
 - Real wire bytes ride ONE pipeline, `pixtuoid_core::harness::Drive` — rules in [`tests/AGENTS.md`](crates/pixtuoid-core/tests/AGENTS.md#the-one-pipeline).
-- Fixtures are RECORDED, never composed (`just hermetic --record` for a scenario a profile records, else `just capture-fixture` — BILLED), and the recorder blanks every subtree no decoder reads (derived by probe, never listed); every scenario declares `provenance.json`. Rules: [`fixtures/README.md`](crates/pixtuoid-core/tests/sources/fixtures/README.md). `just restrip-fixtures` re-strips the committed corpus offline; `just corpus-all` censuses local corpora.
+- Fixtures are RECORDED, never composed (`just hermetic --record` for a scenario a profile records, else `just capture-fixture` — BILLED), and the recorder blanks every subtree no decoder reads (derived by probe, never listed); every scenario declares `provenance.json`. Rules: [`tests/sources/README.md`](crates/pixtuoid-core/tests/sources/README.md). `just restrip-fixtures` re-strips the committed corpus offline; `just corpus-all` censuses local corpora.
 - Visual verification for sprite work: snapshot example → `scripts/crop-snapshot.py` → READ the PNG; loop in `.claude/skills/beautify-decoration/SKILL.md`.
 - CI is the gate, and a green preflight is NOT a green PR. A PR's pushes run only the light tier; the full tier runs on `main`, and in the merge queue unless Mergify merges an up-to-date PR alone at the front directly (two-step CI).
 - Advisory (never gates): `just mutants`, `just bench`, `just bench-pacing`, CodSpeed.
 - Fluency gate, local and pre-release (a wall-clock budget, so never CI): `just pace-check`; its runs and verdict in `scripts/pace-check.py`'s header.
-- Hooks: `git config core.hooksPath .githooks` once per clone; `just setup-tools` installs cargo tools (incl. rust-analyzer — without it the agent LSP degrades to grep).
+- Hooks: `git config core.hooksPath .githooks` once per clone; `just setup-tools` installs `mise.toml`'s tools and rust-analyzer (without it the agent LSP degrades to grep).
 - Release is a human step: [`CONTRIBUTING.md#releasing`](docs/CONTRIBUTING.md#releasing).
 
 ## Workflow

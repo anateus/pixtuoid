@@ -1,53 +1,87 @@
-//! Hermes Agent (Nous Research) source — HOOK-ONLY: pixtuoid never spawns the user's
-//! agent and Hermes's on-disk sessions are not tailable JSONL, so the shell hooks in
-//! the `config.yaml` under [`hermes_home`] are the only seam a passive observer can
-//! reach. That home is `$HERMES_HOME` when set, else `~/.hermes` — but
-//! `%LOCALAPPDATA%\hermes` on Windows, which is why every caller resolves it through
-//! that fn rather than joining `.hermes` itself.
+//! Hermes Agent (Nous Research) source — HOOK-ONLY, via a bundled Python plugin.
 //!
-//! Keyed on `session_id`, not the workspace: a user may run several Hermes sessions
-//! in ONE project and cwd-keying would merge them (the Cursor lesson).
+//! Hermes runs every turn in its gateway daemon, whose own cwd is its install
+//! dir, so no shell hook can name a session's workspace. The bundled plugin
+//! (`install/hermes_plugin.py`) runs in that gateway, reads the workspace from
+//! `ctx.session_cwd()`, and pipes an allowlisted copy of each event's kwargs into
+//! the `pixtuoid-hook` shim:
 //!
-//! The envelope reuses CC's `hook_event_name` field NAME but with snake_case VALUES
-//! alien to the shared CC-shaped arms, so the decoder is `HookDecoding::ClaimsAll`:
-//! it claims EVERY event.
+//! ```json
+//! {"hook_event_name":"pre_tool_call","cwd":"/repo","_pid":43677,"session_id":"local-…","tool_name":"read_file","tool_call_id":"call_…","args":{"path":"NOTE.txt"}}
+//! ```
 //!
-//! `subagent_stop` is deliberately absent from `HERMES_EVENTS`: the SHELL-hook payload
-//! carries a parent id but NO child session/agent id, so a decode could only end a
-//! child that was never started. Hermes's Python PLUGIN API does define a
-//! `subagent_start` with a child id, but plugin hooks are in-process callbacks that
-//! never reach a shell command's stdin — don't "fix" this by modelling them.
+//! Keyed on `session_id`, not the workspace: a user may run several Hermes
+//! sessions in ONE project and cwd-keying would merge them (the Cursor lesson).
+//! The envelope reuses CC's `hook_event_name` field NAME with snake_case VALUES
+//! alien to the shared CC-shaped arms, so the decoder is
+//! `HookDecoding::ClaimsAll`: it claims EVERY event.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::source::decoder::{DecodeError, DecodeResult as Result};
 use serde_json::Value;
 
 use crate::AgentId;
-use crate::source::decoder::{MAX_DECODED_FIELD_CHARS, ellipsize};
-use crate::source::{AgentEvent, ToolDetail};
+use crate::source::decoder::{
+    DecodeError, DecodeResult as Result, MAX_DECODED_FIELD_CHARS, ellipsize, generic_keyed_detail,
+};
+use crate::source::registry::{
+    ChildEndInference, FocusChannel, HookDecoding, HookObject, Hyphen, SourceCaps,
+    SourceDescriptor, SourceKind,
+};
+use crate::source::{AgentEvent, RequestKeys};
 
 /// The Hermes CLI source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "hermes";
 
+pub(crate) const DESCRIPTOR: SourceDescriptor = SourceDescriptor {
+    name: SOURCE_NAME,
+    label_prefix: "hm",
+    verified_version: "0.22.5",
+    version_probe: Some(&["hermes", "--version"]),
+    version_hyphen: Hyphen::Prerelease,
+    home_env: Some("HERMES_HOME"),
+    kind: SourceKind::Agent {
+        transcript: None,
+        hook: Some(HookDecoding::ClaimsAll(decode_hermes_hook_payload)),
+        caps: SourceCaps {
+            // `on_session_finalize` when the gateway finalizes a session, else the
+            // gateway's death. NOT `on_session_end`, which despite the name is a
+            // TURN boundary.
+            has_exit_signal: true,
+            resurrects_on_prompt: false,
+            // No subagent nesting on the wire — sessions render flat.
+            delegations_are_hook_silent: false,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
+            brackets_turns: false,
+        },
+        // The plugin stamps the gateway's pid, which every session shares and no
+        // window owns (`install/hermes_plugin.py`).
+        focus: FocusChannel::ServerStamp,
+    },
+    #[cfg(feature = "native")]
+    native: crate::source::registry::Native {
+        root: Some(hermes_home),
+        focus_probe: None,
+    },
+};
+
 /// The Hermes home dir (`config.yaml` lives directly in it), mirroring hermes's
-/// own `hermes_constants._hermes_home_from_env` (2026.8.3): `HERMES_HOME`
-/// STRIPPED and taken verbatim when what's left is non-empty — even for a dir
-/// that does not exist, unlike Codex's exists-check — else the PLATFORM-NATIVE
-/// default, which is `%LOCALAPPDATA%\hermes` on Windows and only elsewhere
-/// `<user_home>/.hermes`.
+/// own `get_process_hermes_home` (`hermes_constants.py:237-246`, `:46-58` at
+/// v0.22.5): `HERMES_HOME` STRIPPED and, when what's left is non-empty, expanded
+/// as `expand_home` does — even for a dir that does not exist, unlike Codex's
+/// exists-check — else the PLATFORM-NATIVE default, which is
+/// `%LOCALAPPDATA%\hermes` on Windows and only elsewhere `<user_home>/.hermes`,
+/// with `HERMES_DATA_DIR_SUFFIX` appended literally
+/// (`website/docs/reference/environment-variables.md:894`).
 ///
 /// Hermes PROFILES are applied out-of-band and are deliberately not mirrored:
 /// each CLI's resolver is mirrored on its OWN axes, never a generic union.
 pub fn hermes_home() -> Option<PathBuf> {
     let raw = crate::platform::path_env_trimmed("HERMES_HOME");
     let from_env = raw.is_some();
-    let dir = resolve_hermes_home(
-        raw,
-        crate::platform::path_env_trimmed("LOCALAPPDATA"),
-        cfg!(windows),
-        crate::platform::user_home_opt(),
-    )?;
+    let dir = resolve_hermes_home(raw, cfg!(windows), &|name: &str| std::env::var_os(name))?;
     // Only the ENV branch may be blamed on HERMES_HOME. A relative DEFAULT comes
     // from HOME/LOCALAPPDATA, and naming an unset var as the cause sends the
     // reader chasing the wrong one (#881 review).
@@ -59,34 +93,214 @@ pub fn hermes_home() -> Option<PathBuf> {
 }
 
 /// Pure precedence core, separated so the Windows arm is unit-testable on any
-/// host. `user_home` mirrors `Path.home()`, whose Windows arm is
-/// `USERPROFILE`-first (`ntpath.expanduser`) exactly like [`user_home_opt`].
-///
-/// [`user_home_opt`]: crate::platform::user_home_opt
-/// The env values arrive ALREADY trimmed and blank-filtered from
-/// `platform::path_env_trimmed` — normalized at the read boundary, not here.
+/// host: `HERMES_HOME` arrives trimmed from the read boundary, and `var` reads
+/// every other variable as `std::env::var_os` does.
 fn resolve_hermes_home(
     hermes_home_env: Option<PathBuf>,
-    local_appdata: Option<PathBuf>,
     windows: bool,
-    user_home: Option<PathBuf>,
+    var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Option<PathBuf> {
     if let Some(h) = hermes_home_env {
-        return Some(h);
+        return Some(match h.to_str() {
+            Some(raw) => expand_home(raw, windows, var),
+            None => h,
+        });
     }
-    if !windows {
-        return user_home.map(|h| h.join(".hermes"));
-    }
-    let base = match local_appdata {
-        Some(l) => l,
-        None => user_home?.join("AppData").join("Local"),
+    let (base, mut leaf) = if windows {
+        let local = var("LOCALAPPDATA").and_then(crate::platform::trimmed_path);
+        let base = match local {
+            Some(l) => l,
+            None => python_home(true, var)?.join("AppData").join("Local"),
+        };
+        (base, OsString::from("hermes"))
+    } else {
+        (python_home(false, var)?, OsString::from(".hermes"))
     };
-    Some(base.join("hermes"))
+    leaf.push(var("HERMES_DATA_DIR_SUFFIX").unwrap_or_default());
+    Some(base.join(leaf))
 }
 
-/// Decode one Hermes hook payload (already identified by
-/// `_pixtuoid_source == "hermes"`); an unregistered event bails so
-/// registered-vs-decoded drift is loud.
+/// `os.path.expanduser(os.path.expandvars(raw))`, hermes's expansion of
+/// `HERMES_HOME` (`hermes_constants.py:46-48` at v0.22.5), in the host's flavour:
+/// CPython 3.14.8's `Lib/posixpath.py:229-334` or `Lib/ntpath.py:345-468`. On
+/// Unix, where Python asks the passwd database, which core never reads
+/// (`platform::resolve_home_first`), a `~user` and a `~` with no `HOME` stay as
+/// written. A variable whose value is not UTF-8 stays as its reference.
+fn expand_home(raw: &str, windows: bool, var: &dyn Fn(&str) -> Option<OsString>) -> PathBuf {
+    let text = |name: &str| {
+        var(name)
+            .filter(|_| !name.is_empty())
+            .and_then(|v| v.into_string().ok())
+    };
+    let expanded = expandvars(raw, windows, &text);
+    let Some(tail) = expanded.strip_prefix('~') else {
+        return expanded.into();
+    };
+    let (user, rest) = tail.split_at(
+        tail.find(|c| c == '/' || (windows && c == '\\'))
+            .unwrap_or(tail.len()),
+    );
+    let Some(home) = python_home(windows, var) else {
+        return expanded.into();
+    };
+    let home = match (user, windows) {
+        ("", _) => home.into_os_string(),
+        (_, true) => match nt_user_home(home, user, text("USERNAME").as_deref()) {
+            Some(home) => home,
+            None => return expanded.into(),
+        },
+        (_, false) => return expanded.into(),
+    };
+    let mut out = home;
+    out.push(rest);
+    out.into()
+}
+
+/// `ntpath.expanduser`'s guess at `user`'s home (`Lib/ntpath.py:370-384` at
+/// v3.14.8): the `current` user's own `home`, else the profile beside it when
+/// `home` is named for `current`.
+fn nt_user_home(home: PathBuf, user: &str, current: Option<&str>) -> Option<OsString> {
+    if current == Some(user) {
+        return Some(home.into_os_string());
+    }
+    let home = home.to_str()?;
+    let is_sep = |c: char| c == '\\' || c == '/';
+    // The drive and root `dirname` keeps whole. A UNC share stays in `rest`, where
+    // the split lands as `ntpath`'s unless `home` is the share itself.
+    let root = match home.as_bytes() {
+        [_, b':', sep, ..] if is_sep(char::from(*sep)) => 3,
+        [_, b':', ..] => 2,
+        [sep, ..] if is_sep(char::from(*sep)) => 1,
+        _ => 0,
+    };
+    let (root, rest) = home.split_at(root);
+    let (head, name) = rest.split_at(rest.rfind(is_sep).map_or(0, |at| at + 1));
+    if Some(name) != current {
+        return None;
+    }
+    let head = head.trim_end_matches(is_sep);
+    let sep = if head.is_empty() { "" } else { "\\" };
+    Some(format!("{root}{head}{sep}{user}").into())
+}
+
+/// The `$NAME` and `${NAME}` references in `path` — and on Windows `%NAME%`,
+/// `%%`, `$$` and single-quoted runs — replaced as Python's `expandvars` replaces
+/// them: an unknown or unterminated reference stays as written.
+fn expandvars(path: &str, windows: bool, text: &dyn Fn(&str) -> Option<String>) -> String {
+    let specials: &[char] = if windows { &['$', '%', '\''] } else { &['$'] };
+    let mut out = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(at) = rest.find(specials) {
+        out.push_str(&rest[..at]);
+        let here = &rest[at..];
+        let after = &here[1..];
+        // The reference's length, and what replaces it.
+        let (len, value) = match here.as_bytes()[0] {
+            b'\'' => (after.find('\'').map_or(here.len(), |c| c + 2), None),
+            b'%' => match after.find('%') {
+                Some(0) => (2, Some("%".to_owned())),
+                Some(c) => (c + 2, text(&after[..c])),
+                None => (here.len(), None),
+            },
+            _ if windows && after.starts_with('$') => (2, Some("$".to_owned())),
+            _ => match after.strip_prefix('{') {
+                Some(body) => match body.find('}') {
+                    Some(c) => (c + 3, text(&body[..c])),
+                    None => (here.len(), None),
+                },
+                None => {
+                    let name = after
+                        .bytes()
+                        .take_while(|&b| {
+                            b.is_ascii_alphanumeric() || b == b'_' || (windows && b == b'-')
+                        })
+                        .count();
+                    (name + 1, (name > 0).then(|| text(&after[..name])).flatten())
+                }
+            },
+        };
+        out.push_str(value.as_deref().unwrap_or(&here[..len]));
+        rest = &here[len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `Path.home()`, Python's `os.path.expanduser("~")`: `USERPROFILE`, else
+/// `HOMEDRIVE` + `HOMEPATH`, on Windows; `HOME` elsewhere, `/` when it is empty.
+fn python_home(windows: bool, var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if windows {
+        if let Some(profile) = var("USERPROFILE") {
+            return Some(profile.into());
+        }
+        let path = var("HOMEPATH")?;
+        let mut home = var("HOMEDRIVE").unwrap_or_default();
+        home.push(path);
+        return Some(home.into());
+    }
+    let home = var("HOME")?;
+    Some(if home.is_empty() {
+        "/".into()
+    } else {
+        home.into()
+    })
+}
+
+const ON_SESSION_START: &str = "on_session_start";
+const PRE_TOOL_CALL: &str = "pre_tool_call";
+const PRE_APPROVAL_REQUEST: &str = "pre_approval_request";
+const POST_TOOL_CALL: &str = "post_tool_call";
+const ON_SESSION_END: &str = "on_session_end";
+const ON_SESSION_FINALIZE: &str = "on_session_finalize";
+
+/// The events this decoder turns into events. Pinned to its arms by
+/// `every_exported_set_is_exactly_its_dispatch_arms`, and to what the plugin
+/// registers by its selftest, through `the_plugin_contract_is_the_committed_file`.
+#[cfg(any(test, feature = "harness"))]
+#[doc(hidden)]
+pub const DECODED_EVENTS: &[&str] = &[
+    ON_SESSION_START,
+    PRE_TOOL_CALL,
+    PRE_APPROVAL_REQUEST,
+    POST_TOOL_CALL,
+    ON_SESSION_END,
+    ON_SESSION_FINALIZE,
+];
+
+/// The events hermes fires outside a session's turn, where `ctx.session_cwd()`
+/// is undefined (`website/docs/user-guide/features/plugins.md:1109`): the gateway
+/// finalizes a session at its viewer's close or its own stop. The plugin sends
+/// them no cwd, and no arm reads one: `only_an_event_inside_a_turn_reads_the_cwd`.
+#[cfg(any(test, feature = "harness"))]
+#[doc(hidden)]
+pub const OUTSIDE_A_TURN: &[&str] = &[ON_SESSION_FINALIZE];
+
+/// Every envelope field [`field`] reads, pinned by `every_decoded_field_is_read`.
+/// The plugin sends these and `args` cut to [`DETAIL_KEYS`], nothing more of
+/// hermes's kwargs, which its selftest holds it to through
+/// `the_plugin_contract_is_the_committed_file`.
+#[cfg(any(test, feature = "harness"))]
+#[doc(hidden)]
+pub const DECODED_FIELDS: &[&str] = &[
+    "session_id",
+    "cwd",
+    "tool_name",
+    "tool_call_id",
+    "description",
+    "model",
+];
+
+/// The `args` keys a tool's detail is read from.
+const KEYS: &[&str] = &["command", "file_path", "path", "pattern", "url"];
+
+/// [`KEYS`], for the plugin's pin.
+#[cfg(any(test, feature = "harness"))]
+#[doc(hidden)]
+pub const DETAIL_KEYS: &[&str] = KEYS;
+
+/// Decode one Hermes plugin envelope (already identified by
+/// `_pixtuoid_source == "hermes"`); an event outside the plugin's forward set
+/// bails, so plugin-vs-decoder drift is loud.
 ///
 /// The activity arms prepend an [`AgentEvent::Identity`] because Hermes is HOOK-ONLY:
 /// a slot the reducer synthesizes mid-turn has no transcript back-fill path, so
@@ -94,144 +308,97 @@ fn resolve_hermes_home(
 ///
 /// # Errors
 ///
-/// If the payload is not an object, lacks `hook_event_name`, carries neither `session_id` nor `cwd`, or names an unregistered event.
-pub(crate) fn decode_hermes_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| DecodeError::not_an_object(SOURCE_NAME))?;
+/// If the payload lacks `hook_event_name` or `session_id`, or names an event
+/// the plugin does not forward.
+pub(crate) fn decode_hermes_hook_payload(obj: &HookObject) -> Result<Vec<AgentEvent>> {
     let event = obj
         .get("hook_event_name")
-        .and_then(|s| s.as_str())
+        .and_then(Value::as_str)
         .ok_or_else(|| DecodeError::missing(SOURCE_NAME, "hook_event_name"))?;
-    let cwd = obj
-        .get("cwd")
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.is_empty());
-    // The cwd fallback is only for a future event that omits `session_id` — it keeps
-    // coalescing best-effort instead of dropping the event.
-    let key = obj
-        .get("session_id")
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .or(cwd)
-        .ok_or_else(|| DecodeError::missing(SOURCE_NAME, "session_id|cwd"))?;
-    let agent_id = AgentId::from_parts(SOURCE_NAME, key);
-    let cwd = cwd.unwrap_or("");
-
-    let identity = || {
-        AgentEvent::identity(
-            agent_id,
-            SOURCE_NAME,
-            key,
-            (!cwd.is_empty()).then(|| cwd.into()),
-        )
-    };
+    let session_id = field(obj, "session_id")
+        .ok_or_else(|| DecodeError::missing_in(SOURCE_NAME, event, "session_id"))?;
+    let agent_id = AgentId::from_parts(SOURCE_NAME, session_id);
+    let cwd = field(obj, "cwd");
+    let identity =
+        || AgentEvent::identity(agent_id, SOURCE_NAME, session_id, cwd.map(PathBuf::from));
     // A call's start, its approval wait and its end each carry it
-    // (`_CallIds` at `model_tools.py:643`, `tools/approval_context.py:67` at v0.22.2),
+    // (`_CallIds` at `model_tools.py:643`, `tools/approval_context.py:67` at v0.22.5),
     // so a wait names the call whose end clears it.
-    let tool_use_id = || {
-        obj.get("extra")
-            .and_then(|e| e.get("tool_call_id"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-    };
+    let tool_use_id = || field(obj, "tool_call_id").map(String::from);
 
-    let decoded: Result<Vec<AgentEvent>> = match event {
-        "on_session_start" => Ok(vec![AgentEvent::SessionStart {
+    let mut evs = match event {
+        ON_SESSION_START => vec![AgentEvent::SessionStart {
             agent_id,
             source: SOURCE_NAME.to_string(),
-            session_id: key.to_string(),
-            cwd: cwd.into(),
+            session_id: session_id.to_string(),
+            cwd: cwd.unwrap_or_default().into(),
             parent_id: None,
-        }]),
-        "pre_tool_call" => {
-            let tool = obj
-                .get("tool_name")
-                .and_then(|s| s.as_str())
-                .unwrap_or_else(|| {
-                    crate::source::drift::missing_field(SOURCE_NAME, "pre_tool_call", "tool_name");
-                    "?"
-                });
-            Ok(vec![
+        }],
+        PRE_TOOL_CALL => {
+            let tool = field(obj, "tool_name").unwrap_or_else(|| {
+                crate::source::drift::missing_field(SOURCE_NAME, event, "tool_name");
+                "?"
+            });
+            vec![
                 identity(),
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id,
                     tool_use_id: tool_use_id(),
-                    detail: Some(hermes_tool_detail(tool, obj.get("tool_input"))),
+                    detail: Some(generic_keyed_detail(tool, obj.get("args"), KEYS)),
                 },
-            ])
+            ]
         }
-        "post_tool_call" => Ok(vec![
+        POST_TOOL_CALL => vec![
             identity(),
-            AgentEvent::ActivityEnd {
+            AgentEvent::ToolUseEnd {
                 agent_id,
                 tool_use_id: tool_use_id(),
             },
-        ]),
-        // Observer-only for a SHELL hook: `_BLOCKING_EVENTS` in upstream's
-        // `agent/shell_hooks.py` is `{pre_tool_call}` alone, so our silent exit-0
-        // cannot stall the decision. `tool_name` is null here and the WHY rides
-        // `extra.description` — capture-verified, `permission-hermetic`.
-        "pre_approval_request" => {
-            let reason = obj
-                .get("extra")
-                .and_then(|e| e.get("description"))
-                .and_then(|d| d.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|d| crate::source::decoder::ellipsize(d, MAX_DECODED_FIELD_CHARS))
+        ],
+        // The gate's WHY rides `description` (`website/docs/user-guide/features/hooks.md:484`).
+        PRE_APPROVAL_REQUEST => {
+            let reason = field(obj, "description")
+                .map(|d| ellipsize(d, MAX_DECODED_FIELD_CHARS))
                 .unwrap_or_else(|| "permission".to_string());
-            Ok(vec![
+            vec![
                 identity(),
-                AgentEvent::Waiting {
+                AgentEvent::user_action_request(
                     agent_id,
-                    reason,
-                    tool_use_id: tool_use_id(),
-                },
-            ])
+                    Some(reason),
+                    RequestKeys {
+                        tool_use_id: tool_use_id(),
+                        ..RequestKeys::default()
+                    },
+                ),
+            ]
         }
-        // THE session end, as `on_session_end` is not: `lifecycle.py::finalize_session`
-        // hard-closes the Relay conversation under the SAME `session_id` it sends
-        // us, so the id in the payload is the one being terminated. Upstream's
-        // atexit-registered `_run_cleanup` fires it with `reason="shutdown"`, which
-        // is why the registry row claims an exit signal. Its sibling
-        // `on_session_reset` is deliberately NOT here — see the omit ledger.
-        "on_session_finalize" => Ok(vec![AgentEvent::SessionEnd {
+        // THE session end, as `on_session_end` is not: `finalize_session` closes the
+        // Relay conversation under the same `session_id` (`hermes_cli/lifecycle.py:81-93`).
+        // The gateway fires it when a session's last viewer closes it
+        // (`gateway/session_viewer_close.py:1-7`) or it stops mid-turn
+        // (`gateway/run_shutdown.py:1173-1180`); a one-shot session idle at the stop
+        // gets none, and ends with the gateway's pid.
+        ON_SESSION_FINALIZE => vec![AgentEvent::SessionEnd {
             agent_id,
             as_child: false,
-        }]),
-        // A TURN boundary, not the session's end — upstream's own doc says it is
-        // "emitted from agent/turn_finalizer.py" carrying `turn_id`/`completed`
-        // ("True when the turn produced a final response"), and turn_finalizer's
-        // comment adds that "run_conversation() is called once per user message
-        // in multi-turn sessions". Mapping it to SessionEnd walked the agent out of
-        // the office at every turn.
+        }],
+        // A TURN boundary, not the session's end: it fires "at each turn
+        // finalization" (`website/docs/user-guide/features/hooks.md:471`). Mapping it
+        // to SessionEnd walked the agent out of the office at every turn.
         //
         // An ACTIVITY arm, so it takes that class's Identity with it: for a
         // tool-less chat turn this is the ONLY event the session emits, and a
         // daemon attaching mid-session would otherwise get the blank `#N` ghost
-        // the module doc names, until the next tool call.
-        "on_session_end" => Ok(vec![
-            identity(),
-            AgentEvent::ActivityEnd {
-                agent_id,
-                tool_use_id: None,
-            },
-        ]),
+        // the decode fn's doc names, until the next tool call.
+        ON_SESSION_END => vec![identity(), AgentEvent::turn_end(agent_id)],
         other => {
             crate::source::drift::unknown_event(SOURCE_NAME, other);
-            Err(DecodeError::unsupported(SOURCE_NAME, other))
+            return Err(DecodeError::unsupported(SOURCE_NAME, other));
         }
     };
-    let mut evs = decoded?;
-    // hermes nests it one level down and only the session events carry it, so a
-    // top-level read finds nothing and a tool event must not clear it.
-    if let Some(model) = obj
-        .get("extra")
-        .and_then(|e| e.get("model"))
-        .and_then(|m| m.as_str())
-        .filter(|s| !s.is_empty())
-    {
+    // Only the session events carry it (`website/docs/user-guide/features/hooks.md:470-471`),
+    // so an event without one must not clear it.
+    if let Some(model) = field(obj, "model") {
         evs.push(AgentEvent::ModelInfo {
             agent_id,
             model: Some(ellipsize(model, MAX_DECODED_FIELD_CHARS)),
@@ -241,63 +408,32 @@ pub(crate) fn decode_hermes_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
     Ok(evs)
 }
 
-fn hermes_tool_detail(tool: &str, args: Option<&Value>) -> ToolDetail {
-    const KEYS: &[&str] = &["command", "file_path", "path", "pattern", "url"];
-    crate::source::decoder::generic_keyed_detail(tool, args, KEYS)
+/// The non-empty string at top-level `name`.
+fn field<'o>(obj: &'o HookObject, name: &'static str) -> Option<&'o str> {
+    // The plugin sends only the listed fields, so a read missing from the list
+    // would see nothing in production while an inline test payload passes.
+    #[cfg(test)]
+    assert!(
+        DECODED_FIELDS.contains(&name),
+        "{name} is not in DECODED_FIELDS"
+    );
+    obj.get(name)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::decoder::test_obj;
     use serde_json::json;
 
     fn decode_all(v: Value) -> Vec<AgentEvent> {
-        decode_hermes_hook_payload(&v).expect("decodes")
+        decode_hermes_hook_payload(test_obj(&v)).expect("decodes")
     }
 
     fn decode(v: Value) -> AgentEvent {
         decode_all(v).pop().expect("at least one event")
-    }
-
-    #[test]
-    fn session_start_reports_the_model_from_extra() {
-        // The shape from fixtures/hermes/tool-run-hermetic: hermes nests it one
-        // level down, and only the session events carry it.
-        let evs = decode_all(json!({
-            "hook_event_name": "on_session_start", "session_id": "s1", "cwd": "/repo",
-            "extra": {"model": "gpt-4o-mini"}
-        }));
-        assert!(
-            evs.iter().any(
-                |e| matches!(e, AgentEvent::ModelInfo { model: Some(m), .. } if m == "gpt-4o-mini")
-            ),
-            "extra.model must reach ModelInfo, got {evs:?}"
-        );
-    }
-
-    #[test]
-    fn session_start_keys_on_session_id_with_real_cwd() {
-        let ev = decode(json!({
-            "hook_event_name": "on_session_start",
-            "tool_name": null, "tool_input": null,
-            "session_id": "sess-1", "cwd": "/Users/dev/proj", "extra": {}
-        }));
-        match ev {
-            AgentEvent::SessionStart {
-                agent_id,
-                source,
-                session_id,
-                cwd,
-                parent_id,
-            } => {
-                assert_eq!(source, SOURCE_NAME);
-                assert_eq!(agent_id, AgentId::from_parts(SOURCE_NAME, "sess-1"));
-                assert_eq!(session_id, "sess-1", "key on session_id, not cwd");
-                assert_eq!(cwd, std::path::PathBuf::from("/Users/dev/proj"));
-                assert_eq!(parent_id, None);
-            }
-            other => panic!("expected SessionStart, got {other:?}"),
-        }
     }
 
     #[test]
@@ -315,60 +451,76 @@ mod tests {
         );
     }
 
+    /// No key is guessed: a workspace-keyed slot would merge two sessions, and
+    /// the cwd is not the session's identity.
     #[test]
-    fn key_falls_back_to_cwd_when_session_id_absent() {
-        let ev = decode(json!({
-            "hook_event_name": "on_session_start", "cwd": "/Users/dev/proj"
-        }));
-        assert!(matches!(ev, AgentEvent::SessionStart { agent_id, .. }
-            if agent_id == AgentId::from_parts(SOURCE_NAME, "/Users/dev/proj")));
-    }
-
-    #[test]
-    fn a_call_its_wait_and_its_end_name_one_tool_id() {
-        let call = |event: &str| {
-            decode(json!({
-                "hook_event_name": event,
-                "session_id": "s", "cwd": "/repo",
-                "tool_name": "terminal", "tool_input": {"command": "echo hello"},
-                "extra": {"task_id": "t", "tool_call_id": "c", "description": "why"}
-            }))
-        };
-        match call("pre_tool_call") {
-            AgentEvent::ActivityStart {
-                tool_use_id,
-                detail,
-                ..
-            } => {
-                assert_eq!(tool_use_id.as_deref(), Some("c"));
-                assert_eq!(detail.unwrap().display(), "terminal: echo hello");
+    fn a_payload_without_a_session_id_is_an_error_never_keyed_on_its_cwd() {
+        for ev in DECODED_EVENTS {
+            for payload in [
+                json!({"hook_event_name": ev, "cwd": "/Users/dev/proj"}),
+                json!({"hook_event_name": ev, "session_id": "", "cwd": "/Users/dev/proj"}),
+            ] {
+                assert!(
+                    decode_hermes_hook_payload(test_obj(&payload)).is_err(),
+                    "{payload}"
+                );
             }
-            other => panic!("expected ActivityStart, got {other:?}"),
         }
-        assert!(matches!(
-            call("pre_approval_request"),
-            AgentEvent::Waiting { tool_use_id: Some(t), .. } if t == "c"
-        ));
-        assert!(matches!(
-            call("post_tool_call"),
-            AgentEvent::ActivityEnd { tool_use_id: Some(t), .. } if t == "c"
-        ));
     }
 
     #[test]
-    fn post_tool_call_is_activity_end() {
-        let ev = decode(json!({
-            "hook_event_name": "post_tool_call", "session_id": "s", "cwd": "/repo",
-            "tool_name": "terminal",
-            "extra": {"result": "{\"output\":\"hi\"}", "duration_ms": 42}
-        }));
-        assert!(matches!(
-            &ev,
-            AgentEvent::ActivityEnd {
-                tool_use_id: None,
-                ..
-            }
-        ));
+    fn the_session_cwd_names_the_workspace_and_an_empty_one_names_none() {
+        let start = decode(
+            json!({"hook_event_name": "on_session_start", "session_id": "s", "cwd": "/repo"}),
+        );
+        assert!(
+            matches!(&start, AgentEvent::SessionStart { cwd, .. } if cwd == &PathBuf::from("/repo")),
+            "{start:?}"
+        );
+        let with = decode_all(
+            json!({"hook_event_name": "post_tool_call", "session_id": "s",
+            "cwd": "/repo"}),
+        );
+        let without = decode_all(
+            json!({"hook_event_name": "post_tool_call", "session_id": "s",
+            "cwd": ""}),
+        );
+        assert!(
+            matches!(&with[0], AgentEvent::Identity { cwd: Some(c), .. } if c == &PathBuf::from("/repo")),
+            "{with:?}"
+        );
+        assert!(
+            matches!(&without[0], AgentEvent::Identity { cwd: None, .. }),
+            "{without:?}"
+        );
+    }
+
+    #[test]
+    fn a_calls_start_wait_and_end_name_it_and_its_start_names_the_tool() {
+        let id = |ev: &str| {
+            decode(
+                json!({"hook_event_name": ev, "session_id": "s", "cwd": "/repo",
+                "tool_name": "read_file", "tool_call_id": "call_1",
+                "args": {"path": "NOTE.txt"}, "description": "recursive delete"}),
+            )
+        };
+        let start = id("pre_tool_call");
+        let AgentEvent::ToolUseStart {
+            tool_use_id,
+            detail: Some(detail),
+            ..
+        } = &start
+        else {
+            panic!("{start:?}");
+        };
+        assert_eq!(tool_use_id.as_deref(), Some("call_1"));
+        assert!(detail.display().contains("NOTE.txt"), "{detail:?}");
+        assert!(
+            matches!(id("pre_approval_request"), AgentEvent::UserActionRequest {
+            tool_use_id: Some(t), reason: Some(r), .. } if t == "call_1" && r == "recursive delete")
+        );
+        assert!(matches!(id("post_tool_call"), AgentEvent::ToolUseEnd {
+            tool_use_id: Some(t), .. } if t == "call_1"));
     }
 
     /// The name says session; upstream's emitter and payload say TURN. Mapping it
@@ -376,17 +528,19 @@ mod tests {
     /// while the user read or typed.
     #[test]
     fn on_session_end_is_a_turn_boundary_not_the_sessions_end() {
-        let ev =
-            decode(json!({"hook_event_name": "on_session_end", "session_id": "s", "cwd": "/r"}));
+        let evs = decode_all(
+            json!({"hook_event_name": "on_session_end", "session_id": "s",
+            "cwd": "/r", "model": "hermetic"}),
+        );
         assert!(
-            matches!(
-                ev,
-                AgentEvent::ActivityEnd {
-                    tool_use_id: None,
-                    ..
-                }
+            evs.iter().any(|e| matches!(e, AgentEvent::TurnEnd { .. })),
+            "{evs:?}"
+        );
+        assert!(
+            evs.iter().any(
+                |e| matches!(e, AgentEvent::ModelInfo { model: Some(m), .. } if m == "hermetic")
             ),
-            "got {ev:?}"
+            "{evs:?}"
         );
     }
 
@@ -406,9 +560,9 @@ mod tests {
             "on_session_end",
         ] {
             evs.extend(
-                decode_hermes_hook_payload(
+                decode_hermes_hook_payload(test_obj(
                     &json!({"hook_event_name": name, "session_id": sid, "cwd": "/r"}),
-                )
+                ))
                 .expect("decodes"),
             );
         }
@@ -424,85 +578,63 @@ mod tests {
     }
 
     #[test]
-    fn all_events_for_one_session_share_one_agent_id() {
-        let sid = "sess-1";
-        let events = [
-            json!({"hook_event_name": "on_session_start", "session_id": sid, "cwd": "/repo"}),
-            json!({"hook_event_name": "pre_tool_call", "session_id": sid, "cwd": "/repo",
-                   "tool_name": "terminal", "tool_input": {"command": "ls"}}),
-            json!({"hook_event_name": "post_tool_call", "session_id": sid, "cwd": "/repo", "tool_name": "terminal"}),
-            json!({"hook_event_name": "on_session_end", "session_id": sid, "cwd": "/repo"}),
-        ];
-        let ids: std::collections::BTreeSet<_> = events
-            .iter()
-            .flat_map(|v| decode_hermes_hook_payload(v).unwrap())
-            .map(|e| e.agent_id())
-            .collect();
-        assert_eq!(ids.len(), 1, "all events must coalesce to one AgentId");
-    }
-
-    #[test]
-    fn activity_arms_prepend_identity_keyed_on_session_id() {
-        for payload in [
-            json!({"hook_event_name": "pre_tool_call", "session_id": "s", "cwd": "/repo",
-                   "tool_name": "terminal", "tool_input": {"command": "ls"}}),
-            json!({"hook_event_name": "post_tool_call", "session_id": "s", "cwd": "/repo", "tool_name": "terminal"}),
-            json!({"hook_event_name": "on_session_end", "session_id": "s", "cwd": "/repo"}),
-        ] {
-            let name = payload["hook_event_name"].clone();
-            let events = decode_all(payload);
-            assert_eq!(events.len(), 2, "{name}: Identity + activity");
-            match &events[0] {
-                AgentEvent::Identity {
-                    agent_id,
-                    source,
-                    session_id,
-                    cwd,
-                    pid: None,
-                } => {
-                    assert_eq!(*agent_id, AgentId::from_parts(SOURCE_NAME, "s"));
-                    assert_eq!(source, SOURCE_NAME);
-                    assert_eq!(session_id, "s");
-                    assert_eq!(cwd.as_deref(), Some(std::path::Path::new("/repo")));
-                }
-                other => panic!("{name}: expected leading Identity, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    /// The partition is by decoded CLASS, not by wire name — `on_session_end`
-    /// moved to the activity arms and its Identity had to move with it.
-    fn session_events_carry_no_identity() {
-        for payload in [
-            json!({"hook_event_name": "on_session_start", "session_id": "s", "cwd": "/r"}),
-            json!({"hook_event_name": "on_session_finalize", "session_id": "s", "cwd": "/r"}),
-        ] {
-            let name = payload["hook_event_name"].clone();
-            let events = decode_all(payload);
-            assert_eq!(events.len(), 1, "{name}: exactly one event");
+    fn an_event_the_plugin_never_forwards_bails() {
+        for ev in ["subagent_stop", "pre_message", "on_session_reset", "Bogus"] {
             assert!(
-                !matches!(events[0], AgentEvent::Identity { .. }),
-                "{name} must not emit Identity"
+                decode_hermes_hook_payload(test_obj(
+                    &json!({"hook_event_name": ev, "session_id": "s", "cwd": "/r"})
+                ))
+                .is_err(),
+                "{ev} must bail (not forwarded, must not decode silently)"
             );
         }
     }
 
+    /// [`field`]'s assertion holds every read to the list; this holds every
+    /// listed field to a read, by blanking it.
     #[test]
-    fn unknown_event_bails_loudly() {
-        for ev in ["subagent_stop", "pre_message", "on_error", "Bogus"] {
+    fn every_decoded_field_is_read() {
+        let full = json!({"session_id": "s", "cwd": "/r", "tool_name": "terminal",
+            "tool_call_id": "c", "description": "why", "model": "m"});
+        let decoded = |ev: &str, payload: &Value| {
+            let mut payload = payload.clone();
+            payload["hook_event_name"] = json!(ev);
+            format!("{:?}", decode_hermes_hook_payload(test_obj(&payload)))
+        };
+        for name in DECODED_FIELDS {
+            let mut blanked = full.clone();
+            blanked[*name] = json!("");
             assert!(
-                decode_hermes_hook_payload(&json!({"hook_event_name": ev, "cwd": "/r"})).is_err(),
-                "{ev} must bail (not registered, must not decode silently)"
+                DECODED_EVENTS
+                    .iter()
+                    .any(|ev| decoded(ev, &full) != decoded(ev, &blanked)),
+                "{name} is in DECODED_FIELDS, but no event reads it"
             );
         }
+    }
+
+    /// A cwd outside a turn is not the session's, so it registers nothing.
+    #[test]
+    fn only_an_event_inside_a_turn_reads_the_cwd() {
+        for ev in DECODED_EVENTS {
+            let decoded = |payload: Value| format!("{:?}", decode_all(payload));
+            let with = decoded(json!({"hook_event_name": ev, "session_id": "s", "cwd": "/repo"}));
+            let without = decoded(json!({"hook_event_name": ev, "session_id": "s"}));
+            assert_eq!(with == without, OUTSIDE_A_TURN.contains(ev), "{ev}");
+        }
+        let finalize = decode_all(json!({"hook_event_name": "on_session_finalize",
+            "session_id": "s", "cwd": "/repo"}));
+        assert!(
+            matches!(finalize[..], [AgentEvent::SessionEnd { .. }]),
+            "{finalize:?}"
+        );
     }
 
     #[test]
     fn malformed_payloads_are_errors() {
-        assert!(decode_hermes_hook_payload(&json!("just a string")).is_err());
-        assert!(decode_hermes_hook_payload(&json!(42)).is_err());
-        assert!(decode_hermes_hook_payload(&json!({"hook_event_name": "on_session_end"})).is_err());
+        assert!(
+            decode_hermes_hook_payload(test_obj(&json!({"session_id": "s", "cwd": "/r"}))).is_err()
+        );
     }
 
     /// An UNSET `HERMES_HOME` must never be blamed for a relative default: the
@@ -539,10 +671,9 @@ mod tests {
         });
     }
 
-    /// Pinned against a live probe of hermes 2026.8.3, the STRIP included.
     /// `hermes_home` must read through the TRIMMING twin: upstream applies
-    /// `os.environ.get(K, "").strip()`, so a padded override IS the stripped
-    /// path. Nothing else pins that binding — swap `path_env_trimmed` for
+    /// `os.environ.get(K, "").strip()` (`hermes_constants.py:245` at v0.22.5), so
+    /// a padded override IS the stripped path. Nothing else pins that binding — swap `path_env_trimmed` for
     /// `path_env` in `hermes_home()` and every other test still passes.
     #[test]
     fn hermes_home_strips_a_padded_env_override_like_upstream() {
@@ -551,65 +682,196 @@ mod tests {
         assert_eq!(got, Some(PathBuf::from("/custom/hm")));
     }
 
-    #[test]
-    fn hermes_home_takes_the_env_value_then_falls_back_to_dot_hermes() {
-        let unix = |env: Option<&str>| {
-            resolve_hermes_home(
-                env.map(PathBuf::from),
-                None,
-                false,
-                Some(PathBuf::from("/home/u")),
-            )
-        };
-        let default = Some(PathBuf::from("/home/u").join(".hermes"));
+    /// Each variable an env map names, as `std::env::var_os` would hand it over.
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| OsString::from(v))
+        }
+    }
 
-        assert_eq!(unix(Some("/custom/hm")), Some(PathBuf::from("/custom/hm")));
-        assert_eq!(unix(None), default);
-        assert_eq!(resolve_hermes_home(None, None, false, None), None);
+    fn home(raw: Option<&str>, windows: bool, pairs: &[(&str, &str)]) -> Option<PathBuf> {
+        resolve_hermes_home(raw.map(PathBuf::from), windows, &env(pairs))
+    }
+
+    /// Each case's expected value is CPython 3.14.8's `posixpath.expanduser(
+    /// posixpath.expandvars(raw))` under the same environment.
+    #[test]
+    fn hermes_home_expands_its_variables_as_posix_python_does() {
+        let vars = [("HOME", "/home/u"), ("A", "/srv/a")];
+        for (raw, want) in [
+            ("$A/h", "/srv/a/h"),
+            ("${A}/h", "/srv/a/h"),
+            ("$NOPE/h", "$NOPE/h"),
+            ("${A/h", "${A/h"),
+            ("${}/h", "${}/h"),
+            ("a$/h", "a$/h"),
+            ("$A-B/h", "/srv/a-B/h"),
+            ("%A%/h", "%A%/h"),
+        ] {
+            assert_eq!(
+                home(Some(raw), false, &vars),
+                Some(PathBuf::from(want)),
+                "{raw}"
+            );
+        }
+    }
+
+    /// As above, against CPython 3.14.8's `ntpath`, which also reads `%NAME%`,
+    /// takes `-` in a `$NAME`, escapes `%%` and `$$`, and expands nothing in quotes.
+    #[test]
+    fn hermes_home_expands_its_variables_as_windows_python_does() {
+        let vars = [
+            ("USERPROFILE", r"C:\Users\ada"),
+            ("A", r"D:\a"),
+            ("A-B", r"D:\ab"),
+        ];
+        for (raw, want) in [
+            (r"%A%\h", r"D:\a\h"),
+            (r"$A\h", r"D:\a\h"),
+            (r"${A}\h", r"D:\a\h"),
+            (r"%NOPE%\h", r"%NOPE%\h"),
+            (r"%NOPE\h", r"%NOPE\h"),
+            (r"100%%\h", r"100%\h"),
+            ("a$$b", "a$b"),
+            (r"'$A'\h", r"'$A'\h"),
+            (r"$A-B\h", r"D:\ab\h"),
+        ] {
+            assert_eq!(
+                home(Some(raw), true, &vars),
+                Some(PathBuf::from(want)),
+                "{raw}"
+            );
+        }
+    }
+
+    /// Only a leading `~` alone is the user's home; a `~user`, and a `~` with no
+    /// `HOME`, need the passwd database core never reads, so they stay as written.
+    #[test]
+    fn hermes_home_expands_a_leading_tilde_as_posix_python_does() {
+        let with =
+            |home_var: &str, raw: &str| home(Some(raw), false, &[("HOME", home_var), ("X", "~/a")]);
+        assert_eq!(with("/home/u", "~/h"), Some(PathBuf::from("/home/u/h")));
+        assert_eq!(with("/home/u/", "~"), Some(PathBuf::from("/home/u")));
+        assert_eq!(with("", "~"), Some(PathBuf::from("/")));
+        assert_eq!(with("", "~/h"), Some(PathBuf::from("/h")));
+        assert_eq!(
+            with("/home/u", "$X/h"),
+            Some(PathBuf::from("/home/u/a/h")),
+            "a variable's leading `~` expands too: expandvars runs first"
+        );
+        assert_eq!(with("/home/u", "/x/~/h"), Some(PathBuf::from("/x/~/h")));
+        assert_eq!(with("/home/u", "~ada/h"), Some(PathBuf::from("~ada/h")));
+        assert_eq!(home(Some("~/h"), false, &[]), Some(PathBuf::from("~/h")));
+    }
+
+    #[test]
+    fn hermes_home_expands_a_leading_tilde_as_windows_python_does() {
+        let profile = [("USERPROFILE", r"C:\Users\ada"), ("USERNAME", "ada")];
+        assert_eq!(
+            home(Some(r"~\h"), true, &profile),
+            Some(PathBuf::from(r"C:\Users\ada\h"))
+        );
+        assert_eq!(
+            home(Some("~/h"), true, &profile),
+            Some(PathBuf::from(r"C:\Users\ada/h"))
+        );
+        assert_eq!(
+            home(
+                Some(r"~\h"),
+                true,
+                &[("HOMEDRIVE", "C:"), ("HOMEPATH", r"\Users\ada")]
+            ),
+            Some(PathBuf::from(r"C:\Users\ada\h")),
+            "with no USERPROFILE, HOMEDRIVE + HOMEPATH"
+        );
+        assert_eq!(home(Some(r"~\h"), true, &[]), Some(PathBuf::from(r"~\h")));
+        for (raw, vars, want) in [
+            (r"~bob\h", &profile, r"C:\Users\bob\h"),
+            (r"~ada\h", &profile, r"C:\Users\ada\h"),
+            (
+                r"~bob\h",
+                &[("USERPROFILE", r"C:\ada"), ("USERNAME", "ada")],
+                r"C:\bob\h",
+            ),
+            (
+                r"~bob\h",
+                &[("USERPROFILE", r"\\srv\share\ada"), ("USERNAME", "ada")],
+                r"\\srv\share\bob\h",
+            ),
+            (
+                r"~bob\h",
+                &[("USERPROFILE", r"C:\Users\ada"), ("USERNAME", "zed")],
+                r"~bob\h",
+            ),
+        ] {
+            assert_eq!(
+                home(Some(raw), true, vars),
+                Some(PathBuf::from(want)),
+                "{raw} {vars:?}"
+            );
+        }
+    }
+
+    /// `<home>/.hermes`, suffixed literally by `HERMES_DATA_DIR_SUFFIX`, which an
+    /// explicit `HERMES_HOME` never takes.
+    #[test]
+    fn hermes_home_off_windows_is_dot_hermes_with_its_data_dir_suffix() {
+        let vars = [
+            ("HOME", "/home/u"),
+            ("HERMES_DATA_DIR_SUFFIX", "-channel-build-canary"),
+        ];
+        assert_eq!(
+            home(None, false, &vars),
+            Some(PathBuf::from("/home/u").join(".hermes-channel-build-canary"))
+        );
+        assert_eq!(
+            home(None, false, &[("HOME", "/home/u")]),
+            Some(PathBuf::from("/home/u").join(".hermes"))
+        );
+        assert_eq!(
+            home(Some("/custom/hm"), false, &vars),
+            Some(PathBuf::from("/custom/hm"))
+        );
+        assert_eq!(home(None, false, &[]), None);
     }
 
     /// `%LOCALAPPDATA%\hermes`, NOT `<home>/.hermes` — the generic answer wrote
     /// hooks into a config.yaml hermes never reads (#880).
     #[test]
-    fn hermes_home_on_windows_is_local_appdata_not_dot_hermes() {
-        let win = |env: Option<&str>, appdata: Option<&str>| {
-            resolve_hermes_home(
-                env.map(PathBuf::from),
-                appdata.map(PathBuf::from),
+    fn hermes_home_on_windows_is_local_appdata_with_its_data_dir_suffix() {
+        let local = [
+            ("LOCALAPPDATA", r" C:\Users\ada\AppData\Local "),
+            ("USERPROFILE", r"C:\Users\ada"),
+        ];
+        assert_eq!(
+            home(None, true, &local),
+            Some(PathBuf::from(r"C:\Users\ada\AppData\Local").join("hermes")),
+            "LOCALAPPDATA is stripped, as upstream strips it"
+        );
+        assert_eq!(
+            home(
+                None,
                 true,
-                Some(PathBuf::from(r"C:\Users\ada")),
-            )
-        };
-
-        assert_eq!(
-            win(None, Some(r"C:\Users\ada\AppData\Local")),
-            Some(PathBuf::from(r"C:\Users\ada\AppData\Local").join("hermes"))
-        );
-        let relative_default = Some(
-            PathBuf::from(r"C:\Users\ada")
-                .join("AppData")
-                .join("Local")
-                .join("hermes"),
-        );
-        assert_eq!(win(None, None), relative_default);
-        assert_eq!(
-            win(
-                Some(r"D:\profiles\work"),
-                Some(r"C:\Users\ada\AppData\Local")
+                &[
+                    ("USERPROFILE", r"C:\Users\ada"),
+                    ("HERMES_DATA_DIR_SUFFIX", "-magic")
+                ]
             ),
+            Some(
+                PathBuf::from(r"C:\Users\ada")
+                    .join("AppData")
+                    .join("Local")
+                    .join("hermes-magic")
+            )
+        );
+        assert_eq!(
+            home(Some(r"D:\profiles\work"), true, &local),
             Some(PathBuf::from(r"D:\profiles\work")),
             "HERMES_HOME still outranks the platform default"
         );
-        assert_eq!(resolve_hermes_home(None, None, true, None), None);
-    }
-
-    /// The arms MUST disagree — the assertion that would have caught the bug.
-    #[test]
-    fn the_windows_and_unix_defaults_diverge() {
-        let home = Some(PathBuf::from(r"C:\Users\ada"));
-        assert_ne!(
-            resolve_hermes_home(None, None, true, home.clone()),
-            resolve_hermes_home(None, None, false, home),
-        );
+        assert_eq!(home(None, true, &[]), None);
     }
 }

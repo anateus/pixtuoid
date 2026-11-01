@@ -3,15 +3,13 @@ import weatherData from './weather.json';
 import showcaseData from './showcase.json';
 import featuresData from './features.json';
 import { REPO_SLUG } from '../config/gh-stars.mjs';
+import { featureText } from '../config/feature-text.mjs';
 
 // Base is '/' today, but every internal URL still goes through asset()/BASE_URL
 // so a base change can never silently break links.
 export const REPO = `https://github.com/${REPO_SLUG}`;
 export const CRATES = 'https://crates.io/crates/pixtuoid';
 export const SPONSOR = 'https://buymeacoffee.com/IvanWng97';
-// The build authority is `site` in astro.config.mjs; this is only the shared
-// type-narrowing fallback for the `Astro.site` undefined arm.
-export const SITE_ORIGIN = 'https://pixtuoid.dev';
 
 const BASE = import.meta.env.BASE_URL;
 export const asset = (p: string): string => `${BASE.replace(/\/$/, '')}/${p.replace(/^\//, '')}`;
@@ -123,20 +121,18 @@ export interface ShowcaseChannel {
   label: string; // monitor label (channel number is derived from manifest order)
   kind: 'clip' | 'variant-set' | 'live';
   asset?: string; // clip: demos/<asset>.mp4 [+ .webm] + <asset>-poster.png
-  // clip: intrinsic dims (CLS); live: the canvas BUFFER dims — the vibing
+  // clip: intrinsic dims (CLS); live: the office's LAYOUT units — the vibing
   // "camera", where smaller = closer zoom. MUST match media.json's poster job
   // or the static poster and the live canvas reframe on the crossfade.
   w?: number;
   h?: number;
   variants?: ShowcaseVariant[];
-  retint?: boolean; // chips retint the page (themes only)
   variantGroups?: VariantGroup[]; // live channel only
   timeSlider?: boolean; // live channel: exposes a time-of-day scrub control
   poster?: string; // live channel: public/demos/-relative static fallback image
   // OPTIONAL: a channel whose caption would just restate its joined feature's
   // `desc` omits it and falls back to that desc (ChannelStage's `description`).
   caption?: string;
-  duration?: string; // clip badge, m:ss
   status: 'live' | 'soon'; // soon = dimmed placeholder monitor, no assets needed
   default?: boolean; // exactly one — the channel tuned at load
 }
@@ -157,8 +153,13 @@ export interface Feature {
   pix?: string;
   channel?: string; // joins to a SHOWCASE row's `id`
   card?: { blurb: string };
+  protocols?: string[];
 }
-export const FEATURES: Feature[] = featuresData as Feature[];
+export const FEATURES: Feature[] = (featuresData as Feature[]).map((f) => ({
+  ...f,
+  desc: featureText(f.desc, f),
+  card: f.card && { blurb: featureText(f.card.blurb, f) },
+}));
 
 const featureByChannelId = new Map(FEATURES.filter((f) => f.channel).map((f) => [f.channel!, f]));
 

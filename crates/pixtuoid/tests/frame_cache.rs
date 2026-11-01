@@ -45,12 +45,11 @@ fn make_slot(id: AgentId) -> AgentSlot {
         created_at: now,
         last_event_at: now,
         exiting_at: None,
-        pending_idle_at: None,
 
         desk_index: GlobalDeskIndex(0),
         floor_idx: 0,
         tool_call_count: 0,
-        active_ms: 0,
+        running_ms: 0,
         unknown_cwd: false,
         parent_id: None,
         pid: None,

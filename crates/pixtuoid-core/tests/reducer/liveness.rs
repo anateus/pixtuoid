@@ -7,8 +7,8 @@ use pixtuoid_core::state::SceneState;
 use pixtuoid_core::state::reducer::Reducer;
 
 use crate::{
-    DRAIN_INFERRED, HOOK_AND_TRANSCRIPT, act_end, act_start, delegating_pair, proof_of_life,
-    sess_end, waiting,
+    DRAIN_INFERRED, HOOK_AND_TRANSCRIPT, delegating_pair, proof_of_life, sess_end, tool_use_start,
+    turn_end, user_action_request,
 };
 
 #[test]
@@ -110,11 +110,11 @@ fn exit_gc_spares_a_slot_at_exactly_the_grace_window() {
 }
 
 #[test]
-fn stale_active_agent_uses_shorter_timeout_than_idle() {
-    use pixtuoid_core::state::reducer::{STALE_ACTIVE_TIMEOUT, STALE_IDLE_TIMEOUT};
+fn stale_running_agent_uses_shorter_timeout_than_idle() {
+    use pixtuoid_core::state::reducer::{STALE_IDLE_TIMEOUT, STALE_TOOL_TIMEOUT};
     assert!(
-        STALE_ACTIVE_TIMEOUT < STALE_IDLE_TIMEOUT,
-        "active timeout should be shorter than idle"
+        STALE_TOOL_TIMEOUT < STALE_IDLE_TIMEOUT,
+        "`STALE_TOOL_TIMEOUT` should be shorter than `STALE_IDLE_TIMEOUT`"
     );
 
     let mut scene = SceneState::uniform(4);
@@ -133,7 +133,7 @@ fn stale_active_agent_uses_shorter_timeout_than_idle() {
         t0,
         Transport::Hook,
     );
-    act_start(
+    tool_use_start(
         &mut reducer,
         &mut scene,
         id,
@@ -143,13 +143,10 @@ fn stale_active_agent_uses_shorter_timeout_than_idle() {
         Transport::Hook,
     );
 
-    reducer.tick(
-        &mut scene,
-        t0 + STALE_ACTIVE_TIMEOUT + Duration::from_secs(1),
-    );
+    reducer.tick(&mut scene, t0 + STALE_TOOL_TIMEOUT + Duration::from_secs(1));
     assert!(
         scene.agents.get(&id).unwrap().exiting_at.is_some(),
-        "active agent should be reaped after STALE_ACTIVE_TIMEOUT"
+        "running agent should be reaped after STALE_TOOL_TIMEOUT"
     );
 }
 
@@ -251,42 +248,8 @@ fn a_quit_opencode_idle_slot_is_swept_short_and_walks_back_in_on_its_next_turn()
 }
 
 #[test]
-fn proof_of_life_exempts_active_slot_from_stale_sweep() {
-    use pixtuoid_core::state::reducer::{PROOF_OF_LIFE_TTL, STALE_ACTIVE_TIMEOUT};
-    let mut scene = SceneState::uniform(4);
-    let mut r = Reducer::new();
-    let id = AgentId::from_transcript_path("/p/pol-active.jsonl");
-    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    r.apply(
-        &mut scene,
-        AgentEvent::SessionStart {
-            agent_id: id,
-            source: HOOK_AND_TRANSCRIPT.into(),
-            session_id: "s".into(),
-            cwd: PathBuf::from("/repo"),
-            parent_id: None,
-        },
-        t0,
-        Transport::Hook,
-    );
-    act_start(&mut r, &mut scene, id, Some("t"), None, t0, Transport::Hook);
-
-    let vouch_at = t0 + STALE_ACTIVE_TIMEOUT;
-    proof_of_life(&mut r, &mut scene, id, vouch_at, Transport::Jsonl);
-
-    let sweep_at = vouch_at + Duration::from_secs(1);
-    assert!(sweep_at.duration_since(vouch_at).unwrap() < PROOF_OF_LIFE_TTL);
-    r.tick(&mut scene, sweep_at);
-    let slot = scene.agents.get(&id).expect("vouched slot must survive");
-    assert!(
-        slot.exiting_at.is_none(),
-        "a probe-vouched slot must be exempt from the stale sweep"
-    );
-}
-
-#[test]
 fn proof_of_life_lapse_restores_normal_sweep() {
-    use pixtuoid_core::state::reducer::{PROOF_OF_LIFE_TTL, STALE_ACTIVE_TIMEOUT};
+    use pixtuoid_core::state::reducer::{PROOF_OF_LIFE_TTL, STALE_TOOL_TIMEOUT};
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_transcript_path("/p/pol-lapse.jsonl");
@@ -303,13 +266,13 @@ fn proof_of_life_lapse_restores_normal_sweep() {
         t0,
         Transport::Hook,
     );
-    act_start(&mut r, &mut scene, id, Some("t"), None, t0, Transport::Hook);
+    tool_use_start(&mut r, &mut scene, id, Some("t"), None, t0, Transport::Hook);
 
     // Last vouch lands mid-window; the process then exits, so emissions stop.
-    let vouch_at = t0 + STALE_ACTIVE_TIMEOUT - Duration::from_secs(100);
+    let vouch_at = t0 + STALE_TOOL_TIMEOUT - Duration::from_secs(100);
     proof_of_life(&mut r, &mut scene, id, vouch_at, Transport::Jsonl);
 
-    let exempt_at = t0 + STALE_ACTIVE_TIMEOUT + Duration::from_secs(1);
+    let exempt_at = t0 + STALE_TOOL_TIMEOUT + Duration::from_secs(1);
     r.tick(&mut scene, exempt_at);
     assert!(
         scene.agents.get(&id).unwrap().exiting_at.is_none(),
@@ -355,7 +318,7 @@ fn proof_of_life_does_not_touch_activity_state() {
         t0,
         Transport::Hook,
     );
-    act_start(
+    tool_use_start(
         &mut r,
         &mut scene,
         id,
@@ -364,8 +327,6 @@ fn proof_of_life_does_not_touch_activity_state() {
         t0,
         Transport::Hook,
     );
-    // Arms the idle debounce.
-    act_end(&mut r, &mut scene, id, Some("t1"), t0, Transport::Hook);
     let before = scene.agents.get(&id).unwrap().clone();
 
     proof_of_life(
@@ -383,10 +344,6 @@ fn proof_of_life_does_not_touch_activity_state() {
     assert_eq!(
         after.last_event_at, before.last_event_at,
         "ProofOfLife must not refresh last_event_at — it is not a real event"
-    );
-    assert_eq!(
-        after.pending_idle_at, before.pending_idle_at,
-        "ProofOfLife must not disturb the armed Active→Idle debounce"
     );
 }
 
@@ -471,8 +428,8 @@ fn codex_vouched_idle_slot_outlives_short_idle_reap() {
 }
 
 #[test]
-fn proof_of_life_on_delegating_parent_shields_its_active_subtree() {
-    use pixtuoid_core::state::reducer::{PROOF_OF_LIFE_TTL, STALE_ACTIVE_TIMEOUT};
+fn proof_of_life_on_delegating_parent_shields_its_running_subtree() {
+    use pixtuoid_core::state::reducer::{PROOF_OF_LIFE_TTL, STALE_TOOL_TIMEOUT};
     // The probe never vouches subagent ids — their transcript stems are
     // `agent-<id>`, not session UUIDs — so only the parent can be vouched.
     let mut scene = SceneState::uniform(8);
@@ -495,8 +452,8 @@ fn proof_of_life_on_delegating_parent_shields_its_active_subtree() {
         t0 + Duration::from_millis(150),
         Transport::Jsonl,
     );
-    // Dispatching a Task is what makes active_tasks[parent] non-empty.
-    act_start(
+    // Dispatching a Task is what makes tasks_in_flight[parent] non-empty.
+    tool_use_start(
         &mut r,
         &mut scene,
         parent,
@@ -505,7 +462,7 @@ fn proof_of_life_on_delegating_parent_shields_its_active_subtree() {
         t0 + Duration::from_secs(1),
         Transport::Hook,
     );
-    act_start(
+    tool_use_start(
         &mut r,
         &mut scene,
         child,
@@ -514,7 +471,7 @@ fn proof_of_life_on_delegating_parent_shields_its_active_subtree() {
         t0 + Duration::from_secs(2),
         Transport::Jsonl,
     );
-    act_start(
+    tool_use_start(
         &mut r,
         &mut scene,
         grandchild,
@@ -525,7 +482,7 @@ fn proof_of_life_on_delegating_parent_shields_its_active_subtree() {
     );
 
     // The probe re-vouches the PARENT only.
-    let vouch_at = t0 + STALE_ACTIVE_TIMEOUT + Duration::from_secs(60);
+    let vouch_at = t0 + STALE_TOOL_TIMEOUT + Duration::from_secs(60);
     proof_of_life(&mut r, &mut scene, parent, vouch_at, Transport::Jsonl);
 
     let sweep_at = vouch_at + Duration::from_secs(1);
@@ -537,7 +494,7 @@ fn proof_of_life_on_delegating_parent_shields_its_active_subtree() {
     );
     assert!(
         scene.agents.get(&child).unwrap().exiting_at.is_none(),
-        "a vouched delegating parent must shield its silent Active child"
+        "a vouched delegating parent must shield its silent Running child"
     );
     assert!(
         scene.agents.get(&grandchild).unwrap().exiting_at.is_none(),
@@ -547,12 +504,12 @@ fn proof_of_life_on_delegating_parent_shields_its_active_subtree() {
 
 #[test]
 fn vouch_lapse_restores_subtree_sweep() {
-    use pixtuoid_core::state::reducer::{PROOF_OF_LIFE_TTL, STALE_ACTIVE_TIMEOUT};
+    use pixtuoid_core::state::reducer::{PROOF_OF_LIFE_TTL, STALE_TOOL_TIMEOUT};
     let mut scene = SceneState::uniform(8);
     let mut r = Reducer::new();
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let (parent, child) = delegating_pair(&mut r, &mut scene, "pol-lapse-tree", t0);
-    act_start(
+    tool_use_start(
         &mut r,
         &mut scene,
         parent,
@@ -561,7 +518,7 @@ fn vouch_lapse_restores_subtree_sweep() {
         t0 + Duration::from_secs(1),
         Transport::Hook,
     );
-    act_start(
+    tool_use_start(
         &mut r,
         &mut scene,
         child,
@@ -572,7 +529,7 @@ fn vouch_lapse_restores_subtree_sweep() {
     );
 
     // Last vouch lands mid-window; the process then exits, so emissions stop.
-    let vouch_at = t0 + STALE_ACTIVE_TIMEOUT - Duration::from_secs(100);
+    let vouch_at = t0 + STALE_TOOL_TIMEOUT - Duration::from_secs(100);
     proof_of_life(&mut r, &mut scene, parent, vouch_at, Transport::Jsonl);
 
     let lapsed_at = vouch_at + PROOF_OF_LIFE_TTL + Duration::from_secs(1);
@@ -594,7 +551,7 @@ fn vouched_idle_parent_without_tasks_does_not_shield_idle_child() {
     let mut r = Reducer::new();
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let (parent, child) = delegating_pair(&mut r, &mut scene, "pol-backstop", t0);
-    // NO Task dispatch: active_tasks[parent] stays empty; both slots sit Idle.
+    // NO Task dispatch: tasks_in_flight[parent] stays empty; both slots sit Idle.
 
     let vouch_at = t0 + STALE_IDLE_TIMEOUT + Duration::from_secs(60);
     proof_of_life(&mut r, &mut scene, parent, vouch_at, Transport::Jsonl);
@@ -633,7 +590,7 @@ fn fresh_event_resets_stale_timer() {
     );
 
     let almost = t0 + STALE_IDLE_TIMEOUT - Duration::from_secs(60);
-    waiting(
+    user_action_request(
         &mut reducer,
         &mut scene,
         id,
@@ -735,58 +692,6 @@ fn parented_empty_cwd_subagent_is_not_ghost_reaped() {
             .get(&child)
             .is_some_and(|s| s.exiting_at.is_none()),
         "a parented empty-cwd subagent must not be reaped on the 3-min ghost timer"
-    );
-}
-
-#[test]
-fn session_end_cascades_to_children() {
-    let mut scene = SceneState::uniform(8);
-    let mut r = Reducer::new();
-    let parent = AgentId::from_transcript_path("/p/parent.jsonl");
-    let child = AgentId::from_parts("claude-code", "/p/parent/subagents/agent-1.jsonl");
-    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-
-    r.apply(
-        &mut scene,
-        AgentEvent::SessionStart {
-            agent_id: parent,
-            source: "claude-code".into(),
-            session_id: "parent".into(),
-            cwd: PathBuf::from("/repo"),
-            parent_id: None,
-        },
-        t0,
-        Transport::Hook,
-    );
-    r.apply(
-        &mut scene,
-        AgentEvent::SessionStart {
-            agent_id: child,
-            source: "claude-code".into(),
-            session_id: "child".into(),
-            cwd: PathBuf::from("/repo"),
-            parent_id: Some(parent),
-        },
-        t0 + Duration::from_millis(100),
-        Transport::Hook,
-    );
-    assert!(scene.agents.get(&child).unwrap().exiting_at.is_none());
-
-    sess_end(
-        &mut r,
-        &mut scene,
-        parent,
-        false,
-        t0 + Duration::from_secs(10),
-        Transport::Hook,
-    );
-    assert!(
-        scene.agents.get(&parent).unwrap().exiting_at.is_some(),
-        "parent should be exiting"
-    );
-    assert!(
-        scene.agents.get(&child).unwrap().exiting_at.is_some(),
-        "child should cascade to exiting when parent ends"
     );
 }
 
@@ -923,95 +828,6 @@ fn session_end_cascade_marks_all_descendants_exiting() {
 }
 
 #[test]
-fn sweep_stale_marks_old_agent_exiting_on_tick() {
-    use pixtuoid_core::state::reducer::STALE_IDLE_TIMEOUT;
-    let mut scene = SceneState::uniform(4);
-    let mut r = Reducer::new();
-    let id = AgentId::from_transcript_path("/p/stale-sweep.jsonl");
-    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
-
-    r.apply(
-        &mut scene,
-        AgentEvent::SessionStart {
-            agent_id: id,
-            source: "claude-code".into(),
-            session_id: "sw".into(),
-            cwd: PathBuf::from("/old-project"),
-            parent_id: None,
-        },
-        t0,
-        Transport::Hook,
-    );
-    assert!(scene.agents.get(&id).unwrap().exiting_at.is_none());
-
-    r.tick(
-        &mut scene,
-        t0 + STALE_IDLE_TIMEOUT + Duration::from_secs(60),
-    );
-    assert!(
-        scene.agents.get(&id).unwrap().exiting_at.is_some(),
-        "tick past STALE_IDLE_TIMEOUT should mark agent exiting"
-    );
-}
-
-#[test]
-fn stale_sweep_cascades_to_children() {
-    use pixtuoid_core::state::reducer::STALE_IDLE_TIMEOUT;
-    let mut scene = SceneState::uniform(8);
-    let mut r = Reducer::new();
-    let parent = AgentId::from_transcript_path("/p/stale-cascade.jsonl");
-    let child = AgentId::from_parts("claude-code", "/p/stale-cascade/subagents/agent-1.jsonl");
-    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-
-    r.apply(
-        &mut scene,
-        AgentEvent::SessionStart {
-            agent_id: parent,
-            source: "claude-code".into(),
-            session_id: "parent".into(),
-            cwd: PathBuf::from("/repo"),
-            parent_id: None,
-        },
-        t0,
-        Transport::Hook,
-    );
-    r.apply(
-        &mut scene,
-        AgentEvent::SessionStart {
-            agent_id: child,
-            source: "claude-code".into(),
-            session_id: "child".into(),
-            cwd: PathBuf::from("/repo"),
-            parent_id: Some(parent),
-        },
-        t0 + Duration::from_millis(100),
-        Transport::Hook,
-    );
-    // Heartbeat the child so it is NOT independently stale: its exit can then
-    // only have come from the cascade.
-    r.apply(
-        &mut scene,
-        AgentEvent::Rename {
-            agent_id: child,
-            label: "cc·sub".into(),
-        },
-        t0 + Duration::from_secs(25 * 60),
-        Transport::Jsonl,
-    );
-
-    r.tick(&mut scene, t0 + STALE_IDLE_TIMEOUT + Duration::from_secs(1));
-
-    assert!(
-        scene.agents.get(&parent).unwrap().exiting_at.is_some(),
-        "stale parent should be marked exiting"
-    );
-    assert!(
-        scene.agents.get(&child).unwrap().exiting_at.is_some(),
-        "child should cascade-exit with a stale-swept parent (it is not independently stale)"
-    );
-}
-
-#[test]
 fn stale_sweep_already_cascaded_child_is_skipped_in_pass_two() {
     use pixtuoid_core::state::reducer::STALE_IDLE_TIMEOUT;
     let mut scene = SceneState::uniform(8);
@@ -1045,7 +861,7 @@ fn stale_sweep_already_cascaded_child_is_skipped_in_pass_two() {
         Transport::Hook,
     );
 
-    // No heartbeat for either — unlike the cascade tests above, that puts BOTH
+    // No heartbeat for either — unlike stale_sweep_cascades_to_grandchildren, that puts BOTH
     // in the pass-1 `stale` vec, so one of them must hit the write-once skip.
     let now = t0 + STALE_IDLE_TIMEOUT + Duration::from_secs(1);
     r.tick(&mut scene, now);
@@ -1202,7 +1018,7 @@ fn stale_sweep_cascade_skips_unrelated_fresh_agents() {
 
 #[test]
 fn long_delegation_keeps_parent_and_live_subagent_alive() {
-    use pixtuoid_core::state::reducer::STALE_ACTIVE_TIMEOUT;
+    use pixtuoid_core::state::reducer::STALE_TOOL_TIMEOUT;
     let mut scene = SceneState::uniform(8);
     let mut r = Reducer::new();
     let parent = AgentId::from_transcript_path("/p/deleg.jsonl");
@@ -1236,7 +1052,7 @@ fn long_delegation_keeps_parent_and_live_subagent_alive() {
 
     // The Task-start arm does NOT bump last_event_at: the parent's liveness
     // stays frozen at t0.
-    act_start(
+    tool_use_start(
         &mut r,
         &mut scene,
         parent,
@@ -1248,7 +1064,7 @@ fn long_delegation_keeps_parent_and_live_subagent_alive() {
 
     // The subagent's own tool calls refresh its parent's lineage.
     for (mins, tuid) in [(5u64, "sub-R1"), (9u64, "sub-R2")] {
-        act_start(
+        tool_use_start(
             &mut r,
             &mut scene,
             child,
@@ -1259,10 +1075,7 @@ fn long_delegation_keeps_parent_and_live_subagent_alive() {
         );
     }
 
-    r.tick(
-        &mut scene,
-        t0 + STALE_ACTIVE_TIMEOUT + Duration::from_secs(1),
-    );
+    r.tick(&mut scene, t0 + STALE_TOOL_TIMEOUT + Duration::from_secs(1));
 
     assert!(
         scene.agents.get(&parent).unwrap().exiting_at.is_none(),
@@ -1275,8 +1088,19 @@ fn long_delegation_keeps_parent_and_live_subagent_alive() {
 }
 
 #[test]
-fn stale_sweep_spares_subagent_blocked_under_a_waiting_parent() {
-    use pixtuoid_core::state::reducer::STALE_ACTIVE_TIMEOUT;
+fn a_childs_turn_end_refreshes_its_parents_lineage() {
+    let mut scene = SceneState::uniform(8);
+    let mut r = Reducer::new();
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let (parent, child) = delegating_pair(&mut r, &mut scene, "lineage-turn-end", t0);
+    let end = t0 + Duration::from_secs(60);
+    turn_end(&mut r, &mut scene, child, end, Transport::Hook);
+    assert_eq!(scene.agents[&parent].last_event_at, end);
+}
+
+#[test]
+fn stale_sweep_spares_subagent_blocked_under_a_requires_action_parent() {
+    use pixtuoid_core::state::reducer::STALE_TOOL_TIMEOUT;
     let mut scene = SceneState::uniform(8);
     let mut r = Reducer::new();
     let parent = AgentId::from_transcript_path("/p/perm-parent.jsonl");
@@ -1307,7 +1131,7 @@ fn stale_sweep_spares_subagent_blocked_under_a_waiting_parent() {
         t0 + Duration::from_millis(100),
         Transport::Hook,
     );
-    act_start(
+    tool_use_start(
         &mut r,
         &mut scene,
         child,
@@ -1318,7 +1142,7 @@ fn stale_sweep_spares_subagent_blocked_under_a_waiting_parent() {
     );
     // The child's tool needs permission, but CC's Notification hook lands on
     // the PARENT.
-    waiting(
+    user_action_request(
         &mut r,
         &mut scene,
         parent,
@@ -1329,22 +1153,22 @@ fn stale_sweep_spares_subagent_blocked_under_a_waiting_parent() {
 
     r.tick(
         &mut scene,
-        t0 + STALE_ACTIVE_TIMEOUT + Duration::from_secs(60),
+        t0 + STALE_TOOL_TIMEOUT + Duration::from_secs(60),
     );
 
     assert!(
         scene.agents.get(&parent).unwrap().exiting_at.is_none(),
-        "Waiting parent (60-min threshold) must survive a 10-min wait"
+        "RequiresAction parent (60-min threshold) must survive a 10-min wait"
     );
     assert!(
         scene.agents.get(&child).unwrap().exiting_at.is_none(),
-        "a subagent blocked under a Waiting parent must NOT be reaped on the Active timer"
+        "a subagent blocked under a RequiresAction parent must NOT be reaped on the tool timeout"
     );
 }
 
 #[test]
-fn stale_sweep_spares_grandchild_under_a_waiting_ancestor() {
-    use pixtuoid_core::state::reducer::STALE_ACTIVE_TIMEOUT;
+fn stale_sweep_spares_grandchild_under_a_requires_action_ancestor() {
+    use pixtuoid_core::state::reducer::STALE_TOOL_TIMEOUT;
     let mut scene = SceneState::uniform(8);
     let mut r = Reducer::new();
     let gp = AgentId::from_transcript_path("/p/perm-gp.jsonl");
@@ -1389,7 +1213,7 @@ fn stale_sweep_spares_grandchild_under_a_waiting_ancestor() {
         Transport::Hook,
     );
     for id in [parent, child] {
-        act_start(
+        tool_use_start(
             &mut r,
             &mut scene,
             id,
@@ -1399,7 +1223,7 @@ fn stale_sweep_spares_grandchild_under_a_waiting_ancestor() {
             Transport::Hook,
         );
     }
-    waiting(
+    user_action_request(
         &mut r,
         &mut scene,
         gp,
@@ -1410,27 +1234,27 @@ fn stale_sweep_spares_grandchild_under_a_waiting_ancestor() {
 
     r.tick(
         &mut scene,
-        t0 + STALE_ACTIVE_TIMEOUT + Duration::from_secs(60),
+        t0 + STALE_TOOL_TIMEOUT + Duration::from_secs(60),
     );
 
     assert!(
         scene.agents.get(&child).unwrap().exiting_at.is_none(),
-        "a grandchild under a Waiting ancestor must NOT be reaped on the Active timer"
+        "a grandchild under a RequiresAction ancestor must NOT be reaped on the tool timeout"
     );
     assert!(
         scene.agents.get(&parent).unwrap().exiting_at.is_none(),
-        "the middle agent under a Waiting ancestor must NOT be reaped either"
+        "the middle agent under a RequiresAction ancestor must NOT be reaped either"
     );
 }
 
 #[test]
-fn active_subagent_keeps_parent_alive_via_jsonl_events() {
+fn running_subagent_keeps_parent_alive_via_jsonl_events() {
     let mut scene = SceneState::uniform(8);
     let mut r = Reducer::new();
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let (parent, child) = delegating_pair(&mut r, &mut scene, "deleg2", t0);
     // The parent's OWN last event is frozen at t0+1s from here on.
-    act_start(
+    tool_use_start(
         &mut r,
         &mut scene,
         parent,
@@ -1441,7 +1265,7 @@ fn active_subagent_keeps_parent_alive_via_jsonl_events() {
     );
     // The subagent emits ONLY JSONL — no hook event reaches the parent.
     for mins in [4u64, 8, 12] {
-        act_start(
+        tool_use_start(
             &mut r,
             &mut scene,
             child,
@@ -1468,9 +1292,9 @@ fn active_subagent_keeps_parent_alive_via_jsonl_events() {
 }
 
 #[test]
-fn reasonix_delegating_slot_survives_the_active_timeout() {
+fn reasonix_delegating_slot_survives_the_tool_timeout() {
     use pixtuoid_core::source::ToolDetail;
-    use pixtuoid_core::state::reducer::{STALE_ACTIVE_TIMEOUT, STALE_WAITING_TIMEOUT};
+    use pixtuoid_core::state::reducer::{STALE_BLOCKED_TIMEOUT, STALE_TOOL_TIMEOUT};
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let id = AgentId::from_parts("reasonix", "/Users/dev/proj");
@@ -1491,7 +1315,7 @@ fn reasonix_delegating_slot_survives_the_active_timeout() {
     // Reasonix hooks carry no tool id.
     r.apply(
         &mut scene,
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id: id,
             tool_use_id: None,
             detail: Some(ToolDetail::Task),
@@ -1502,18 +1326,18 @@ fn reasonix_delegating_slot_survives_the_active_timeout() {
 
     r.tick(
         &mut scene,
-        t0 + STALE_ACTIVE_TIMEOUT + Duration::from_secs(60),
+        t0 + STALE_TOOL_TIMEOUT + Duration::from_secs(60),
     );
     assert!(
         scene
             .agents
             .get(&id)
             .is_some_and(|s| s.exiting_at.is_none()),
-        "a hook-silent Delegating rx slot must not be swept on the 10-min Active timer"
+        "a hook-silent Delegating rx slot must not be swept on the 10-min tool timeout"
     );
     r.tick(
         &mut scene,
-        t0 + STALE_WAITING_TIMEOUT + Duration::from_secs(60),
+        t0 + STALE_BLOCKED_TIMEOUT + Duration::from_secs(60),
     );
     assert!(
         scene.agents.get(&id).is_none_or(|s| s.exiting_at.is_some()),
@@ -1523,8 +1347,8 @@ fn reasonix_delegating_slot_survives_the_active_timeout() {
 
 // Crafted input: two SessionStarts each naming the other as parent.
 #[test]
-fn waiting_parent_cycle_is_still_reaped_by_the_stale_sweep() {
-    use pixtuoid_core::state::reducer::STALE_WAITING_TIMEOUT;
+fn requires_action_parent_cycle_is_still_reaped_by_the_stale_sweep() {
+    use pixtuoid_core::state::reducer::STALE_BLOCKED_TIMEOUT;
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -1554,28 +1378,28 @@ fn waiting_parent_cycle_is_still_reaped_by_the_stale_sweep() {
         t0,
         Transport::Hook,
     );
-    waiting(&mut r, &mut scene, b, "permission", t0, Transport::Hook);
+    user_action_request(&mut r, &mut scene, b, "permission", t0, Transport::Hook);
 
     r.tick(
         &mut scene,
-        t0 + STALE_WAITING_TIMEOUT + Duration::from_secs(60),
+        t0 + STALE_BLOCKED_TIMEOUT + Duration::from_secs(60),
     );
     for id in [a, b] {
         assert!(
             scene.agents.get(&id).is_none_or(|s| s.exiting_at.is_some()),
-            "a Waiting parent-cycle member must not self-exempt from the stale sweep"
+            "a RequiresAction parent-cycle member must not self-exempt from the stale sweep"
         );
     }
 }
 
-// A 2-cycle whose members are BOTH Waiting would mutually exempt — each has
-// the OTHER as a genuine Waiting ancestor, so `has_waiting_ancestor` skips
+// A 2-cycle whose members are BOTH RequiresAction would mutually exempt — each has
+// the OTHER as a genuine RequiresAction ancestor, so `has_requires_action_ancestor` skips
 // both every sweep tick (#238). The fix is upstream of the sweep: the
 // SessionStart arm refuses a cycle-closing parent link, so the sweep itself
 // needs no cycle awareness.
 #[test]
-fn mutual_waiting_parent_cycle_is_refused_at_the_link_seam_and_reaped() {
-    use pixtuoid_core::state::reducer::STALE_WAITING_TIMEOUT;
+fn mutual_requires_action_parent_cycle_is_refused_at_the_link_seam_and_reaped() {
+    use pixtuoid_core::state::reducer::STALE_BLOCKED_TIMEOUT;
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -1625,17 +1449,17 @@ fn mutual_waiting_parent_cycle_is_refused_at_the_link_seam_and_reaped() {
         "a cycle-closing enrichment must degrade to parentless"
     );
     for id in [a, b] {
-        waiting(&mut r, &mut scene, id, "permission", t0, Transport::Hook);
+        user_action_request(&mut r, &mut scene, id, "permission", t0, Transport::Hook);
     }
 
     r.tick(
         &mut scene,
-        t0 + STALE_WAITING_TIMEOUT + Duration::from_secs(60),
+        t0 + STALE_BLOCKED_TIMEOUT + Duration::from_secs(60),
     );
     for id in [a, b] {
         assert!(
             scene.agents.get(&id).is_none_or(|s| s.exiting_at.is_some()),
-            "a mutual-Waiting pair must not exempt each other from the stale sweep"
+            "a mutual-RequiresAction pair must not exempt each other from the stale sweep"
         );
     }
 }

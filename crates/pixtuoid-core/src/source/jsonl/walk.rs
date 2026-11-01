@@ -32,7 +32,7 @@ pub(super) fn id_path(path: &Path) -> std::path::PathBuf {
 /// First-sight decision, shared by EVERY path that can be the first to see a
 /// file: seed the cursor at EOF — suppressing SessionStart — when the session
 /// is historical (mtime outside `window`) OR already ended. Unifying the gate
-/// here is the #85 fix: the post-startup rescan used to bypass it and
+/// here is the #85 fix: a later scan used to bypass it and
 /// resurrect an ended/stale session as a phantom live sprite.
 ///
 /// `probe_live` (the liveness vouch) exempts only the RECENCY half — a
@@ -91,6 +91,12 @@ pub(super) async fn scan_root(
     ctx: &WatchCtx<'_>,
     root_health: &mut FailureLatch,
 ) {
+    // A scan admits every transcript in the initial window, and a followed one
+    // costs an fd; its pass's reconcile follows only what a live writer holds.
+    let ctx = &WatchCtx {
+        follower: None,
+        ..*ctx
+    };
     revouch_gated_files(decoders, ctx).await;
     match tokio::fs::read_dir(root).await {
         Ok(mut read) => {
@@ -141,6 +147,7 @@ pub(super) async fn walk_jsonl(path: &Path, decoders: SourceDecoders, ctx: &Watc
         tx,
         window,
         live: _,
+        follower,
     } = *ctx;
     let SourceDecoders {
         decode_line,
@@ -217,10 +224,19 @@ pub(super) async fn walk_jsonl(path: &Path, decoders: SourceDecoders, ctx: &Watc
         cursors.lock().await.insert(path.to_path_buf(), file_len);
         return;
     }
+    // A first sight may be a transcript its writer holds open, whose later
+    // writes FSEvents reports only at close: codex's first line among them,
+    // written after it runs `git`. Re-measured once followed, so a write that
+    // landed before the knote is this walk's to read.
+    let file_len = match follower {
+        Some(follower) if !known && follower.follow(path) => tokio::fs::symlink_metadata(path)
+            .await
+            .map_or(file_len, |meta| meta.len()),
+        _ => file_len,
+    };
     // Reset-to-0 is the LIVE-session resync. Exit-path drains must NOT take it —
-    // they pre-park at the new EOF, or the un-claim behind the drain turns this
-    // into a ghost replay (`park_if_truncated_below_cursor`).
-    if cursor_now > file_len {
+    // they pre-park at the new EOF (`park_if_truncated_below_cursor`).
+    let cursor_now = if cursor_now > file_len {
         warn!(
             path = ?path,
             file_len,
@@ -228,8 +244,10 @@ pub(super) async fn walk_jsonl(path: &Path, decoders: SourceDecoders, ctx: &Watc
             "file truncated below cursor, resetting cursor"
         );
         cursors.lock().await.insert(path.to_path_buf(), 0);
-        return;
-    }
+        0
+    } else {
+        cursor_now
+    };
     if cursor_now == file_len {
         return;
     }
@@ -277,10 +295,10 @@ pub(super) async fn walk_jsonl(path: &Path, decoders: SourceDecoders, ctx: &Watc
             tail.as_deref().map(decoders.activity_recency),
             Some(super::TailActivity::SidecarOnly)
         );
-        // Judged on the window `scan_pending_tasks` reads, wide enough to hold a
-        // tool result's whole line.
+        // Judged on the window `rescan_skipped_tail` reads, wide enough to hold
+        // a tool result's whole line.
         let revives = sight != Some(Sight::Ended)
-            || read_tail(path, TASK_SCAN_BYTES)
+            || read_tail(path, SKIP_RESCAN_BYTES)
                 .await
                 .is_some_and(|t| tail_shows_activity(&t, path, source, decoders.decode_line));
         if sight != Some(Sight::Claimed) && !metadata_only && revives {
@@ -297,10 +315,11 @@ pub(super) async fn walk_jsonl(path: &Path, decoders: SourceDecoders, ctx: &Watc
             };
             emit_first_sight(path, source, decoders, seen, tx, head).await;
         }
-        // #222: the skipped span may bury an IN-FLIGHT Task dispatch. Only when
-        // registered — JSONL events for an unknown id are reducer no-ops.
+        // #222: the skipped span may bury an IN-FLIGHT Task dispatch, or its
+        // turn's end. Only when registered — JSONL events for an unknown id are
+        // reducer no-ops.
         if seen.lock().await.get(path) == Some(&Sight::Claimed) {
-            scan_pending_tasks(path, decoders, ctx).await;
+            rescan_skipped_tail(path, decoders, ctx).await;
         }
         return;
     }
@@ -322,20 +341,16 @@ pub(super) async fn walk_jsonl(path: &Path, decoders: SourceDecoders, ctx: &Watc
         return;
     }
 
-    let safe_end_relative = match new_chunk.iter().rposition(|&b| b == b'\n') {
-        Some(i) => i + 1,
-        None => 0,
-    };
-    if safe_end_relative == 0 {
+    let new_bytes = crate::source::admit::whole(&new_chunk);
+    if new_bytes.is_empty() {
         return;
     }
-    let new_cursor = cursor_now + safe_end_relative as u64;
+    let new_cursor = cursor_now + new_bytes.len() as u64;
     {
         let mut cursors_g = cursors.lock().await;
         cursors_g.insert(path.to_path_buf(), new_cursor);
     }
 
-    let new_bytes = &new_chunk[..safe_end_relative];
     // Normalized like `id_derive` above, or on Windows the hook key and the
     // per-line key disagree and every JSONL event lands on a phantom id.
     let transcript_path_str = crate::id::normalize_path_key(&path.to_string_lossy());
@@ -359,16 +374,10 @@ pub(super) async fn walk_jsonl(path: &Path, decoders: SourceDecoders, ctx: &Watc
         matches!(ev, AgentEvent::SessionEnd { .. }) && ev.agent_id() == path_agent_id
     };
     let mut decoded = Vec::new();
-    for line in new_bytes.split(|b| *b == b'\n') {
-        if line.is_empty() {
+    for line in crate::source::admit::lines(new_bytes) {
+        let Ok(s) = line else {
+            warn!(path = ?path, "non-utf8 line skipped");
             continue;
-        }
-        let s = match std::str::from_utf8(line) {
-            Ok(s) => s,
-            Err(_) => {
-                warn!(path = ?path, "non-utf8 line skipped");
-                continue;
-            }
         };
         let v: serde_json::Value = match serde_json::from_str(s) {
             Ok(v) => v,
@@ -377,10 +386,7 @@ pub(super) async fn walk_jsonl(path: &Path, decoders: SourceDecoders, ctx: &Watc
                 continue;
             }
         };
-        match decode_line(&transcript_path_str, source, v) {
-            Ok(events) => decoded.extend(events),
-            Err(e) => warn!(path = ?path, error = %e, "decode error"),
-        }
+        decoded.extend(decode_line(&transcript_path_str, source, v));
     }
 
     // A trailer flushed after the end line (grok's `hook_execution{stop}`)
@@ -416,22 +422,19 @@ fn tail_shows_activity(
     decode_line: LineDecoder,
 ) -> bool {
     let transcript = crate::id::normalize_path_key(&path.to_string_lossy());
-    // The window starts mid-file, so its first chunk is a partial line.
-    tail.split(|b| *b == b'\n')
-        .skip(1)
-        .filter_map(|line| std::str::from_utf8(line).ok())
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .filter_map(|v| decode_line(&transcript, source, v).ok())
-        .flatten()
+    crate::source::admit::window_lines(tail)
+        .filter_map(|line| serde_json::from_str(line.ok()?).ok())
+        .flat_map(|v| decode_line(&transcript, source, v))
         .any(|ev| ev.shows_activity())
 }
 
 /// Pre-drain guard for the exit-path drains: a transcript truncated/recreated
 /// BELOW its cursor at the moment a drain runs would hit `walk_jsonl`'s
-/// truncation arm — cursor reset to 0, return WITHOUT draining — so the next
-/// pass replays the whole file as a first-sight and re-registers the just-ended
-/// session as a ghost. Park the cursor at the new EOF instead; only genuinely
-/// NEW bytes (len > cursor) re-register. The reset-to-0 replay stays the right
+/// truncation arm, which re-reads it from 0 inside the drain — re-sending the
+/// rewrite's stale events around the end — and stops at its last whole line,
+/// leaving an unterminated tail for the walk after the un-claim to judge as
+/// new: a ghost revival. Park the cursor at the new EOF instead; only genuinely
+/// NEW bytes (len > cursor) re-register. The reset-to-0 re-read stays the right
 /// call on the NORMAL walk path, where a live session's truncate-rewrite
 /// resyncs from the top.
 pub(super) async fn park_if_truncated_below_cursor(path: &Path, ctx: &WatchCtx<'_>) {
@@ -540,53 +543,39 @@ pub(super) async fn check_session_ended(path: &Path, checker: SessionEndChecker)
     }
 }
 
-/// How far back from EOF the oversized-skip Task scan looks.
-pub(super) const TASK_SCAN_BYTES: u64 = 256 * 1024;
+/// How far back from EOF an oversized skip is rescanned for what it buried.
+pub(super) const SKIP_RESCAN_BYTES: u64 = 256 * 1024;
 
-/// #222: tail-scan an oversized skipped span for IN-FLIGHT Task dispatches and
-/// re-emit exactly their `ActivityStart`s. Mid-attach to a delegating session
-/// whose backlog exceeds `MAX_PENDING_BYTES` never decodes the in-flight
-/// dispatch line, leaving the reducer's `active_tasks` empty: the parent never
-/// shows Delegating and the b1 completion cascade never arms.
+/// Tail-scan an oversized skipped span and re-emit what the skip buried: its
+/// IN-FLIGHT Task dispatches' `ToolUseStart`s (#222), and its last turn
+/// bracket, a start or a keyed end. Mid-attach to a delegating session whose
+/// backlog exceeds `MAX_PENDING_BYTES` never decodes the in-flight dispatch
+/// line, leaving the reducer's `tasks_in_flight` empty: the parent never shows
+/// Delegating and the b1 completion cascade never arms. A re-emitted start
+/// shows the turn the session is in; a re-emitted end closes, through the turn
+/// ledger's in-order rule, whatever turn the skip buried the end of.
 ///
 /// Tail-window geometry guarantees no false leak: a completion is always LATER
 /// in the file than its start, so any windowed start's completion is also in
-/// the window. A dispatch buried deeper than `TASK_SCAN_BYTES` keeps the
+/// the window. A dispatch buried deeper than [`SKIP_RESCAN_BYTES`] keeps the
 /// pre-#222 skip behavior — bounded, documented residual.
 ///
-/// Everything `decode_line` emits EXCEPT the unmatched Task starts is
-/// DISCARDED: this is a Task-seeding scan, not a replay — replaying 256 KiB of
-/// activity would animate a burst of stale tools.
-async fn scan_pending_tasks(path: &Path, decoders: SourceDecoders, ctx: &WatchCtx<'_>) {
-    let Some(buf) = read_tail(path, TASK_SCAN_BYTES).await else {
+/// Everything else `decode_line` emits is DISCARDED: this is a seeding scan,
+/// not a replay — replaying the window's activity would animate a burst of
+/// stale tools.
+async fn rescan_skipped_tail(path: &Path, decoders: SourceDecoders, ctx: &WatchCtx<'_>) {
+    let Some(buf) = read_tail(path, SKIP_RESCAN_BYTES).await else {
         return;
     };
     let transcript_path_str = crate::id::normalize_path_key(&path.to_string_lossy());
-    let mut lines = buf.split(|b| *b == b'\n');
-    // The window always starts mid-file, so its first chunk is a partial line —
-    // skip it rather than decode a fragment that may parse as JSON by accident.
-    let _ = lines.next();
     let mut pending: Vec<(String, AgentEvent)> = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(s) = std::str::from_utf8(line) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
-            continue;
-        };
-        let events = match (decoders.decode_line)(&transcript_path_str, ctx.source, v) {
-            Ok(events) => events,
-            Err(e) => {
-                debug!(path = ?path, error = %e, "task-scan decode error");
-                continue;
-            }
-        };
-        for ev in events {
+    let mut last_bracket = None;
+    let parsed = crate::source::admit::window_lines(&buf)
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.ok()?).ok());
+    for v in parsed {
+        for ev in (decoders.decode_line)(&transcript_path_str, ctx.source, v) {
             match &ev {
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     tool_use_id: Some(tuid),
                     detail: Some(d),
                     ..
@@ -595,22 +584,27 @@ async fn scan_pending_tasks(path: &Path, decoders: SourceDecoders, ctx: &WatchCt
                         pending.push((tuid.clone(), ev));
                     }
                 }
-                AgentEvent::ActivityEnd {
+                AgentEvent::ToolUseEnd {
                     tool_use_id: Some(tuid),
                     ..
                 } => {
                     pending.retain(|(t, _)| t != tuid);
                 }
+                AgentEvent::TurnStart { .. } | AgentEvent::TurnEnd { turn: Some(_), .. } => {
+                    last_bracket = Some(ev);
+                }
                 _ => {}
             }
         }
     }
-    for (tuid, ev) in pending {
-        debug!(
-            ?tuid,
-            path = ?path,
-            "re-emitting in-flight Task dispatch from the oversized tail"
-        );
+    // A start precedes the dispatches of its turn, and an end follows them.
+    let (start, end) = match last_bracket {
+        Some(start @ AgentEvent::TurnStart { .. }) => (Some(start), None),
+        end => (None, end),
+    };
+    let rest = pending.into_iter().map(|(_, ev)| ev).chain(end);
+    for ev in start.into_iter().chain(rest) {
+        debug!(path = ?path, event = ?ev, "re-emitting from the oversized tail");
         if ctx.tx.send((Transport::Jsonl, ev)).await.is_err() {
             return;
         }
@@ -634,19 +628,11 @@ pub(super) fn detect_parent_id(path: &Path, source: &str) -> Option<AgentId> {
 }
 
 /// Walk a byte span's JSONL lines, handing each parsed line to `visit` until it
-/// returns `true`. Malformed/non-UTF-8 lines are skipped — a transcript head can
-/// straddle a partial write.
+/// returns `true`. A line that does not parse is skipped.
 fn scan_jsonl(bytes: &[u8], mut visit: impl FnMut(&serde_json::Value) -> bool) {
-    for line in bytes.split(|b| *b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(s) = std::str::from_utf8(line) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
-            continue;
-        };
+    let parsed = crate::source::admit::lines(bytes)
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.ok()?).ok());
+    for v in parsed {
         if visit(&v) {
             return;
         }

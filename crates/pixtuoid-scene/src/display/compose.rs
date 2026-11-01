@@ -15,7 +15,7 @@ use crate::display::pen::{ArtPx, ArtRect, Pen};
 use crate::display::text::{Align, LABEL_GAP, TextRun};
 use crate::glass_weather::GlassWeather;
 use crate::layout::{
-    Bounds, DESK_H, Depth, Fixture, FixtureKind, Point, SceneLayout, Station, Tie,
+    Bounds, DESK_H, Depth, Fixture, FixtureKind, Point, SceneLayout, StationArt, Tie,
 };
 use crate::pack::NORTH_SOFA_SEAT_ROWS;
 use crate::render_scale::RenderScale;
@@ -343,29 +343,13 @@ fn lights(
     let pen = Pen::for_pack(scale, pack);
     // Each desk's lamp shines from the bulb its art draws, which the cutaway's
     // art stands on the side the desk faces; the model's is the classic's.
-    let lamps: Vec<crate::lighting::Emitter> = lights
-        .desks
+    let lamps: Vec<crate::lighting::Emitter> = layout
+        .home_desks
         .iter()
-        .enumerate()
-        .map(|(i, d)| {
-            let facing = layout.desk_facing(pixtuoid_core::state::FloorLocalDeskIndex(i));
-            let bulb = layout
-                .home_desks
-                .get(i)
-                .map(|&at| bulb_at(at, Desk::facing(facing), pack, scale));
-            match (bulb, d.lamp.light) {
-                (Some(centre), crate::lighting::Light::Halo { radius, share, .. }) => {
-                    crate::lighting::Emitter {
-                        light: crate::lighting::Light::Halo {
-                            centre,
-                            radius,
-                            share,
-                        },
-                        ..d.lamp
-                    }
-                }
-                _ => d.lamp,
-            }
+        .zip(&lights.desks)
+        .map(|(desk, d)| {
+            d.relit_at(bulb_at(desk.at, Desk::facing(desk.facing), pack, scale))
+                .lamp
         })
         .collect();
     let inputs = lights
@@ -679,55 +663,40 @@ fn push_fixture(
             Playback::Held,
         ),
         K::DeskChair(i) => {
-            let Some(&desk) = layout.home_desks.get(i.0) else {
-                return;
-            };
-            if carried.contains(&desk) {
+            let desk = layout.home_desks[i.0];
+            if carried.contains(&desk.at) {
                 return;
             }
-            if let Some((span, at)) = chair_span(pack, layout.desk_facing(i), desk) {
+            if let Some((span, at)) = chair_span(pack, desk.facing, desk.at) {
                 order.push((span.with_depth(depth), PieceKind::Chair { at }));
             }
         }
         K::Station { waypoint, station } => {
-            let Some(wp) = layout.waypoints.get(waypoint) else {
-                return;
+            let at = fixture.at;
+            let mut appliance = |sprite| {
+                let anim = pack.piece(sprite);
+                let busy = frame.occupied_waypoints.contains(&waypoint);
+                let art = Art {
+                    sprite,
+                    frame: crate::pack::appliance_frame_index(anim, busy, moment.timing.beat),
+                    flip: Flip::None,
+                };
+                push_art(order, pack, at, art, depth, Playback::Looping);
             };
-            match station {
-                Station::PantryCounter => {
-                    if let Some(pantry) = &layout.pantry {
-                        let sprite = crate::layout::pantry_counter_anim(pantry.counter_size.w);
-                        push_art(
-                            order,
-                            pack,
-                            wp.pos,
-                            Art::still(sprite),
-                            depth,
-                            Playback::Held,
-                        );
-                    }
+            match station.art() {
+                StationArt::PantryCounter => {
+                    let sprite = crate::layout::pantry_counter_anim(fixture.visual.width);
+                    push_art(order, pack, at, Art::still(sprite), depth, Playback::Held);
                 }
-                Station::SnackShelf => push_art(
+                StationArt::SnackShelf => push_art(
                     order,
                     pack,
-                    wp.pos,
+                    at,
                     Art::still(PackPiece::SnackShelf),
                     depth,
                     Playback::Held,
                 ),
-                Station::VendingMachine | Station::Printer => {
-                    let Some(sprite) = crate::pack::appliance_piece(wp.kind) else {
-                        return;
-                    };
-                    let anim = pack.piece(sprite);
-                    let busy = frame.occupied_waypoints.contains(&waypoint);
-                    let art = Art {
-                        sprite,
-                        frame: crate::pack::appliance_frame_index(anim, busy, moment.timing.beat),
-                        flip: Flip::None,
-                    };
-                    push_art(order, pack, wp.pos, art, depth, Playback::Looping);
-                }
+                StationArt::Appliance(sprite) => appliance(sprite),
             }
         }
         K::Plant { kind, .. } => push_art(
@@ -758,18 +727,9 @@ fn push_fixture(
         K::NoticeBoard { .. } => push_hung(order, pack, top_left, PackPiece::NoticeBoard, depth),
         // A back-view sofa splits into bands its sitter sorts between
         // ([`push_sofa`]), so it lays its own layers.
-        K::MeetingSofa {
-            room,
-            seat,
-            faces_away,
-        } => {
-            let sofa = layout
-                .meeting_rooms
-                .get(room)
-                .and_then(|r| r.trio)
-                .and_then(|t| t.sofas.get(seat).copied());
-            if let (Some(at), Some(tie)) = (sofa, tie_of(fixture)) {
-                push_sofa(order, pack, at, faces_away, tie);
+        K::MeetingSofa { faces_away, .. } => {
+            if let Some(tie) = tie_of(fixture) {
+                push_sofa(order, pack, fixture.at, faces_away, tie);
             }
             return;
         }
@@ -984,10 +944,7 @@ fn push_desk(
         theme,
         scale,
     } = office;
-    let Some(&d) = layout.home_desks.get(i.0) else {
-        return;
-    };
-    let facing = layout.desk_facing(i);
+    let crate::layout::HomeDesk { at: d, facing } = layout.home_desks[i.0];
     let desk = Desk::facing(facing);
     let props = frame.desk(i);
     let screen = Screen::of(
@@ -1164,7 +1121,7 @@ fn push_characters(
     (order, badges): (&mut Vec<(Span, PieceKind)>, &mut Vec<crate::display::Badge>),
 ) -> Vec<crate::layout::Point> {
     let Office {
-        layout,
+        layout: _,
         pack,
         theme,
         scale,
@@ -1173,9 +1130,7 @@ fn push_characters(
     let namesakes = crate::badge::Namesakes::of(&frame.agents);
     let mut carried = Vec::new();
     for c in &frame.characters {
-        let Some(agent) = frame.agents.get(c.agent_idx) else {
-            continue;
-        };
+        let agent = &frame.agents[c.agent_idx];
         let pose = crate::character::SpritePose::of(c, agent, theme);
         // The frame `paint_figure` draws: an animation's frames need not
         // share a size.
@@ -1183,13 +1138,12 @@ fn push_characters(
             crate::pack::densest_frame(pack, pose.anim_name, pose.frame_idx, RenderScale::ONE)
                 .logical;
         let key = crate::character::character_key(pose, agent, pack, scale, now);
-        let seat = c.seat_desk.map(|d| (d, layout.desk_facing_at(d)));
-        let chair = seat.and_then(|(d, facing)| chair_span(pack, facing, d));
-        if let (Some((d, _)), Some(_)) = (seat, chair) {
-            carried.push(d);
+        let seat = c.seat_desk;
+        let chair = seat.and_then(|d| chair_span(pack, d.facing, d.at));
+        if let (Some(d), Some(_)) = (seat, chair) {
+            carried.push(d.at);
         }
-        let badge_ceiling =
-            seat.map(|(d, facing)| desk_span(pack, Desk::facing(facing), d, scale).y0);
+        let badge_ceiling = seat.map(|d| desk_span(pack, Desk::facing(d.facing), d.at, scale).y0);
         let at = cutaway_top_left(c);
         let shadow = !c.seated;
         // The drawn box reaches up over the hair its style dresses it in.
@@ -1257,9 +1211,8 @@ fn riders(
     inks: crate::effects::look::Inks,
 ) -> Vec<crate::display::effects::Riding> {
     let d = key.frame.density.get();
-    let Some(pen) = Pen::new(scale, key.frame.density) else {
-        return Vec::new();
-    };
+    let pen =
+        Pen::new(scale, key.frame.density).expect("`densest` picks a density dividing `scale`");
     // A dressed frame's head is its mark's column on its crest; the base
     // art's, the classic's crown point: its frame's top, centred.
     let head = match key.dress.as_ref() {

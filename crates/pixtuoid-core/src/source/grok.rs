@@ -9,11 +9,12 @@
 //!   snake_case event values** (`hookEventName`, `sessionId`, `toolUseId`, …)
 //!   — the only spelling pre-1.0 sent, hence the claims-all custom decoder
 //!   below; 1.0.x mirrors every key in CC's snake_case too
-//!   (`grok/tool-run-recorded`), which this decoder still does not read. Hooks
+//!   (`grok/fixtures/tool-run-hermetic`), which this decoder still does not read. Hooks
 //!   dispatch SEQUENTIALLY inline on the session actor, so the shim's
 //!   `WRITE_TIMEOUT` bound matters here.
 //! - **Keying**: `sessionId` is consistent across every event of a session, ==
-//!   the transcript's parent-DIR name, == a subagent's `subagentId`. Hook and
+//!   the transcript's parent-DIR name (upstream joins the id into
+//!   `session_dir`; `grok_id_from_path` mirrors it), == a subagent's `subagentId`. Hook and
 //!   watcher keys therefore coalesce, and a child's tool hooks carry the
 //!   CHILD's `sessionId`.
 //! - **Subagents**: in-process children persisted as FLAT siblings in the
@@ -33,17 +34,63 @@ use std::path::{Path, PathBuf};
 
 use crate::AgentId;
 use crate::source::decoder::{MAX_DECODED_FIELD_CHARS, ellipsize, generic_tool_display};
-use crate::source::{AgentEvent, ToolDetail};
+use crate::source::registry::{
+    ChildEndInference, FocusChannel, HookDecoding, HookObject, Hyphen, SourceCaps,
+    SourceDescriptor, SourceKind, Transcript,
+};
+use crate::source::{AgentEvent, RequestKeys, ToolDetail};
 
 #[cfg(feature = "native")]
 mod native;
 #[cfg(feature = "native")]
 pub use native::GrokSource;
-#[cfg(feature = "native")]
-pub(crate) use native::live_grok_session_ids;
 
 /// The Grok Build source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "grok";
+
+pub(crate) const DESCRIPTOR: SourceDescriptor = SourceDescriptor {
+    name: SOURCE_NAME,
+    label_prefix: "gk",
+    verified_version: "1.0.70",
+    version_probe: Some(&["grok", "--version"]),
+    version_hyphen: Hyphen::Prerelease,
+    home_env: Some("GROK_HOME"),
+    kind: SourceKind::Agent {
+        transcript: Some(Transcript {
+            line_decoder: decode_grok_line,
+            id_from_path: grok_id_from_path,
+            // Session dirs carry rewrite-on-resume siblings (chat_history /
+            // rewind_points / events.jsonl) that must never be tailed.
+            path_filter: is_updates_jsonl,
+            // Always-None: grok lines carry no cwd — the URL-encoded group dir
+            // does, applied via the watcher's cwd deriver.
+            cwd_extractor: extract_grok_cwd,
+            parent_extractor: None,
+        }),
+        hook: Some(HookDecoding::ClaimsAll(decode_grok_hook_payload)),
+        caps: SourceCaps {
+            // `session_end` does NOT fire on a plain TUI quit (the loop breaks without
+            // draining the session actor), so the DOMINANT exit is signal-less; the
+            // authority is the liveness probe over grok's `active_sessions.json`.
+            has_exit_signal: false,
+            // Every prompt fires `user_prompt_submit` (→ SessionStart), so a swept
+            // LIVE session walks back in — which is what makes the short idle reap
+            // safe for grok's untracked headless one-shots.
+            resurrects_on_prompt: true,
+            // A BLOCKING spawn's Task detail gets its post_tool_use at
+            // completion, and a background spawn never mints a Task at all.
+            delegations_are_hook_silent: false,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
+            brackets_turns: false,
+        },
+        // `active_sessions.json` maps session_id → pid with an `opened_at` recycle
+        // guard; a shim stamp would shadow it with a walk carrying no guard (#527).
+        focus: FocusChannel::TranscriptProbe,
+    },
+    #[cfg(feature = "native")]
+    native: native::NATIVE,
+};
 
 /// xAI's private JSON-RPC method namespace, named once so the decode arm and
 /// the session-end scan cannot drift apart.
@@ -64,11 +111,8 @@ const XAI_HOOK_EXECUTION: &str = "hook_execution";
 ///
 /// # Errors
 ///
-/// If the payload is not an object, lacks `hookEventName`, carries none of `sessionId`, `cwd` or `workspaceRoot`, names an unrecognized event, or is a subagent event without `subagentId`.
-pub(crate) fn decode_grok_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| DecodeError::not_an_object(SOURCE_NAME))?;
+/// If the payload lacks `hookEventName`, carries none of `sessionId`, `cwd` or `workspaceRoot`, names an unrecognized event, or is a subagent event without `subagentId`.
+pub(crate) fn decode_grok_hook_payload(obj: &HookObject) -> Result<Vec<AgentEvent>> {
     let event = obj
         .get("hookEventName")
         .and_then(|s| s.as_str())
@@ -143,7 +187,7 @@ pub(crate) fn decode_grok_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
                 });
             Ok(vec![
                 identity(),
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id,
                     tool_use_id: tool_use_id(),
                     detail: Some(grok_tool_detail(tool, obj.get("toolInput"))),
@@ -153,11 +197,11 @@ pub(crate) fn decode_grok_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
         // A FAILED tool fires `post_tool_use_failure` INSTEAD OF
         // `post_tool_use`; a DENIED one fires `permission_denied` and never
         // runs at all. All three close the activity, which also resolves a
-        // permission `Waiting` gated on this tool — right for the denied case:
-        // the prompt is answered, so the sprite must not stay Waiting.
+        // permission `UserActionRequest` gated on this tool — right for the denied case:
+        // the prompt is answered, so the sprite must not stay RequiresAction.
         "post_tool_use" | "post_tool_use_failure" | "permission_denied" => Ok(vec![
             identity(),
-            AgentEvent::ActivityEnd {
+            AgentEvent::ToolUseEnd {
                 agent_id,
                 tool_use_id: tool_use_id(),
             },
@@ -186,15 +230,15 @@ pub(crate) fn decode_grok_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
                         .unwrap_or(kind);
                     Ok(vec![
                         identity(),
-                        AgentEvent::Waiting {
+                        AgentEvent::user_action_request(
                             agent_id,
-                            reason: ellipsize(msg, MAX_DECODED_FIELD_CHARS),
-                            tool_use_id: None,
-                        },
+                            Some(ellipsize(msg, MAX_DECODED_FIELD_CHARS)),
+                            RequestKeys::default(),
+                        ),
                     ])
                 }
                 // `idle_prompt` is the 60s-idle nudge — idle, not blocked; a
-                // Waiting would misrender every lunch break as a permission
+                // RequiresAction would misrender every lunch break as a permission
                 // prompt. `agent_error` is the retry-exhausted toast, an
                 // errored TURN whose state signal is the `stop_failure` arm.
                 // `task_complete` announces a BACKGROUNDED shell/monitor task
@@ -211,12 +255,10 @@ pub(crate) fn decode_grok_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
                 }
             }
         }
-        // Turn end, identity-LESS: an end for an unknown agent proves nothing
-        // worth registering. All three of upstream's turn-end causes land here.
-        "stop" | "stop_failure" | "stop_cancelled" => Ok(vec![AgentEvent::ActivityEnd {
-            agent_id,
-            tool_use_id: None,
-        }]),
+        // Identity-less: an end alone proves too little to label a session, so
+        // an unknown id registers blank (`shows_activity`). All three of
+        // upstream's turn-end causes land here.
+        "stop" | "stop_failure" | "stop_cancelled" => Ok(vec![AgentEvent::turn_end(agent_id)]),
         "subagent_start" => {
             let Some(child_session_id) = child_key(obj) else {
                 crate::source::drift::missing_field(SOURCE_NAME, event, "subagentId");
@@ -296,19 +338,17 @@ fn subagent_child_id(obj: &serde_json::Map<String, Value>, event: &str) -> Resul
 
 /// Grok tool detail: `"name: target"` over grok's snake_case tool vocabulary.
 ///
-/// **`spawn_subagent` maps to `ToolDetail::Task` ONLY for an explicit
-/// `background: false` (blocking) dispatch — NOT on the CC-style semantic
-/// `subagent_type` detection.** grok's spawn defaults to background=TRUE, where
+/// **[`SPAWN_TOOL`] maps to `ToolDetail::Task` ONLY for an explicit
+/// `background: false` (blocking) dispatch.** grok's spawn defaults to background=TRUE, where
 /// `post_tool_use` fires at SPAWN time, not completion; a Task-detail Start
-/// whose End arrives immediately would drain `active_tasks` while the child is
+/// whose End arrives immediately would drain `tasks_in_flight` while the child is
 /// alive, and the reducer's b1 drain-cascade would then `cascade_exit` the LIVE
 /// child subtree, unrecoverably. Blocking spawns are the one shape where
 /// End == completion. Skipping Task detail elsewhere loses nothing: grok
 /// children are FIRST-CLASS (child-keyed tool hooks) and their ends are
 /// wire-carried, so b1 has no end to infer.
 fn grok_tool_detail(tool: &str, args: Option<&Value>) -> ToolDetail {
-    let is_spawn = tool == "spawn_subagent" || args.and_then(|a| a.get("subagent_type")).is_some();
-    if is_spawn && spawn_is_blocking(args) {
+    if is_blocking_spawn(tool, args) {
         return ToolDetail::Task;
     }
     const KEYS: &[&str] = &[
@@ -335,36 +375,30 @@ fn grok_tool_detail(tool: &str, args: Option<&Value>) -> ToolDetail {
 /// line's `sessionId`: the path is the watcher's id space, and the two are
 /// equal by construction. The hook transport keys on the same string, so
 /// cross-transport dedup (hook `toolUseId` == ACP `toolCallId`) actually fires.
-///
-/// # Errors
-///
-/// Never: the `Result` is the [`LineDecoder`](crate::source::decoder::LineDecoder) signature, and a malformed line decodes to `vec![]`.
-pub(crate) fn decode_grok_line(path: &str, source: &str, v: Value) -> Result<Vec<AgentEvent>> {
+pub(crate) fn decode_grok_line(path: &str, source: &str, v: Value) -> Vec<AgentEvent> {
     let agent_id = AgentId::from_parts(source, &grok_id_from_path(Path::new(path)));
     let Some(method) = v.get("method").and_then(|m| m.as_str()) else {
-        return Ok(vec![]);
+        return vec![];
     };
     let Some(update) = v.pointer("/params/update").and_then(|u| u.as_object()) else {
-        return Ok(vec![]);
+        return vec![];
     };
     let Some(tag) = update.get("sessionUpdate").and_then(|t| t.as_str()) else {
-        return Ok(vec![]);
+        return vec![];
     };
     let str_field = |key: &str| update.get(key).and_then(|s| s.as_str());
 
-    let decoded: Result<Vec<AgentEvent>> = match method {
-        crate::source::acp::SESSION_UPDATE_METHOD => Ok(crate::source::acp::decode_session_update(
-            agent_id,
-            update,
-            grok_transcript_tool_detail,
-        )),
+    let mut evs = match method {
+        crate::source::acp::SESSION_UPDATE_METHOD => {
+            crate::source::acp::decode_session_update(agent_id, update, grok_transcript_tool_detail)
+        }
         // xAI private extension namespace — ACP reserves the `_` prefix for
         // implementation-specific methods, so none of this is ACP vocabulary.
         XAI_SESSION_UPDATE_METHOD => match tag {
             XAI_SUBAGENT_SPAWNED => {
                 let Some(child_key) = transcript_child_key(update) else {
                     crate::source::drift::missing_field(SOURCE_NAME, tag, "child_session_id");
-                    return Ok(vec![]);
+                    return vec![];
                 };
                 let child = AgentId::from_parts(SOURCE_NAME, child_key);
                 let mut evs = vec![AgentEvent::SessionStart {
@@ -386,41 +420,37 @@ pub(crate) fn decode_grok_line(path: &str, source: &str, v: Value) -> Result<Vec
                         label: ellipsize(label, MAX_DECODED_FIELD_CHARS),
                     });
                 }
-                Ok(evs)
+                evs
             }
             XAI_SUBAGENT_FINISHED => {
                 let Some(child_key) = transcript_child_key(update) else {
                     crate::source::drift::missing_field(SOURCE_NAME, tag, "child_session_id");
-                    return Ok(vec![]);
+                    return vec![];
                 };
-                Ok(vec![AgentEvent::SessionEnd {
+                vec![AgentEvent::SessionEnd {
                     agent_id: AgentId::from_parts(SOURCE_NAME, child_key),
                     as_child: true,
-                }])
+                }]
             }
             // The transcript twin of the `stop` hook: a tool-less turn's only
             // end signal for transcript-only setups.
-            XAI_TURN_COMPLETED => Ok(vec![AgentEvent::ActivityEnd {
-                agent_id,
-                tool_use_id: None,
-            }]),
+            XAI_TURN_COMPLETED => vec![AgentEvent::turn_end(agent_id)],
             XAI_HOOK_EXECUTION => {
                 if str_field("event_name") == Some("session_end") {
-                    Ok(vec![AgentEvent::SessionEnd {
+                    vec![AgentEvent::SessionEnd {
                         agent_id,
                         as_child: false,
-                    }])
+                    }]
                 } else {
-                    Ok(vec![])
+                    vec![]
                 }
             }
             // grok emits many cosmetic xAI updates (diff_review, compaction,
             // rewind_marker, …), so an unhandled extension tag is a silent skip.
-            _ => Ok(vec![]),
+            _ => vec![],
         },
-        _ => Ok(vec![]),
+        _ => vec![],
     };
-    let mut evs = decoded?;
     // The model rides `_meta` on an ORDINARY update; keying on the
     // `model_changed` tag a real session never sends left the flame dark.
     if let Some(model) = update
@@ -435,7 +465,7 @@ pub(crate) fn decode_grok_line(path: &str, source: &str, v: Value) -> Result<Vec
             effort: None,
         });
     }
-    Ok(evs)
+    evs
 }
 
 /// grok transcript lines carry NO cwd anywhere in their content — it exists
@@ -452,23 +482,31 @@ pub(crate) fn extract_grok_cwd(_v: &Value) -> Option<PathBuf> {
 /// Task detection follows the SAME blocking-only rule as the hook side — see
 /// [`grok_tool_detail`] for the b1 WHY.
 fn grok_transcript_tool_detail(title: &str, raw_input: Option<&Value>) -> ToolDetail {
-    if raw_input.is_some_and(|a| a.get("subagent_type").is_some()) && spawn_is_blocking(raw_input) {
+    if is_blocking_spawn(title, raw_input) {
         return ToolDetail::Task;
     }
     generic_tool_display(title, None)
 }
 
-/// Whether spawn args explicitly request a BLOCKING run (`false`): the model's
-/// `background` on both transports, since the hook's `toolInput` and a fresh
+/// grok's spawn tool, by name: its model-facing schema has no `subagent_type`
+/// (`crates/common/xai-tool-types/src/task.rs:26-32` at `xai-org/grok-build`
+/// `2bdd1d6a63`).
+const SPAWN_TOOL: &str = "spawn_subagent";
+
+/// Whether `tool` is [`SPAWN_TOOL`] and its args request a BLOCKING run
+/// (`false`): the model's `background` on both transports, since the hook's
+/// `toolInput` and a fresh
 /// `tool_call`'s `rawInput` carry its arguments as sent; the struct's own
 /// `run_in_background` rides only the later `tool_call_update` (1.0.62's run).
 /// Upstream parses the flag LENIENTLY — a model-emitted `"false"` STRING still
 /// runs blocking — which this `as_bool` read misses toward the SAFE side only:
 /// a missed `false` skips the Task detail, never over-mints it into b1.
-fn spawn_is_blocking(args: Option<&Value>) -> bool {
-    args.and_then(|a| a.get("background"))
-        .and_then(Value::as_bool)
-        == Some(false)
+fn is_blocking_spawn(tool: &str, args: Option<&Value>) -> bool {
+    tool == SPAWN_TOOL
+        && args
+            .and_then(|a| a.get("background"))
+            .and_then(Value::as_bool)
+            == Some(false)
 }
 
 /// The first-sight gate's session-ended checker: an ended grok session is
@@ -594,6 +632,7 @@ fn resolve_grok_home(grok_home_env: Option<PathBuf>, home: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::decoder::test_obj;
 
     #[test]
     fn grok_home_takes_env_unconditionally_even_when_missing() {
@@ -613,7 +652,7 @@ mod tests {
     use serde_json::json;
 
     fn decode_all(v: Value) -> Vec<AgentEvent> {
-        decode_grok_hook_payload(&v).expect("decodes")
+        decode_grok_hook_payload(test_obj(&v)).expect("decodes")
     }
 
     /// The payload's MAIN event is the LAST decoded one — activity arms
@@ -633,29 +672,6 @@ mod tests {
     }
 
     #[test]
-    fn session_start_keys_on_session_id() {
-        let mut v = envelope("session_start");
-        v["source"] = json!("new");
-        let ev = decode(v);
-        match ev {
-            AgentEvent::SessionStart {
-                agent_id,
-                source,
-                session_id,
-                cwd,
-                parent_id,
-            } => {
-                assert_eq!(source, SOURCE_NAME);
-                assert_eq!(agent_id, AgentId::from_parts(SOURCE_NAME, "0197fa30-sess"));
-                assert_eq!(session_id, "0197fa30-sess");
-                assert_eq!(cwd, PathBuf::from("/Users/dev/proj"));
-                assert_eq!(parent_id, None);
-            }
-            other => panic!("expected SessionStart, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn session_start_public_source_field_never_drives_attribution() {
         for reason in ["new", "load"] {
             let mut v = envelope("session_start");
@@ -669,7 +685,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_updates_meta_carries_the_model() {
-        // The shape from fixtures/grok/permission-hermetic — `model_changed`
+        // The shape from grok/fixtures/permission-hermetic — `model_changed`
         // never appears in a real session.
         let evs = decode_line(json!({
             "method": "session/update",
@@ -701,154 +717,45 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_submit_is_the_resurrect_carrier() {
-        let ev = decode(envelope("user_prompt_submit"));
-        assert!(matches!(ev, AgentEvent::SessionStart { agent_id, .. }
-            if agent_id == AgentId::from_parts(SOURCE_NAME, "0197fa30-sess")));
-    }
-
-    #[test]
-    fn session_end_maps_to_root_session_end() {
-        let mut v = envelope("session_end");
-        v["reason"] = json!("shutdown");
-        assert!(matches!(
-            decode(v),
-            AgentEvent::SessionEnd {
-                as_child: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn pre_tool_use_is_identity_plus_activity_start_with_tool_id() {
-        let mut v = envelope("pre_tool_use");
-        v["toolName"] = json!("run_terminal_command");
-        v["toolUseId"] = json!("call_42");
-        v["toolInput"] = json!({"command": "cargo test"});
-        v["toolInputTruncated"] = json!(false);
-        let evs = decode_all(v);
-        assert_eq!(evs.len(), 2);
-        match &evs[0] {
-            AgentEvent::Identity {
-                session_id,
-                cwd,
-                pid: None,
-                ..
-            } => {
-                assert_eq!(session_id, "0197fa30-sess");
-                assert_eq!(cwd.as_deref(), Some(Path::new("/Users/dev/proj")));
-            }
-            other => panic!("expected leading Identity, got {other:?}"),
-        }
-        match &evs[1] {
-            AgentEvent::ActivityStart {
-                tool_use_id,
-                detail,
-                ..
-            } => {
-                assert_eq!(tool_use_id.as_deref(), Some("call_42"));
-                assert_eq!(
-                    detail.as_ref().unwrap().display(),
-                    "run_terminal_command: cargo test"
-                );
-            }
-            other => panic!("expected ActivityStart, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn post_tool_use_variants_and_denial_close_the_activity() {
-        for event in [
-            "post_tool_use",
-            "post_tool_use_failure",
-            "permission_denied",
-        ] {
-            let mut v = envelope(event);
-            v["toolName"] = json!("run_terminal_command");
-            v["toolUseId"] = json!("call_42");
-            let evs = decode_all(v);
-            assert_eq!(evs.len(), 2, "{event}: Identity + End");
-            assert!(
-                matches!(&evs[1], AgentEvent::ActivityEnd { tool_use_id: Some(id), .. }
-                    if id == "call_42"),
-                "{event} must end tool call_42"
-            );
-        }
-    }
-
-    #[test]
-    fn the_three_turn_end_causes_are_identityless_turn_ends() {
-        for event in ["stop", "stop_failure", "stop_cancelled"] {
-            let evs = decode_all(envelope(event));
-            assert_eq!(evs.len(), 1, "{event}: exactly one event");
-            assert!(
-                matches!(
-                    &evs[0],
-                    AgentEvent::ActivityEnd {
-                        tool_use_id: None,
-                        ..
-                    }
-                ),
-                "{event} must decode to a bare ActivityEnd"
-            );
-        }
-    }
-
-    #[test]
     fn blocking_spawn_is_task_background_and_default_are_not() {
-        let blocking = grok_tool_detail(
-            "spawn_subagent",
-            Some(&json!({"subagent_type": "explore", "background": false})),
-        );
+        let blocking = grok_tool_detail(SPAWN_TOOL, Some(&json!({"background": false})));
         assert!(blocking.is_task(), "blocking spawn must read Delegating");
 
         // background:true AND the absent-field DEFAULT (grok's spawn defaults
         // to background) must both stay generic.
         for input in [
-            json!({"subagent_type": "explore", "background": true}),
-            json!({"subagent_type": "explore", "description": "map the build"}),
+            json!({"background": true}),
+            json!({"description": "map the build"}),
         ] {
-            let detail = grok_tool_detail("spawn_subagent", Some(&input));
+            let detail = grok_tool_detail(SPAWN_TOOL, Some(&input));
             assert!(
                 !detail.is_task(),
                 "background/default spawn must NOT be Task (b1 would evict the live child): {input}"
             );
         }
-        assert!(!grok_tool_detail("spawn_subagent", None).is_task());
-        let renamed = grok_tool_detail(
-            "task",
-            Some(&json!({"subagent_type": "explore", "background": false})),
-        );
-        assert!(
-            renamed.is_task(),
-            "semantic detection still applies when blocking"
-        );
+        assert!(!grok_tool_detail(SPAWN_TOOL, None).is_task());
     }
 
     #[test]
     fn blocking_flag_is_the_models_background_on_both_transports() {
-        let blocking = json!({"subagent_type": "explore", "background": false});
-        assert!(grok_tool_detail("spawn_subagent", Some(&blocking)).is_task());
-        assert!(grok_transcript_tool_detail("Spawn subagent", Some(&blocking)).is_task());
-        let background = json!({"subagent_type": "explore", "background": true});
-        assert!(!grok_tool_detail("spawn_subagent", Some(&background)).is_task());
-        assert!(!grok_transcript_tool_detail("Spawn subagent", Some(&background)).is_task());
+        let blocking = json!({"background": false});
+        assert!(grok_tool_detail(SPAWN_TOOL, Some(&blocking)).is_task());
+        assert!(grok_transcript_tool_detail(SPAWN_TOOL, Some(&blocking)).is_task());
+        let background = json!({"background": true});
+        assert!(!grok_tool_detail(SPAWN_TOOL, Some(&background)).is_task());
+        assert!(!grok_transcript_tool_detail(SPAWN_TOOL, Some(&background)).is_task());
         // The struct's spelling rides no line either transport reads.
-        let structs_spelling = json!({"subagent_type": "explore", "run_in_background": false});
-        assert!(!grok_tool_detail("spawn_subagent", Some(&structs_spelling)).is_task());
-        assert!(!grok_transcript_tool_detail("Spawn subagent", Some(&structs_spelling)).is_task());
+        let structs_spelling = json!({"run_in_background": false});
+        assert!(!grok_tool_detail(SPAWN_TOOL, Some(&structs_spelling)).is_task());
+        assert!(!grok_transcript_tool_detail(SPAWN_TOOL, Some(&structs_spelling)).is_task());
         // A model-emitted STRING "false" (upstream parses leniently).
-        let lenient = json!({"subagent_type": "explore", "background": "false"});
-        assert!(!grok_tool_detail("spawn_subagent", Some(&lenient)).is_task());
+        let lenient = json!({"background": "false"});
+        assert!(!grok_tool_detail(SPAWN_TOOL, Some(&lenient)).is_task());
     }
 
     #[test]
     fn background_spawn_displays_description_as_target() {
-        let detail = grok_tool_detail(
-            "spawn_subagent",
-            Some(&json!({"subagent_type": "explore", "description": "map the build"})),
-        );
+        let detail = grok_tool_detail(SPAWN_TOOL, Some(&json!({"description": "map the build"})));
         assert_eq!(detail.display(), "spawn_subagent: map the build");
     }
 
@@ -858,49 +765,35 @@ mod tests {
         v["toolName"] = json!("read_file");
         v["toolInput"] = json!({"path": "src/lib.rs"});
         assert!(
-            matches!(decode(v), AgentEvent::ActivityStart { detail: Some(d), .. }
+            matches!(decode(v), AgentEvent::ToolUseStart { detail: Some(d), .. }
             if d.display() == "read_file: src/lib.rs")
         );
     }
 
     #[test]
-    fn long_targets_are_truncated_at_the_decode_boundary() {
-        let mut v = envelope("pre_tool_use");
-        v["toolName"] = json!("run_terminal_command");
-        v["toolInput"] = json!({"command": "x".repeat(300)});
-        match decode(v) {
-            AgentEvent::ActivityStart {
-                detail: Some(d), ..
-            } => {
-                let display = d.display();
-                assert!(display.ends_with('…'), "must be ellipsized: {display}");
-            }
-            other => panic!("expected ActivityStart, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn permission_and_elicitation_notifications_are_waiting() {
+    fn permission_and_elicitation_notifications_are_user_action_requests() {
         for kind in ["permission_prompt", "elicitation_dialog"] {
             let mut v = envelope("notification");
             v["notificationType"] = json!(kind);
             v["message"] = json!("Tool permission requested");
             let evs = decode_all(v);
-            assert_eq!(evs.len(), 2, "{kind}: Identity + Waiting");
+            assert_eq!(evs.len(), 2, "{kind}: Identity + UserActionRequest");
             assert!(
-                matches!(&evs[1], AgentEvent::Waiting { reason, .. }
-                    if reason == "Tool permission requested"),
-                "{kind} must decode to Waiting"
+                matches!(&evs[1], AgentEvent::UserActionRequest { reason, .. }
+                    if reason.as_deref() == Some("Tool permission requested")),
+                "{kind} must decode to UserActionRequest"
             );
         }
     }
 
     #[test]
-    fn waiting_reason_falls_back_to_the_notification_type() {
+    fn user_action_request_reason_falls_back_to_the_notification_type() {
         let mut v = envelope("notification");
         v["notificationType"] = json!("permission_prompt");
-        assert!(matches!(decode(v), AgentEvent::Waiting { reason, .. }
-            if reason == "permission_prompt"));
+        assert!(
+            matches!(decode(v), AgentEvent::UserActionRequest { reason, .. }
+            if reason.as_deref() == Some("permission_prompt"))
+        );
     }
 
     /// Zero events is the SAME observable for a knowingly-ignored type and an
@@ -920,7 +813,7 @@ mod tests {
             });
             assert!(
                 !logs.contains("unknown_event"),
-                "{known} is a KNOWN non-waiting type — it must not breadcrumb, got:\n{logs}"
+                "{known} is a KNOWN non-requires-action type — it must not breadcrumb, got:\n{logs}"
             );
         }
         // Control: the breadcrumb still fires for a genuinely new type, so the
@@ -1001,38 +894,10 @@ mod tests {
     fn subagent_events_without_subagent_id_are_malformed() {
         for event in ["subagent_start", "subagent_stop"] {
             assert!(
-                decode_grok_hook_payload(&envelope(event)).is_err(),
+                decode_grok_hook_payload(test_obj(&envelope(event))).is_err(),
                 "{event} without subagentId must bail"
             );
         }
-    }
-
-    #[test]
-    fn all_events_for_one_session_share_one_agent_id() {
-        let sid = "0197fa30-sess";
-        let mut pre = envelope("pre_tool_use");
-        pre["toolName"] = json!("read_file");
-        pre["toolUseId"] = json!("c1");
-        let mut post = envelope("post_tool_use");
-        post["toolUseId"] = json!("c1");
-        let mut note = envelope("notification");
-        note["notificationType"] = json!("permission_prompt");
-        let events = [
-            envelope("session_start"),
-            envelope("user_prompt_submit"),
-            pre,
-            note,
-            post,
-            envelope("stop"),
-            envelope("session_end"),
-        ];
-        let ids: std::collections::BTreeSet<_> = events
-            .iter()
-            .flat_map(|v| decode_grok_hook_payload(v).unwrap())
-            .map(|e| e.agent_id())
-            .collect();
-        assert_eq!(ids.len(), 1, "all root events must coalesce to one AgentId");
-        assert!(ids.contains(&AgentId::from_parts(SOURCE_NAME, sid)));
     }
 
     #[test]
@@ -1041,21 +906,31 @@ mod tests {
             "hookEventName": "stop",
             "cwd": "/Users/dev/proj"
         }));
-        assert!(matches!(ev, AgentEvent::ActivityEnd { agent_id, .. }
+        assert!(matches!(ev, AgentEvent::TurnEnd { agent_id, .. }
             if agent_id == AgentId::from_parts(SOURCE_NAME, "/Users/dev/proj")));
     }
 
     #[test]
+    fn every_turn_end_cause_is_a_bare_turn_end() {
+        for event in ["stop", "stop_failure", "stop_cancelled"] {
+            let evs = decode_all(envelope(event));
+            assert!(
+                matches!(evs.as_slice(), [AgentEvent::TurnEnd { .. }]),
+                "{event}: {evs:?}"
+            );
+        }
+    }
+
+    #[test]
     fn nothing_to_key_on_is_malformed() {
-        assert!(decode_grok_hook_payload(&json!({"hookEventName": "stop"})).is_err());
+        assert!(decode_grok_hook_payload(test_obj(&json!({"hookEventName": "stop"}))).is_err());
         assert!(
-            decode_grok_hook_payload(
+            decode_grok_hook_payload(test_obj(
                 &json!({"hookEventName": "stop", "cwd": "", "workspaceRoot": ""})
-            )
+            ))
             .is_err()
         );
-        assert!(decode_grok_hook_payload(&json!("just a string")).is_err());
-        assert!(decode_grok_hook_payload(&json!({"sessionId": "s"})).is_err());
+        assert!(decode_grok_hook_payload(test_obj(&json!({"sessionId": "s"}))).is_err());
     }
 
     #[test]
@@ -1063,7 +938,7 @@ mod tests {
         // pre/post_compact are deliberately unregistered.
         for ev in ["pre_compact", "post_compact", "PreToolUse", "bogus"] {
             assert!(
-                decode_grok_hook_payload(&envelope(ev)).is_err(),
+                decode_grok_hook_payload(test_obj(&envelope(ev))).is_err(),
                 "{ev} must bail"
             );
         }
@@ -1073,7 +948,7 @@ mod tests {
         "/home/u/.grok/sessions/%2Fhome%2Fu%2Fproj/0197fa30-sess/updates.jsonl";
 
     fn decode_line(v: Value) -> Vec<AgentEvent> {
-        decode_grok_line(TRANSCRIPT, SOURCE_NAME, v).expect("decodes")
+        decode_grok_line(TRANSCRIPT, SOURCE_NAME, v)
     }
 
     fn acp_line(update: Value) -> Value {
@@ -1082,11 +957,11 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_spawn_subagent_call_is_task_detail_without_a_subagent_type_arg() {
-        // `background: false` is what makes a spawn BLOCKING; the args carry no
-        // `subagent_type`, so only the tool NAME can classify this one.
+    fn only_the_spawn_tool_is_a_spawn() {
+        // `background: false` makes a spawn BLOCKING; only the tool NAME makes
+        // it a spawn.
         assert_eq!(
-            grok_tool_detail("spawn_subagent", Some(&json!({"background": false}))),
+            grok_tool_detail(SPAWN_TOOL, Some(&json!({"background": false}))),
             ToolDetail::Task,
             "the tool NAME alone marks a blocking spawn"
         );
@@ -1127,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_tool_call_line_is_activity_start_keyed_by_path() {
+    fn fresh_tool_call_line_is_tool_use_start_keyed_by_path() {
         // A FRESH tool_call OMITS `status` (Pending is the ACP schema's serde
         // skip-default) and its `title` is the RAW tool name.
         let evs = decode_line(acp_line(json!({
@@ -1139,7 +1014,7 @@ mod tests {
         })));
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id,
                 tool_use_id,
                 detail,
@@ -1156,7 +1031,7 @@ mod tests {
                     "title IS the display (ACP carries no tool name)"
                 );
             }
-            other => panic!("expected ActivityStart, got {other:?}"),
+            other => panic!("expected ToolUseStart, got {other:?}"),
         }
     }
 
@@ -1169,7 +1044,7 @@ mod tests {
                 "status": status
             })));
             assert!(
-                matches!(&evs[..], [AgentEvent::ActivityEnd { tool_use_id: Some(id), .. }]
+                matches!(&evs[..], [AgentEvent::ToolUseEnd { tool_use_id: Some(id), .. }]
                     if id == "call_42"),
                 "{status} must end call_42"
             );
@@ -1190,20 +1065,20 @@ mod tests {
         let blocking = decode_line(acp_line(json!({
             "sessionUpdate": "tool_call", "toolCallId": "call-0b8fe95b-2070-4e76-a5c7-036d4ad88f12-0",
             "title": "spawn_subagent",
-            "rawInput": {"subagent_type": "general-purpose", "background": false,
+            "rawInput": {"background": false,
                          "description": "Reply with single word", "prompt": "reply done"}
         })));
         assert!(
-            matches!(&blocking[..], [AgentEvent::ActivityStart { detail: Some(d), .. }] if d.is_task())
+            matches!(&blocking[..], [AgentEvent::ToolUseStart { detail: Some(d), .. }] if d.is_task())
         );
         let background = decode_line(acp_line(json!({
             "sessionUpdate": "tool_call", "toolCallId": "call-0b8fe95b-2070-4e76-a5c7-036d4ad88f12-1",
             "title": "spawn_subagent",
-            "rawInput": {"subagent_type": "general-purpose", "background": true,
+            "rawInput": {"background": true,
                          "description": "Reply with single word", "prompt": "reply done"}
         })));
         assert!(
-            matches!(&background[..], [AgentEvent::ActivityStart { detail: Some(d), .. }] if !d.is_task()),
+            matches!(&background[..], [AgentEvent::ToolUseStart { detail: Some(d), .. }] if !d.is_task()),
             "default (background) spawn must NOT be Task — b1 would evict the live child"
         );
     }
@@ -1241,13 +1116,10 @@ mod tests {
     #[test]
     fn turn_completed_settles_the_turn_to_idle() {
         let evs = decode_line(xai_line(json!({"sessionUpdate": "turn_completed"})));
-        assert!(matches!(
-            &evs[..],
-            [AgentEvent::ActivityEnd {
-                tool_use_id: None,
-                ..
-            }]
-        ));
+        assert!(
+            matches!(&evs[..], [AgentEvent::TurnEnd { .. }]),
+            "got {evs:?}"
+        );
     }
 
     #[test]
@@ -1388,11 +1260,7 @@ mod tests {
             json!({"method": "session/update", "params": {"update": {"noTag": true}}}),
             json!({"method": "bogus/method", "params": {"update": {"sessionUpdate": "tool_call"}}}),
         ] {
-            assert!(
-                decode_grok_line(TRANSCRIPT, SOURCE_NAME, v)
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(decode_grok_line(TRANSCRIPT, SOURCE_NAME, v).is_empty());
         }
     }
 

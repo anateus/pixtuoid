@@ -8,7 +8,7 @@ fn every_registered_source_has_two_char_label_prefix() {
         assert_eq!(
             prefix.chars().count(),
             2,
-            "source {src:?} has no 2-char label prefix (got {prefix:?}) — fix its SourceDescriptor row in source/registry.rs"
+            "source {src:?} has no 2-char label prefix (got {prefix:?}) — fix its module's `DESCRIPTOR`"
         );
     }
 }
@@ -45,13 +45,13 @@ fn rename_classification_and_upgradability_cover_each_provenance() {
 #[test]
 fn stale_timeout_constants_have_their_intended_durations() {
     use super::{
-        PROOF_OF_LIFE_TTL, STALE_ACTIVE_TIMEOUT, STALE_IDLE_TIMEOUT, STALE_SHORT_IDLE_TIMEOUT,
-        STALE_UNKNOWN_CWD_TIMEOUT, STALE_WAITING_TIMEOUT,
+        PROOF_OF_LIFE_TTL, STALE_BLOCKED_TIMEOUT, STALE_IDLE_TIMEOUT, STALE_SHORT_IDLE_TIMEOUT,
+        STALE_TOOL_TIMEOUT, STALE_UNKNOWN_CWD_TIMEOUT,
     };
     use std::time::Duration;
-    assert_eq!(STALE_ACTIVE_TIMEOUT, Duration::from_secs(600));
+    assert_eq!(STALE_TOOL_TIMEOUT, Duration::from_secs(600));
     assert_eq!(STALE_IDLE_TIMEOUT, Duration::from_secs(1800));
-    assert_eq!(STALE_WAITING_TIMEOUT, Duration::from_secs(3600));
+    assert_eq!(STALE_BLOCKED_TIMEOUT, Duration::from_secs(3600));
     assert_eq!(STALE_UNKNOWN_CWD_TIMEOUT, Duration::from_secs(180));
     assert_eq!(STALE_SHORT_IDLE_TIMEOUT, Duration::from_secs(300));
     assert_eq!(PROOF_OF_LIFE_TTL, Duration::from_secs(150));
@@ -60,8 +60,8 @@ fn stale_timeout_constants_have_their_intended_durations() {
 // Synthetic caps on an unregistered source, so the POLICY half stays covered
 // for caps combinations the registered rows don't happen to spell.
 #[test]
-fn delegating_slot_with_hook_silent_caps_gets_waiting_window() {
-    use super::{STALE_ACTIVE_TIMEOUT, STALE_WAITING_TIMEOUT, stale_threshold_with_caps};
+fn delegating_slot_with_hook_silent_caps_gets_the_blocked_window() {
+    use super::{STALE_BLOCKED_TIMEOUT, STALE_TOOL_TIMEOUT, stale_threshold_with_caps};
     use crate::source::registry::SourceCaps;
     use crate::source::{AgentEvent, ToolDetail, Transport};
     use crate::{AgentId, Reducer, SceneState};
@@ -72,6 +72,7 @@ fn delegating_slot_with_hook_silent_caps_gets_waiting_window() {
         delegations_are_hook_silent: true,
         child_end_inference: crate::source::registry::ChildEndInference::TaskDrain,
         child_hooks_unnamed: false,
+        brackets_turns: false,
     };
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
@@ -90,7 +91,7 @@ fn delegating_slot_with_hook_silent_caps_gets_waiting_window() {
     );
     r.apply(
         &mut scene,
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id: id,
             tool_use_id: None,
             detail: Some(ToolDetail::Task),
@@ -101,18 +102,18 @@ fn delegating_slot_with_hook_silent_caps_gets_waiting_window() {
     let slot = scene.agents.get(&id).unwrap();
     assert_eq!(
         stale_threshold_with_caps(slot, Some(caps)),
-        STALE_WAITING_TIMEOUT,
-        "hook-silent Delegating slot must get the Waiting-class window"
+        STALE_BLOCKED_TIMEOUT,
+        "hook-silent Delegating slot must get the blocked window"
     );
     assert_eq!(
         stale_threshold_with_caps(slot, None),
-        STALE_ACTIVE_TIMEOUT,
-        "without the cap, Delegating reaps on the normal Active timer"
+        STALE_TOOL_TIMEOUT,
+        "without the cap, Delegating reaps on the tool timeout"
     );
 
     r.apply(
         &mut scene,
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id: id,
             tool_use_id: None,
             detail: Some(ToolDetail::Generic {
@@ -125,14 +126,14 @@ fn delegating_slot_with_hook_silent_caps_gets_waiting_window() {
     let slot = scene.agents.get(&id).unwrap();
     assert_eq!(
         stale_threshold_with_caps(slot, Some(caps)),
-        STALE_ACTIVE_TIMEOUT,
-        "caps-on but non-Task detail must keep the Active timer"
+        STALE_TOOL_TIMEOUT,
+        "caps-on but non-Task detail must keep the tool timeout"
     );
 }
 
 #[test]
-fn generic_tool_displaying_delegating_keeps_the_active_window() {
-    use super::{STALE_ACTIVE_TIMEOUT, stale_threshold_with_caps};
+fn generic_tool_displaying_delegating_keeps_the_running_window() {
+    use super::{STALE_TOOL_TIMEOUT, stale_threshold_with_caps};
     use crate::source::registry::SourceCaps;
     use crate::source::{AgentEvent, ToolDetail, Transport};
     use crate::{AgentId, Reducer, SceneState};
@@ -143,6 +144,7 @@ fn generic_tool_displaying_delegating_keeps_the_active_window() {
         delegations_are_hook_silent: true,
         child_end_inference: crate::source::registry::ChildEndInference::TaskDrain,
         child_hooks_unnamed: false,
+        brackets_turns: false,
     };
     let mut scene = SceneState::uniform(4);
     let mut r = Reducer::new();
@@ -161,7 +163,7 @@ fn generic_tool_displaying_delegating_keeps_the_active_window() {
     );
     r.apply(
         &mut scene,
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id: id,
             tool_use_id: None,
             detail: Some(ToolDetail::Generic {
@@ -174,13 +176,13 @@ fn generic_tool_displaying_delegating_keeps_the_active_window() {
     let slot = scene.agents.get(&id).unwrap();
     assert_eq!(
         stale_threshold_with_caps(slot, Some(caps)),
-        STALE_ACTIVE_TIMEOUT,
+        STALE_TOOL_TIMEOUT,
         "a Generic tool spelling 'Delegating' must not ride the delegation carve-out"
     );
 }
 
 #[test]
-fn gated_before_waiting_evicted_on_apply_path_sweep() {
+fn an_action_request_is_evicted_on_apply_path_sweep() {
     use crate::AgentId;
     use crate::source::{AgentEvent, ToolDetail, Transport};
     use crate::state::SceneState;
@@ -205,7 +207,7 @@ fn gated_before_waiting_evicted_on_apply_path_sweep() {
     );
     r.apply(
         &mut scene,
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id: id,
             tool_use_id: Some("toolT".into()),
             detail: Some(ToolDetail::from("Bash")),
@@ -215,17 +217,17 @@ fn gated_before_waiting_evicted_on_apply_path_sweep() {
     );
     r.apply(
         &mut scene,
-        AgentEvent::Waiting {
-            agent_id: id,
-            reason: "perm".into(),
-            tool_use_id: None,
-        },
+        AgentEvent::user_action_request(
+            id,
+            Some("perm".into()),
+            crate::source::RequestKeys::default(),
+        ),
         t0,
         Transport::Hook,
     );
     assert!(
-        r.corr.gated_before_waiting.contains_key(&id),
-        "gate recorded while Waiting mid-tool"
+        r.corr.action_requests.contains(&id),
+        "request recorded while RequiresAction mid-tool"
     );
 
     // The UNRELATED event below is what runs sweep_exited on the APPLY path.
@@ -258,8 +260,8 @@ fn gated_before_waiting_evicted_on_apply_path_sweep() {
         "exited slot swept on the apply path"
     );
     assert!(
-        !r.corr.gated_before_waiting.contains_key(&id),
-        "apply-path sweep_exited must evict the gated entry (not only tick's retain)"
+        !r.corr.action_requests.contains(&id),
+        "apply-path sweep_exited must evict the action request (not only tick's retain)"
     );
 }
 
@@ -577,7 +579,7 @@ fn a_known_slots_hook_end_refuses_its_stragglers_past_the_sweep() {
         );
         r.apply(
             scene,
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id: id,
                 tool_use_id: Some("t".into()),
                 detail: None,
@@ -710,7 +712,7 @@ fn resurrect_in_place_evicts_correlation_maps_but_keeps_proof_of_life() {
     r.apply(&mut scene, session_start("s"), t0, Transport::Hook);
     r.apply(
         &mut scene,
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id: id,
             tool_use_id: Some("t-gate".into()),
             detail: Some(ToolDetail::from("Bash")),
@@ -720,19 +722,19 @@ fn resurrect_in_place_evicts_correlation_maps_but_keeps_proof_of_life() {
     );
     r.apply(
         &mut scene,
-        AgentEvent::Waiting {
-            agent_id: id,
-            reason: "perm".into(),
-            tool_use_id: None,
-        },
+        AgentEvent::user_action_request(
+            id,
+            Some("perm".into()),
+            crate::source::RequestKeys::default(),
+        ),
         t0 + Duration::from_secs(1),
         Transport::Hook,
     );
     // A dispatch that fully drains arms the b1 cascade and leaves an (empty)
-    // active_tasks entry behind.
+    // tasks_in_flight entry behind.
     r.apply(
         &mut scene,
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id: id,
             tool_use_id: Some("task-1".into()),
             detail: Some(ToolDetail::from("Agent")),
@@ -742,7 +744,7 @@ fn resurrect_in_place_evicts_correlation_maps_but_keeps_proof_of_life() {
     );
     r.apply(
         &mut scene,
-        AgentEvent::ActivityEnd {
+        AgentEvent::ToolUseEnd {
             agent_id: id,
             tool_use_id: Some("task-1".into()),
         },
@@ -756,13 +758,10 @@ fn resurrect_in_place_evicts_correlation_maps_but_keeps_proof_of_life() {
         Transport::Hook,
     );
     assert!(
-        r.corr.active_tasks.contains_key(&id),
-        "active task populated"
+        r.corr.tasks_in_flight.contains_key(&id),
+        "task in flight populated"
     );
-    assert!(
-        r.corr.gated_before_waiting.contains_key(&id),
-        "gate populated"
-    );
+    assert!(r.corr.action_requests.contains(&id), "request populated");
     assert!(r.pending_b1_cascades.contains_key(&id), "cascade armed");
     assert!(
         r.corr.recent_proof_of_life.contains_key(&id),
@@ -795,12 +794,12 @@ fn resurrect_in_place_evicts_correlation_maps_but_keeps_proof_of_life() {
         "resurrected"
     );
     assert!(
-        !r.corr.active_tasks.contains_key(&id),
-        "resurrect must evict the dead life's active_tasks entry"
+        !r.corr.tasks_in_flight.contains_key(&id),
+        "resurrect must evict the dead life's tasks_in_flight entry"
     );
     assert!(
-        !r.corr.gated_before_waiting.contains_key(&id),
-        "resurrect must evict the dead life's gated_before_waiting entry"
+        !r.corr.action_requests.contains(&id),
+        "resurrect must evict the dead life's action request"
     );
     assert!(
         !r.pending_b1_cascades.contains_key(&id),
@@ -916,11 +915,11 @@ fn correlation_maps_stay_bounded_across_a_long_stream() {
     const ITERS: u64 = 3_000;
     const MAP_NAMES: [&str; 7] = [
         "recent_hook_tool_uses",
-        "active_tasks",
+        "tasks_in_flight",
         "recent_task_drains",
         "lifecycles",
         "recent_proof_of_life",
-        "gated_before_waiting",
+        "action_requests",
         "counted_calls",
     ];
 
@@ -951,7 +950,7 @@ fn correlation_maps_stay_bounded_across_a_long_stream() {
         );
         r.apply(
             &mut scene,
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id: a,
                 tool_use_id: Some("task1".into()),
                 detail: Some(ToolDetail::Task),
@@ -961,7 +960,7 @@ fn correlation_maps_stay_bounded_across_a_long_stream() {
         );
         r.apply(
             &mut scene,
-            AgentEvent::ActivityEnd {
+            AgentEvent::ToolUseEnd {
                 agent_id: a,
                 tool_use_id: Some("task1".into()),
             },
@@ -970,7 +969,7 @@ fn correlation_maps_stay_bounded_across_a_long_stream() {
         );
         r.apply(
             &mut scene,
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id: a,
                 tool_use_id: Some("gate1".into()),
                 detail: Some(ToolDetail::Generic {
@@ -982,11 +981,11 @@ fn correlation_maps_stay_bounded_across_a_long_stream() {
         );
         r.apply(
             &mut scene,
-            AgentEvent::Waiting {
-                agent_id: a,
-                reason: "perm".into(),
-                tool_use_id: None,
-            },
+            AgentEvent::user_action_request(
+                a,
+                Some("perm".into()),
+                crate::source::RequestKeys::default(),
+            ),
             now,
             Transport::Hook,
         );
@@ -1015,11 +1014,11 @@ fn correlation_maps_stay_bounded_across_a_long_stream() {
             now,
             Transport::Hook,
         );
-        // An ORPHAN Task (no SessionStart, so no slot) leaves an active_tasks
+        // An ORPHAN Task (no SessionStart, so no slot) leaves an tasks_in_flight
         // entry reaped ONLY by tick's slot-removal retain.
         r.apply(
             &mut scene,
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id: AgentId::from_parts("claude-code", &format!("o{i}")),
                 tool_use_id: Some("orphan".into()),
                 detail: Some(ToolDetail::Task),
@@ -1033,11 +1032,11 @@ fn correlation_maps_stay_bounded_across_a_long_stream() {
 
         let lens = [
             r.corr.recent_hook_tool_uses.len(),
-            r.corr.active_tasks.len(),
+            r.corr.tasks_in_flight.len(),
             r.corr.recent_task_drains.len(),
             r.corr.lifecycles.len(),
             r.corr.recent_proof_of_life.len(),
-            r.corr.gated_before_waiting.len(),
+            r.corr.action_requests.len(),
             r.corr
                 .counted_calls
                 .values()
@@ -1146,4 +1145,256 @@ fn the_stale_sweep_logs_the_wire_label_escaped() {
         out.contains(r"re\u{1b}]0;pwned\u{7}po\u{202e}Z"),
         "escaped, not dropped: {out:?}"
     );
+}
+
+/// An open turn showing no item is the agent between items, alive by its
+/// turn: it is reaped on neither the tool's window alone nor the idle one.
+#[test]
+fn an_open_turn_showing_no_item_keeps_the_longer_of_the_tool_and_idle_windows() {
+    use super::{STALE_IDLE_TIMEOUT, STALE_TOOL_TIMEOUT, stale_threshold_with_caps};
+    use crate::source::registry::{ChildEndInference, SourceCaps};
+    use crate::source::{AgentEvent, Transport};
+    use crate::state::{ActivityState, TurnKey};
+    use crate::{AgentId, Reducer, SceneState};
+    use std::time::SystemTime;
+    let caps = |short_idle: bool| SourceCaps {
+        has_exit_signal: !short_idle,
+        resurrects_on_prompt: true,
+        delegations_are_hook_silent: false,
+        child_end_inference: ChildEndInference::None,
+        child_hooks_unnamed: false,
+        brackets_turns: true,
+    };
+    let mut scene = SceneState::uniform(4);
+    let mut r = Reducer::new();
+    let id = AgentId::from_parts("opencode", "ses_p");
+    r.apply(
+        &mut scene,
+        AgentEvent::SessionStart {
+            agent_id: id,
+            source: "opencode".into(),
+            session_id: "/p".into(),
+            cwd: "/p".into(),
+            parent_id: None,
+        },
+        SystemTime::UNIX_EPOCH,
+        Transport::Hook,
+    );
+    r.apply(
+        &mut scene,
+        AgentEvent::TurnStart {
+            agent_id: id,
+            turn: TurnKey::Seq(1),
+        },
+        SystemTime::UNIX_EPOCH,
+        Transport::Hook,
+    );
+    let slot = &scene.agents[&id];
+    assert_eq!(slot.state, ActivityState::Running { item: None });
+    assert_eq!(
+        stale_threshold_with_caps(slot, Some(caps(true))),
+        STALE_TOOL_TIMEOUT,
+        "the short idle window is shorter than a tool's"
+    );
+    assert_eq!(
+        stale_threshold_with_caps(slot, Some(caps(false))),
+        STALE_IDLE_TIMEOUT
+    );
+}
+
+/// The turn axis over one agent's `Seq` stream, as `step` checks it after
+/// each event.
+mod turn_property {
+    use std::time::{Duration, SystemTime};
+
+    use proptest::prelude::*;
+
+    use crate::source::{AgentEvent, RequestKeys, ToolDetail, Transport};
+    use crate::state::turns::SeqOracle;
+    use crate::state::{ActivityState, TurnKey};
+    use crate::{AgentId, Reducer, SceneState};
+
+    fn id() -> AgentId {
+        AgentId::from_parts("opencode", "ses_p")
+    }
+
+    fn t(at: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + at)
+    }
+
+    #[derive(Clone, Debug)]
+    pub(super) enum Ev {
+        Start(u64),
+        End(Option<u64>),
+        Tool(u8),
+        ToolEnd(u8),
+        Task(u8),
+        Raise { call: Option<u8>, turn: Option<u64> },
+    }
+
+    impl Ev {
+        fn event(&self) -> AgentEvent {
+            let call = |c: &u8| format!("c{c}");
+            match self {
+                Ev::Start(k) => AgentEvent::TurnStart {
+                    agent_id: id(),
+                    turn: TurnKey::Seq(*k),
+                },
+                Ev::End(k) => AgentEvent::TurnEnd {
+                    agent_id: id(),
+                    turn: k.map(TurnKey::Seq),
+                },
+                Ev::Tool(c) => AgentEvent::ToolUseStart {
+                    agent_id: id(),
+                    tool_use_id: Some(call(c)),
+                    detail: Some(ToolDetail::from("bash")),
+                },
+                Ev::Task(c) => AgentEvent::ToolUseStart {
+                    agent_id: id(),
+                    tool_use_id: Some(call(c)),
+                    detail: Some(ToolDetail::Task),
+                },
+                Ev::ToolEnd(c) => AgentEvent::ToolUseEnd {
+                    agent_id: id(),
+                    tool_use_id: Some(call(c)),
+                },
+                Ev::Raise { call: c, turn } => AgentEvent::user_action_request(
+                    id(),
+                    Some("permission".into()),
+                    RequestKeys {
+                        tool_use_id: c.as_ref().map(call),
+                        turn: turn.map(TurnKey::Seq),
+                        ..RequestKeys::default()
+                    },
+                ),
+            }
+        }
+    }
+
+    fn see(oracle: &mut SeqOracle, ev: &Ev) {
+        match ev {
+            Ev::Start(k) => oracle.start(*k),
+            Ev::End(k) => oracle.end(*k),
+            _ => {}
+        }
+    }
+
+    pub(super) fn seeded() -> (Reducer, SceneState) {
+        let mut scene = SceneState::uniform(4);
+        let mut r = Reducer::new();
+        r.apply(
+            &mut scene,
+            AgentEvent::SessionStart {
+                agent_id: id(),
+                source: "opencode".into(),
+                session_id: "ses_p".into(),
+                cwd: "/p".into(),
+                parent_id: None,
+            },
+            t(0),
+            Transport::Hook,
+        );
+        (r, scene)
+    }
+
+    /// Apply `ev` as the `n`th event and check the property after it.
+    pub(super) fn step(
+        r: &mut Reducer,
+        scene: &mut SceneState,
+        oracle: &mut SeqOracle,
+        n: u64,
+        ev: &Ev,
+    ) -> Result<(), String> {
+        r.apply(scene, ev.event(), t(n), Transport::Hook);
+        see(oracle, ev);
+        let state = &scene.agents[&id()].state;
+        let open = r.corr.turns.open(&id()).cloned();
+        if *state == (ActivityState::Running { item: None }) && open.is_none() {
+            return Err(format!(
+                "after {ev:?}: Running with no item and no turn open"
+            ));
+        }
+        if open.is_some() && *state == ActivityState::Idle {
+            return Err(format!("after {ev:?}: Idle with turn {open:?} open"));
+        }
+        if open != oracle.open() {
+            return Err(format!(
+                "after {ev:?}: turn {open:?} open, the stream's newest unended start is {:?}",
+                oracle.open()
+            ));
+        }
+        Ok(())
+    }
+
+    fn ev() -> impl Strategy<Value = Ev> {
+        let call = 0u8..3;
+        prop_oneof![
+            (0u64..5).prop_map(Ev::Start),
+            proptest::option::of(0u64..5).prop_map(Ev::End),
+            call.clone().prop_map(Ev::Tool),
+            call.clone().prop_map(Ev::ToolEnd),
+            call.clone().prop_map(Ev::Task),
+            (proptest::option::of(call), proptest::option::of(0u64..5))
+                .prop_map(|(call, turn)| Ev::Raise { call, turn }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn every_event_keeps_the_turn_axis_property(evs in proptest::collection::vec(ev(), 0..24)) {
+            let (mut r, mut scene) = seeded();
+            let mut oracle = SeqOracle::default();
+            for (n, ev) in (1..).zip(&evs) {
+                if let Err(e) = step(&mut r, &mut scene, &mut oracle, n, ev) {
+                    return Err(TestCaseError::fail(e));
+                }
+            }
+        }
+    }
+}
+
+/// Every order of two turns' brackets and a request gated in the first, on a
+/// `Seq` stream, keeps the turn-axis property after each event.
+#[test]
+fn every_order_of_two_turns_and_a_gated_request_keeps_the_property() {
+    use crate::state::turns::SeqOracle;
+    use turn_property::{Ev, seeded, step};
+    let events = [
+        Ev::Start(1),
+        Ev::End(Some(1)),
+        Ev::Start(2),
+        Ev::End(Some(2)),
+        Ev::Raise {
+            call: None,
+            turn: Some(1),
+        },
+    ];
+    let mut orders = 0;
+    let mut check = |order: &[usize]| {
+        let (mut r, mut scene) = seeded();
+        let mut oracle = SeqOracle::default();
+        for (n, &i) in (1..).zip(order) {
+            if let Err(e) = step(&mut r, &mut scene, &mut oracle, n, &events[i]) {
+                panic!("order {order:?}: {e}");
+            }
+        }
+        orders += 1;
+    };
+    // Heap's algorithm: every permutation once.
+    let mut order: Vec<usize> = (0..events.len()).collect();
+    let mut c = vec![0; order.len()];
+    check(&order);
+    let mut i = 0;
+    while i < order.len() {
+        if c[i] < i {
+            order.swap(if i % 2 == 0 { 0 } else { c[i] }, i);
+            check(&order);
+            c[i] += 1;
+            i = 0;
+        } else {
+            c[i] = 0;
+            i += 1;
+        }
+    }
+    assert_eq!(orders, 120, "5! orders");
 }

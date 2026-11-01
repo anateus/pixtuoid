@@ -25,7 +25,7 @@ use winit::window::{ResizeDirection, Window, WindowId, WindowLevel};
 
 use super::offscreen::{OfficeRenderer, WindowFrame};
 use crate::config::{self, FloatingConfig};
-use pixtuoid_scene::cutaway::Face;
+use pixtuoid_scene::cutaway::chrome_cell;
 use pixtuoid_scene::floor::{FloorInputs, FloorMeta, PetInputs};
 use pixtuoid_scene::look::Place;
 use pixtuoid_scene::theme::Theme;
@@ -128,7 +128,7 @@ impl Stop {
 pub(crate) struct Settings {
     pub(crate) config_path: PathBuf,
     pub(crate) audio: config::AudioConfig,
-    pub(crate) log: Option<crate::run_log::LogLocation>,
+    pub(crate) log: crate::run_log::LogLocation,
     pub(crate) first_run: bool,
 }
 
@@ -433,7 +433,6 @@ impl FloatingApp {
         let now = self.ui.now();
         let world = FloorInputs {
             scene: &scene,
-            pack: &self.pack,
             now,
             floor: floor_meta,
             pets: PetInputs {
@@ -475,7 +474,7 @@ impl FloatingApp {
             window: (win_w, win_h),
             footer: self.renderer.footer(
                 &scene,
-                super::overlays::footer_budget(win_w as usize, Face::chrome(at)),
+                super::overlays::footer_budget(win_w as usize, chrome_cell(at)),
                 audio_audible,
                 volume_flash,
                 self.live
@@ -503,7 +502,7 @@ impl FloatingApp {
                 .map(|tip| (tip, (cursor.0 as i32, cursor.1 as i32))),
             panels: super::overlays::panels_grid(
                 &frames,
-                super::overlays::panel_cells((win_w, win_h), Face::chrome(at)),
+                super::overlays::panel_cells((win_w, win_h), chrome_cell(at)),
                 now,
                 self.theme,
             ),

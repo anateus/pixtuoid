@@ -41,7 +41,6 @@ pub(crate) fn paint_connection_panel(
     let &ConnectionFrame {
         open: _,
         ref rows,
-        ref live,
         selected,
         confirm,
         ref result,
@@ -65,18 +64,15 @@ pub(crate) fn paint_connection_panel(
     let list: Vec<Line<'static>> = rows
         .iter()
         .enumerate()
-        .map(|(i, row)| {
-            let li = live.get(i).cloned().unwrap_or_default();
-            connection_line(row, &li, selected == i, now, theme)
-        })
+        .map(|(i, (row, live))| connection_line(row, live, selected == i, now, theme))
         .collect();
 
     let detail = if let Some(ci) = confirm {
-        let name = rows.get(ci).map_or("", |r| r.display_name);
+        let name = rows.get(ci).map_or("", |(r, _)| r.display_name);
         format!("\u{26a0} disconnect {name}? (y/n)")
     } else if let Some(res) = result {
         res.clone()
-    } else if let Some(row) = rows.get(selected) {
+    } else if let Some((row, _)) = rows.get(selected) {
         if let Some(h) = &row.health {
             h.clone()
         } else {
@@ -144,7 +140,7 @@ fn connection_line(
     };
 
     let (c_glyph, c_text, c_color) = match row.state {
-        ConnState::Connected => ('\u{25cf}', "connected", theme.ui.label_active),
+        ConnState::Connected => ('\u{25cf}', "connected", theme.ui.label_ok),
         ConnState::Disconnected => ('\u{25cb}', "disconnected", theme.ui.label_idle),
         ConnState::NoCli { .. } => ('\u{2014}', "no CLI", theme.ui.label_idle),
     };
@@ -155,7 +151,7 @@ fn connection_line(
         (
             '\u{26a0}',
             "transport died".to_string(),
-            theme.ui.label_waiting,
+            theme.ui.label_warn,
         )
     } else {
         match &live.facet {
@@ -172,7 +168,7 @@ fn connection_line(
                 (
                     '\u{25cf}',
                     format!("{agents} agent{plural} \u{00b7} {age} ago"),
-                    theme.ui.label_active,
+                    theme.ui.label_ok,
                 )
             }
             // Zero instances reports the OBSERVATION, not a verdict: presence is
@@ -225,7 +221,7 @@ fn connection_line(
         Span::styled(conn_cell, base.fg(to_color(c_color))),
         Span::styled(
             health_flag.to_string(),
-            base.fg(to_color(theme.ui.label_waiting)),
+            base.fg(to_color(theme.ui.label_warn)),
         ),
         Span::styled(format!("{l_glyph} {l_text}"), base.fg(to_color(l_color))),
     ])
@@ -388,7 +384,7 @@ mod tests {
             "a zero-instance daemon must report no count: {stopped}"
         );
         for live_word in [
-            pixtuoid_scene::neon_sign::gateway_label(DaemonState::Busy),
+            pixtuoid_scene::neon_sign::gateway_label(DaemonState::Running),
             pixtuoid_scene::neon_sign::gateway_label(DaemonState::Degraded),
             pixtuoid_scene::neon_sign::gateway_label(DaemonState::Down),
         ] {
@@ -398,11 +394,13 @@ mod tests {
             );
         }
 
-        let busy = cell(daemon_facet(2, DaemonState::Busy));
-        assert!(busy.contains("2 gateways"), "{busy}");
+        let running = cell(daemon_facet(2, DaemonState::Running));
+        assert!(running.contains("2 gateways"), "{running}");
         assert!(
-            busy.contains(pixtuoid_scene::neon_sign::gateway_label(DaemonState::Busy)),
-            "the state word must be the shared board vocabulary: {busy}"
+            running.contains(pixtuoid_scene::neon_sign::gateway_label(
+                DaemonState::Running
+            )),
+            "the state word must be the shared board vocabulary: {running}"
         );
 
         let one = cell(daemon_facet(1, DaemonState::Degraded));

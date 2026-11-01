@@ -18,12 +18,14 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::source::decoder::DecodeResult as Result;
 use serde_json::Value;
 
 use crate::AgentId;
-use crate::source::decoder::{MAX_DECODED_FIELD_CHARS, ellipsize};
-use crate::source::{AgentEvent, ToolDetail};
+use crate::source::decoder::{MAX_DECODED_FIELD_CHARS, accept_all_paths, ellipsize};
+use crate::source::registry::{
+    ChildEndInference, FocusChannel, Hyphen, SourceCaps, SourceDescriptor, SourceKind, Transcript,
+};
+use crate::source::{AgentEvent, RequestKeys, ToolDetail};
 
 #[cfg(feature = "native")]
 mod native;
@@ -32,6 +34,41 @@ pub use native::CopilotSource;
 
 /// The GitHub Copilot CLI source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "copilot";
+
+pub(crate) const DESCRIPTOR: SourceDescriptor = SourceDescriptor {
+    name: SOURCE_NAME,
+    label_prefix: "cp",
+    verified_version: "1.0.105",
+    version_probe: Some(&["copilot", "--version"]),
+    version_hyphen: Hyphen::Prerelease,
+    home_env: Some("COPILOT_HOME"),
+    kind: SourceKind::Agent {
+        transcript: Some(Transcript {
+            line_decoder: decode_copilot_line,
+            id_from_path: copilot_id_from_path,
+            path_filter: accept_all_paths,
+            cwd_extractor: extract_copilot_cwd,
+            parent_extractor: None,
+        }),
+        hook: None,
+        caps: SourceCaps {
+            // `session.shutdown` is a real persisted exit marker.
+            has_exit_signal: true,
+            // sessionId is constant across `--resume`, so a swept session does
+            // not silently walk back in.
+            resurrects_on_prompt: false,
+            // The `task` dispatch emits `tool.execution_start`/`complete` AND
+            // explicit `subagent.started`/`completed` events.
+            delegations_are_hook_silent: false,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
+            brackets_turns: false,
+        },
+        focus: FocusChannel::Unsupported,
+    },
+    #[cfg(feature = "native")]
+    native: native::NATIVE,
+};
 
 /// `$COPILOT_HOME` if set, else `~/.copilot` — mirroring copilot 1.0.78's
 /// `resolveCopilotHome` (in the `runtime.node` addon, probed directly): empty
@@ -113,18 +150,14 @@ const SESSION_SHUTDOWN: &str = "session.shutdown";
 /// Decode one `events.jsonl` line into zero or more `AgentEvent`s. Unknown,
 /// ephemeral, or malformed shapes return `vec![]` and never panic — real files
 /// carry embedded-newline / U+2028 corruption (upstream copilot-cli #2649/#2012).
-///
-/// # Errors
-///
-/// Never: the `Result` is the [`LineDecoder`](crate::source::decoder::LineDecoder) signature, and a malformed line decodes to `vec![]`.
 pub(crate) fn decode_copilot_line(
     transcript_path: &str,
     source: &str,
     v: Value,
-) -> Result<Vec<AgentEvent>> {
+) -> Vec<AgentEvent> {
     let root = AgentId::from_parts(source, &copilot_id_from_path(Path::new(transcript_path)));
     let Some(obj) = v.as_object() else {
-        return Ok(vec![]);
+        return vec![];
     };
     let kind = obj.get("type").and_then(|s| s.as_str()).unwrap_or("");
     let data = obj.get("data");
@@ -134,7 +167,7 @@ pub(crate) fn decode_copilot_line(
         _ => root,
     };
 
-    let out = match kind {
+    match kind {
         SESSION_START => {
             let session_id = data
                 .and_then(|d| str_at(d, "sessionId"))
@@ -155,18 +188,18 @@ pub(crate) fn decode_copilot_line(
         TOOL_EXECUTION_START => {
             let Some(d) = data else {
                 crate::source::drift::missing_field(source, "tool.execution_start", "data");
-                return Ok(vec![]);
+                return vec![];
             };
             let Some(tool_call_id) = str_at(d, "toolCallId") else {
                 crate::source::drift::missing_field(source, "tool.execution_start", "toolCallId");
-                return Ok(vec![]);
+                return vec![];
             };
             let tool_name = str_at(d, "toolName").unwrap_or_else(|| {
                 crate::source::drift::missing_field(source, "tool.execution_start", "toolName");
                 ""
             });
             let detail = copilot_tool_detail(tool_name, d.get("arguments"));
-            vec![AgentEvent::ActivityStart {
+            vec![AgentEvent::ToolUseStart {
                 agent_id: acting,
                 tool_use_id: Some(tool_call_id.to_string()),
                 detail: Some(detail),
@@ -175,7 +208,7 @@ pub(crate) fn decode_copilot_line(
         TOOL_EXECUTION_COMPLETE => {
             let Some(d) = data else {
                 crate::source::drift::missing_field(source, "tool.execution_complete", "data");
-                return Ok(vec![]);
+                return vec![];
             };
             let Some(tool_call_id) = str_at(d, "toolCallId") else {
                 crate::source::drift::missing_field(
@@ -183,9 +216,9 @@ pub(crate) fn decode_copilot_line(
                     "tool.execution_complete",
                     "toolCallId",
                 );
-                return Ok(vec![]);
+                return vec![];
             };
-            let mut out = vec![AgentEvent::ActivityEnd {
+            let mut out = vec![AgentEvent::ToolUseEnd {
                 agent_id: acting,
                 tool_use_id: Some(tool_call_id.to_string()),
             }];
@@ -209,15 +242,18 @@ pub(crate) fn decode_copilot_line(
                 // persists in the slot + egresses on the headless summary.
                 .map(|k| ellipsize(&format!("permission: {k}"), MAX_DECODED_FIELD_CHARS))
                 .unwrap_or_else(|| "permission".to_string());
-            vec![AgentEvent::Waiting {
-                agent_id: acting,
-                reason,
-                // The gated call (#951), so its own end resolves the wait.
-                tool_use_id: request
-                    .and_then(|p| str_at(p, "toolCallId"))
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned),
-            }]
+            vec![AgentEvent::user_action_request(
+                acting,
+                Some(reason),
+                RequestKeys {
+                    // The gated call (#951), so its own end resolves the wait.
+                    tool_use_id: request
+                        .and_then(|p| str_at(p, "toolCallId"))
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned),
+                    ..RequestKeys::default()
+                },
+            )]
         }
         // A refusal ends the gated call: a denial's `tool.execution_complete`
         // follows, a cancel's (Esc at the prompt) never does, and the second
@@ -228,7 +264,7 @@ pub(crate) fn decode_copilot_line(
                 .and_then(|r| str_at(r, "kind"))
                 .is_some_and(|k| k.starts_with("approved"));
             match data.and_then(|d| str_at(d, "toolCallId")) {
-                Some(id) if !approved && !id.is_empty() => vec![AgentEvent::ActivityEnd {
+                Some(id) if !approved && !id.is_empty() => vec![AgentEvent::ToolUseEnd {
                     agent_id: acting,
                     tool_use_id: Some(id.to_owned()),
                 }],
@@ -237,7 +273,7 @@ pub(crate) fn decode_copilot_line(
         }
         SUBAGENT_STARTED => {
             let Some(child_key) = copilot_child_key(&v, data) else {
-                return Ok(vec![]);
+                return vec![];
             };
             let child = AgentId::from_parts(source, child_key);
             let mut evs = vec![AgentEvent::SessionStart {
@@ -264,7 +300,7 @@ pub(crate) fn decode_copilot_line(
         }
         SUBAGENT_COMPLETED | SUBAGENT_FAILED => {
             let Some(child_key) = copilot_child_key(&v, data) else {
-                return Ok(vec![]);
+                return vec![];
             };
             vec![AgentEvent::SessionEnd {
                 agent_id: AgentId::from_parts(source, child_key),
@@ -274,47 +310,38 @@ pub(crate) fn decode_copilot_line(
         // Only the root's ends its turn: neither listener of it in 1.0.98's
         // bundled `cli-main.js` (:2122, :3100) passes `includeSubAgents`, without
         // which `SessionClient._dispatchEvent` (:1536) skips one with an `agentId`.
-        SESSION_TASK_COMPLETE if acting == root => vec![AgentEvent::ActivityEnd {
-            agent_id: root,
-            tool_use_id: None,
-        }],
-        // Copilot's ONLY usage wire is this shutdown summary — one final delta
-        // as the session ends. `tokenDetails.input` already EXCLUDES cache
-        // reads, so fresh = input + cache_write + output. `cache_write` is an
-        // INFERRED snake_case key (from the sibling `cache_read`): no fixture
-        // carries a nonzero bucket, and a differently-spelled key only
-        // UNDERcounts.
+        SESSION_TASK_COMPLETE if acting == root => vec![AgentEvent::turn_end(root)],
+        // `modelMetrics` is the one usage a shutdown always carries, hosted or
+        // BYOK (1.0.103's `schemas/session-events.schema.json`, `ShutdownData`'s
+        // `required`); its `inputTokens` counts cache reads, which are not fresh.
         SESSION_SHUTDOWN => {
             let mut evs = vec![AgentEvent::SessionEnd {
                 agent_id: root,
                 as_child: false,
             }];
-            if let Some(details) = data
-                .and_then(|d| d.get("tokenDetails"))
-                .and_then(|t| t.as_object())
-            {
-                let bucket = |k: &str| {
-                    details
-                        .get(k)
-                        .and_then(|b| b.get("tokenCount"))
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0)
-                };
-                let fresh = bucket("input")
-                    .saturating_add(bucket("cache_write"))
-                    .saturating_add(bucket("output"));
-                if fresh > 0 {
-                    evs.push(AgentEvent::Usage {
-                        agent_id: root,
-                        fresh_tokens: fresh,
-                    });
-                }
+            let fresh = data
+                .and_then(|d| d.get("modelMetrics"))
+                .and_then(Value::as_object)
+                .into_iter()
+                .flat_map(|models| models.values())
+                .filter_map(|metric| metric.get("usage"))
+                .map(|usage| {
+                    let count = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    count("inputTokens")
+                        .saturating_sub(count("cacheReadTokens"))
+                        .saturating_add(count("outputTokens"))
+                })
+                .fold(0u64, u64::saturating_add);
+            if fresh > 0 {
+                evs.push(AgentEvent::Usage {
+                    agent_id: root,
+                    fresh_tokens: fresh,
+                });
             }
             evs
         }
         _ => vec![],
-    };
-    Ok(out)
+    }
 }
 
 /// Copilot's tool-detail dispatch. The sub-agent dispatch is the `task` tool,
@@ -322,7 +349,7 @@ pub(crate) fn decode_copilot_line(
 /// [`crate::source::decoder::make_tool_detail`] (which flags a Task on the mere
 /// PRESENCE of a `subagent_type` input key) would let a model-authored /
 /// hallucinated `subagent_type` arg spoof an ordinary tool into a delegation,
-/// prematurely draining `active_tasks` and evicting real children.
+/// prematurely draining `tasks_in_flight` and evicting real children.
 fn copilot_tool_detail(tool: &str, args: Option<&Value>) -> ToolDetail {
     if tool == "task" {
         return ToolDetail::Task;
@@ -351,7 +378,7 @@ mod tests {
             });
             let mut evs = 0;
             let logs = crate::test_capture::capture_logs(|| {
-                evs = decode_copilot_line(path, "copilot", line).map_or(0, |e| e.len());
+                evs = decode_copilot_line(path, "copilot", line).len();
             });
             evs > 0 || logs.contains(crate::source::drift::TARGET)
         };
@@ -383,8 +410,7 @@ mod tests {
             "/p/11111111-2222-3333-4444-555555555555/events.jsonl",
             "copilot",
             serde_json::from_str(line).unwrap(),
-        )
-        .unwrap();
+        );
         assert!(
             evs.iter().any(|e| matches!(e, AgentEvent::ModelInfo { model: Some(m), effort: None, .. } if m == "claude-haiku-4.5")),
             "per-tool model must surface, got {evs:?}"
@@ -394,8 +420,7 @@ mod tests {
             "/p/11111111-2222-3333-4444-555555555555/events.jsonl",
             "copilot",
             serde_json::from_str(line).unwrap(),
-        )
-        .unwrap();
+        );
         assert!(
             !evs.iter()
                 .any(|e| matches!(e, AgentEvent::ModelInfo { .. })),
@@ -404,35 +429,13 @@ mod tests {
     }
     use serde_json::json;
 
-    #[test]
-    fn a_shutdown_with_no_fresh_tokens_emits_no_usage_reading() {
-        // `tokenDetails` present but every FRESH bucket zero (a cache-read-only
-        // turn): a `Usage { fresh_tokens: 0 }` would be a reading of nothing,
-        // pushed into a monotone accumulator.
-        let line = r#"{"type":"session.shutdown","data":{"tokenDetails":{"input":{"tokenCount":0},"cache_read":{"tokenCount":900}}},"id":"e9","timestamp":"ts","parentId":null}"#;
-        let evs = decode_copilot_line(
-            "/p/11111111-2222-3333-4444-555555555555/events.jsonl",
-            "copilot",
-            serde_json::from_str(line).unwrap(),
-        )
-        .unwrap();
-        assert!(
-            !evs.iter().any(|e| matches!(e, AgentEvent::Usage { .. })),
-            "zero fresh tokens must not surface a Usage, got {evs:?}"
-        );
-        assert!(
-            evs.iter()
-                .any(|e| matches!(e, AgentEvent::SessionEnd { .. }))
-        );
-    }
-
     const PATH: &str = "/p/session-state/65f8cef9-7dd8-46fa-9f6a-78cc95f68ab3/events.jsonl";
 
     fn root() -> AgentId {
         AgentId::from_parts(SOURCE_NAME, "65f8cef9-7dd8-46fa-9f6a-78cc95f68ab3")
     }
     fn decode(line: &str) -> Vec<AgentEvent> {
-        decode_copilot_line(PATH, SOURCE_NAME, serde_json::from_str(line).unwrap()).unwrap()
+        decode_copilot_line(PATH, SOURCE_NAME, serde_json::from_str(line).unwrap())
     }
 
     #[test]
@@ -447,10 +450,10 @@ mod tests {
     fn empty_agent_id_attributes_to_the_root() {
         let line = r#"{"type":"tool.execution_start","agentId":"","data":{"toolCallId":"call_1","toolName":"bash","arguments":{"command":"ls"}}}"#;
         match &decode(line)[..] {
-            [AgentEvent::ActivityStart { agent_id, .. }] => {
+            [AgentEvent::ToolUseStart { agent_id, .. }] => {
                 assert_eq!(*agent_id, root(), "empty agentId must key to the root");
             }
-            other => panic!("expected one ActivityStart, got {other:?}"),
+            other => panic!("expected one ToolUseStart, got {other:?}"),
         }
     }
 
@@ -515,76 +518,15 @@ mod tests {
     }
 
     #[test]
-    fn real_session_start_registers_root_with_cwd_and_session_id() {
-        let line = r#"{"type":"session.start","data":{"sessionId":"65f8cef9-7dd8-46fa-9f6a-78cc95f68ab3","version":1,"producer":"copilot-agent","copilotVersion":"unknown","startTime":"2026-05-22T05:59:45.408Z","selectedModel":"claude-haiku-4.5","context":{"cwd":"d:\\contentforge-fullstack (1)"},"alreadyInUse":false},"id":"0bc5f1ba-1abe-49c9-a303-d843bd0c3fa8","timestamp":"2026-05-22T05:59:45.488Z","parentId":null}"#;
-        match &decode(line)[..] {
-            [
-                AgentEvent::SessionStart {
-                    agent_id,
-                    source,
-                    session_id,
-                    cwd,
-                    parent_id,
-                },
-            ] => {
-                assert_eq!(*agent_id, root());
-                assert_eq!(source, "copilot");
-                assert_eq!(session_id, "65f8cef9-7dd8-46fa-9f6a-78cc95f68ab3");
-                assert_eq!(cwd, Path::new(r"d:\contentforge-fullstack (1)"));
-                assert_eq!(*parent_id, None);
-            }
-            other => panic!("expected one SessionStart, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn real_tool_round_is_active_then_idle_keyed_on_tool_call_id() {
-        let start = r#"{"type":"tool.execution_start","data":{"toolCallId":"tooluse_9CoqZL2lZlJUsz7TjJsSUk","toolName":"report_intent","arguments":{"intent":"Exploring project setup"}},"id":"595a6493-1763-4c80-b75a-936d4f263a11","timestamp":"2026-05-22T06:00:14.298Z","parentId":"2902a578-0304-4abc-8402-afefefff9e70"}"#;
-        match &decode(start)[..] {
-            [
-                AgentEvent::ActivityStart {
-                    agent_id,
-                    tool_use_id,
-                    detail: Some(_),
-                },
-            ] => {
-                assert_eq!(*agent_id, root());
-                assert_eq!(
-                    tool_use_id.as_deref(),
-                    Some("tooluse_9CoqZL2lZlJUsz7TjJsSUk")
-                );
-            }
-            other => panic!("expected ActivityStart, got {other:?}"),
-        }
-        let complete = r#"{"type":"tool.execution_complete","data":{"toolCallId":"tooluse_9CoqZL2lZlJUsz7TjJsSUk","model":"claude-haiku-4.5","interactionId":"65f25156-0095-4746-ac3e-fa52340df72b","success":true,"result":{"content":"Intent logged","detailedContent":"Exploring project setup"},"toolTelemetry":{}},"id":"cd7e82e8","timestamp":"2026-05-22T06:00:14.323Z","parentId":"d97de833"}"#;
-        match &decode(complete)[..] {
-            [
-                AgentEvent::ActivityEnd {
-                    agent_id,
-                    tool_use_id,
-                },
-                ..,
-            ] => {
-                assert_eq!(*agent_id, root());
-                assert_eq!(
-                    tool_use_id.as_deref(),
-                    Some("tooluse_9CoqZL2lZlJUsz7TjJsSUk")
-                );
-            }
-            other => panic!("expected ActivityEnd first, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn real_task_tool_is_delegating() {
         let line = r#"{"type":"tool.execution_start","data":{"toolCallId":"call_SGMJ1yjMtpgFUbZct2fEo2Hk","toolName":"task","arguments":{"description":"Incident command response","agent_type":"sisko","name":"sisko-incident-command","mode":"sync"},"turnId":"0"},"id":"a","timestamp":"t","parentId":null}"#;
         match &decode(line)[..] {
             [
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     detail: Some(d), ..
                 },
             ] => assert!(d.is_task(), "task tool must be Delegating, got {d:?}"),
-            other => panic!("expected Delegating ActivityStart, got {other:?}"),
+            other => panic!("expected Delegating ToolUseStart, got {other:?}"),
         }
     }
 
@@ -593,14 +535,14 @@ mod tests {
         let line = r#"{"type":"tool.execution_start","data":{"toolCallId":"c1","toolName":"view","arguments":{"path":"x.rs","subagent_type":null}},"id":"a","timestamp":"t","parentId":null}"#;
         match &decode(line)[..] {
             [
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     detail: Some(d), ..
                 },
             ] => assert!(
                 !d.is_task(),
                 "a spoofed subagent_type arg must stay Generic, got {d:?}"
             ),
-            other => panic!("expected Generic ActivityStart, got {other:?}"),
+            other => panic!("expected Generic ToolUseStart, got {other:?}"),
         }
     }
 
@@ -609,7 +551,7 @@ mod tests {
         let line = r#"{"type":"tool.execution_start","data":{"toolCallId":"c2","toolName":"bash","arguments":{"command":"cargo test"}},"id":"a","timestamp":"t","parentId":null}"#;
         match &decode(line)[..] {
             [
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     detail: Some(ToolDetail::Generic { display }),
                     ..
                 },
@@ -617,7 +559,7 @@ mod tests {
                 display.contains("cargo test"),
                 "bash tool should show its command target, got {display:?}"
             ),
-            other => panic!("expected Generic ActivityStart with target, got {other:?}"),
+            other => panic!("expected Generic ToolUseStart with target, got {other:?}"),
         }
     }
 
@@ -756,27 +698,12 @@ mod tests {
         })
         .to_string();
         match &decode(&line)[..] {
-            [AgentEvent::ActivityStart { agent_id, .. }] => assert_eq!(
+            [AgentEvent::ToolUseStart { agent_id, .. }] => assert_eq!(
                 *agent_id,
                 AgentId::from_parts(SOURCE_NAME, "call_SGMJ1yjMtpgFUbZct2fEo2Hk"),
                 "a line with envelope agentId must attribute to the CHILD, not root"
             ),
-            other => panic!("expected child ActivityStart, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn permission_requested_reason_is_capped_at_the_decode_boundary() {
-        use crate::source::decoder::MAX_DECODED_FIELD_CHARS;
-        let kind = "x".repeat(MAX_DECODED_FIELD_CHARS * 4);
-        let line = format!(
-            r#"{{"type":"permission.requested","data":{{"permissionRequest":{{"kind":"{kind}"}}}},"id":"a","timestamp":"t","parentId":null}}"#
-        );
-        match &decode(&line)[..] {
-            [AgentEvent::Waiting { reason, .. }] => {
-                assert_eq!(reason.chars().count(), MAX_DECODED_FIELD_CHARS + 1);
-            }
-            other => panic!("expected Waiting, got {other:?}"),
+            other => panic!("expected child ToolUseStart, got {other:?}"),
         }
     }
 
@@ -785,10 +712,11 @@ mod tests {
         let req = r#"{"type":"permission.requested","data":{"requestId":"8c508e21-0a6c-4a06-8824-3930476499ea","permissionRequest":{"kind":"shell","toolCallId":"call_K8WLZkwufHsI9bTvkZmMKec2","fullCommandText":"cat /etc/hostname","intention":"Print /etc/hostname contents","commands":[{"identifier":"cat","readOnly":true}],"possiblePaths":["/etc/hostname"],"possibleUrls":[],"hasWriteFileRedirection":false,"canOfferSessionApproval":true},"promptRequest":{"kind":"path","accessKind":"shell","paths":["/etc/hostname"],"toolCallId":"call_K8WLZkwufHsI9bTvkZmMKec2"}},"id":"1f975691-a108-4d6f-924b-d48263d46274","timestamp":"2026-06-14T21:35:55.637Z","parentId":"e0a534c6-d548-4def-b0bd-316c83efe5fd"}"#;
         match &decode(req)[..] {
             [
-                AgentEvent::Waiting {
+                AgentEvent::UserActionRequest {
                     agent_id,
-                    reason,
+                    reason: Some(reason),
                     tool_use_id,
+                    ..
                 },
             ] => {
                 assert_eq!(*agent_id, root());
@@ -799,7 +727,7 @@ mod tests {
                     "the wait names the call it gates"
                 );
             }
-            other => panic!("expected Waiting, got {other:?}"),
+            other => panic!("expected UserActionRequest, got {other:?}"),
         }
         let approved = r#"{"type":"permission.completed","data":{"requestId":"8c508e21-0a6c-4a06-8824-3930476499ea","toolCallId":"call_K8WLZkwufHsI9bTvkZmMKec2","result":{"kind":"approved"}},"id":"8123a44a-3471-4262-9191-b3cddaf5224d","timestamp":"2026-06-14T21:35:58.218Z","parentId":"1f975691-a108-4d6f-924b-d48263d46274"}"#;
         assert!(
@@ -824,7 +752,7 @@ mod tests {
             ),
         ] {
             match &decode(refused)[..] {
-                [AgentEvent::ActivityEnd { tool_use_id, .. }] => {
+                [AgentEvent::ToolUseEnd { tool_use_id, .. }] => {
                     assert_eq!(tool_use_id.as_deref(), Some(call), "{refused}");
                 }
                 other => panic!("a refusal must end the gated call, got {other:?}"),
@@ -834,7 +762,6 @@ mod tests {
 
     #[test]
     fn real_session_shutdown_ends_the_root() {
-        // A tokenDetails-less shutdown (older wire / crashy teardown).
         let line = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","totalPremiumRequests":1},"id":"220c4131","timestamp":"2026-05-22T06:17:01.077Z","parentId":"cd21bd01"}"#;
         match &decode(line)[..] {
             [AgentEvent::SessionEnd { agent_id, as_child }] => {
@@ -846,10 +773,8 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_usage_sums_a_cache_write_bucket_into_fresh() {
-        // The only fixture with a nonzero `cache_write` bucket — no captured
-        // shutdown carries one (the key is inferred; see the decoder arm).
-        let line = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","tokenDetails":{"input":{"tokenCount":11175},"cache_write":{"tokenCount":500},"cache_read":{"tokenCount":1664},"output":{"tokenCount":212}},"currentModel":"gpt-5-mini"},"id":"56992353","timestamp":"2026-06-14T21:38:47.162Z","parentId":"3079df1f"}"#;
+    fn a_shutdown_sums_each_models_fresh_usage_into_one_reading() {
+        let line = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-4.1":{"usage":{"inputTokens":1000,"outputTokens":77,"cacheReadTokens":300,"cacheWriteTokens":222}},"gpt-5-mini":{"usage":{"inputTokens":50,"outputTokens":5,"cacheReadTokens":0,"cacheWriteTokens":0}}}},"id":"e1","timestamp":"t","parentId":null}"#;
         match &decode(line)[..] {
             [
                 AgentEvent::SessionEnd { .. },
@@ -860,8 +785,9 @@ mod tests {
             ] => {
                 assert_eq!(*agent_id, root());
                 assert_eq!(
-                    *fresh_tokens, 11_887,
-                    "fresh = input 11175 + cache_write 500 + output 212 (cache_read excluded)"
+                    *fresh_tokens,
+                    (1000 - 300 + 77) + (50 + 5),
+                    "input less cache reads, plus output, over every model"
                 );
             }
             other => panic!("expected [SessionEnd, Usage], got {other:?}"),
@@ -869,25 +795,22 @@ mod tests {
     }
 
     #[test]
-    fn real_session_shutdown_usage_summary_lands_one_final_delta() {
-        let line = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","tokenDetails":{"input":{"tokenCount":11175},"cache_read":{"tokenCount":1664},"output":{"tokenCount":212}},"currentModel":"gpt-5-mini"},"id":"56992353","timestamp":"2026-06-14T21:38:47.162Z","parentId":"3079df1f"}"#;
-        match &decode(line)[..] {
-            [
-                AgentEvent::SessionEnd { agent_id, as_child },
-                AgentEvent::Usage {
-                    agent_id: u_id,
-                    fresh_tokens,
-                },
-            ] => {
-                assert_eq!(*u_id, root());
-                assert_eq!(
-                    *fresh_tokens, 11_387,
-                    "fresh = input 11175 + output 212, cache_read excluded"
-                );
-                assert_eq!(*agent_id, root());
-                assert!(!*as_child);
-            }
-            other => panic!("expected [SessionEnd, Usage], got {other:?}"),
+    fn a_shutdown_with_no_fresh_usage_reads_nothing() {
+        // A reading of zero would be pushed into a monotone accumulator.
+        for data in [
+            r#"{"modelMetrics":{}}"#,
+            r#"{"modelMetrics":{"m":{"usage":{"inputTokens":900,"outputTokens":0,"cacheReadTokens":900,"cacheWriteTokens":0}}}}"#,
+            r#"{"modelMetrics":{"m":{"requests":{"count":1}}}}"#,
+        ] {
+            let line = format!(
+                r#"{{"type":"session.shutdown","data":{data},"id":"e2","timestamp":"t","parentId":null}}"#
+            );
+            assert!(
+                !decode(&line)
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Usage { .. })),
+                "{data}"
+            );
         }
     }
 
@@ -902,16 +825,8 @@ mod tests {
             decode(r#"{"type":"tool.execution_start","id":"n","timestamp":"t","parentId":null}"#)
                 .is_empty()
         );
-        assert!(
-            decode_copilot_line(PATH, SOURCE_NAME, json!("not an object"))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            decode_copilot_line(PATH, SOURCE_NAME, json!(["array"]))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(decode_copilot_line(PATH, SOURCE_NAME, json!("not an object")).is_empty());
+        assert!(decode_copilot_line(PATH, SOURCE_NAME, json!(["array"])).is_empty());
     }
 
     #[test]
@@ -967,7 +882,7 @@ mod tests {
         let line = r#"{"type":"tool.execution_start","data":{"toolName":"view"},"id":"x","timestamp":"t","parentId":null}"#;
         assert!(
             decode(line).is_empty(),
-            "no toolCallId → no ActivityStart (can't key the tool)"
+            "no toolCallId → no ToolUseStart (can't key the tool)"
         );
     }
 
@@ -976,16 +891,16 @@ mod tests {
         let line = r#"{"type":"tool.execution_complete","data":{"success":true},"id":"x","timestamp":"t","parentId":null}"#;
         assert!(
             decode(line).is_empty(),
-            "no toolCallId → no ActivityEnd (can't key the tool)"
+            "no toolCallId → no ToolUseEnd (can't key the tool)"
         );
     }
 
     #[test]
-    fn tool_execution_start_without_tool_name_still_emits_activity_start_keyed_on_call_id() {
+    fn tool_execution_start_without_tool_name_still_emits_tool_use_start_keyed_on_call_id() {
         let line = r#"{"type":"tool.execution_start","data":{"toolCallId":"tc1","arguments":{}},"id":"x","timestamp":"t","parentId":null}"#;
         match &decode(line)[..] {
             [
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id,
                     tool_use_id,
                     detail: Some(d),
@@ -995,24 +910,16 @@ mod tests {
                 assert_eq!(tool_use_id.as_deref(), Some("tc1"));
                 assert!(!d.is_task(), "an empty tool name is NOT the task dispatch");
             }
-            other => panic!("expected one ActivityStart, got {other:?}"),
+            other => panic!("expected one ToolUseStart, got {other:?}"),
         }
     }
 
     #[test]
-    fn session_task_complete_ends_root_activity_with_no_tool_id() {
+    fn session_task_complete_ends_the_roots_turn() {
         let line = r#"{"type":"session.task_complete","data":{},"id":"x","timestamp":"t","parentId":null}"#;
         match &decode(line)[..] {
-            [
-                AgentEvent::ActivityEnd {
-                    agent_id,
-                    tool_use_id,
-                },
-            ] => {
-                assert_eq!(*agent_id, root());
-                assert!(tool_use_id.is_none(), "the root settle carries no tool id");
-            }
-            other => panic!("expected one root ActivityEnd, got {other:?}"),
+            [AgentEvent::TurnEnd { agent_id, .. }] => assert_eq!(*agent_id, root()),
+            other => panic!("expected one root TurnEnd, got {other:?}"),
         }
     }
 

@@ -28,10 +28,10 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import unittest
 from pathlib import Path
 
 from PIL import Image
-
 from readme_pixels import PACK_DIR, load_pack, sprite_path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -294,6 +294,22 @@ ICONS = {
             "K K K K K K K K K K",
         ]
     },
+    # the cutaway office: a terminal framing sky, sun, skyline and floor, so
+    # it reads as a picture where `window` reads as text
+    "cutaway": {
+        "grid": [
+            "K K K K K K K K K K",
+            "K M M M M M M M M K",
+            "K c c c c c c y y K",
+            "K c c c c c c y y K",
+            "K c n c c c n c c K",
+            "K n n c n c n n c K",
+            "K n n n n n n n n K",
+            "K D D D D D D D D K",
+            "K d D D d D D d D K",
+            "K K K K K K K K K K",
+        ]
+    },
 }
 
 
@@ -320,8 +336,6 @@ def sprite_rows(name, frame=0):
             continue
         if in_frame:
             rows.append(line.split())
-    if not rows:
-        sys.exit(f"gen-pix-icons: no @frame {frame} rows in {name}")
     return rows
 
 
@@ -332,10 +346,10 @@ def render(icon_name, rows, pal):
     assert px is not None
     for y, row in enumerate(rows):
         if len(row) != w:
-            sys.exit(f"gen-pix-icons: {icon_name} row {y} is ragged ({len(row)} != {w})")
+            sys.exit(
+                f"gen-pix-icons: {icon_name} row {y} is ragged ({len(row)} != {w})"
+            )
         for x, key in enumerate(row):
-            if key not in pal:
-                sys.exit(f"gen-pix-icons: {icon_name} uses unknown palette key {key!r}")
             rgb = pal[key]
             if rgb is not None:
                 px[x, y] = (*rgb, 255)
@@ -382,7 +396,8 @@ def emit(name, img, label, out_dir, check, work, stale):
                 str(out),
                 str(cand),
                 str(DIFF_DIR / f"diff-{label}-{name}.png"),
-            ]
+            ],
+            check=False,
         ).returncode
         if rc != 0:
             stale.append(f"{tag} (differs)")
@@ -423,7 +438,9 @@ def generate(site_dir, readme_dir, check, icons=ICONS):
         orphans = sorted(
             p
             for p in out_dir.iterdir()
-            if p.is_file() and not p.name.startswith(".") and (p.stem not in icons or p.suffix != f".{ext}")
+            if p.is_file()
+            and not p.name.startswith(".")
+            and (p.stem not in icons or p.suffix != f".{ext}")
         )
         if check and orphans:
             stale.append(f"{label}: orphaned {', '.join(p.name for p in orphans)}")
@@ -434,55 +451,64 @@ def generate(site_dir, readme_dir, check, icons=ICONS):
     return stale
 
 
-def selftest():
-    """A drift gate that cannot fail is no gate: each kind of drift fails, a dotfile does not."""
-    name = next(iter(ICONS))
-    fails = []
-    with tempfile.TemporaryDirectory() as tmp:
-        site, readme = Path(tmp, "site"), Path(tmp, "readme")
-        one = {name: ICONS[name]}
+class SelfTest(unittest.TestCase):
+    def test_each_kind_of_drift_fails_and_a_dotfile_does_not(self):
+        """A drift gate that cannot fail is no gate."""
+        name = next(iter(ICONS))
+        with tempfile.TemporaryDirectory() as tmp:
+            site, readme = Path(tmp, "site"), Path(tmp, "readme")
+            one = {name: ICONS[name]}
 
-        def stale():
-            return generate(site, readme, check=True, icons=one)
+            def stale():
+                return generate(site, readme, check=True, icons=one)
 
-        def expect(cond, what):
-            if not cond:
-                fails.append(f"{what}: {stale()}")
-
-        generate(site, readme, check=False, icons=one)
-        expect(stale() == [], "a fresh write is not stale")
-        for d in (site, readme):
-            (d / ".DS_Store").write_bytes(b"")
-        expect(stale() == [], "a dotfile is no orphan")
-        (readme / f"{name}.png").write_bytes(b"")
-        expect(stale() == [f"readme: orphaned {name}.png"], "an icon in the other format is an orphan")
-        (site / "gone.png").write_bytes(b"")
-        (readme / "gone.svg").write_bytes(b"")
-        readme_orphans = ", ".join(sorted(["gone.svg", f"{name}.png"]))
-        expect(stale() == ["site: orphaned gone.png", f"readme: orphaned {readme_orphans}"], "a removed icon's files are orphans")
-        generate(site, readme, check=False, icons=one)
-        left = {p.name for d in (site, readme) for p in d.iterdir()}
-        expect(left == {f"{name}.png", f"{name}.svg", ".DS_Store"}, "a write deletes the orphans and keeps the dotfiles")
-        out = readme / f"{name}.svg"
-        out.write_text(out.read_text(encoding="utf-8") + " ", encoding="utf-8")
-        expect(stale() == [f"readme/{name} (differs)"], "an edited SVG differs")
-        out.unlink()
-        expect(stale() == [f"readme/{name} (missing)"], "a deleted SVG is missing")
-    for f in fails:
-        print(f"FAIL: {f}", file=sys.stderr)
-    print(f"gen-pix-icons selftest: {'FAIL' if fails else 'ok'}")
-    return 1 if fails else 0
+            generate(site, readme, check=False, icons=one)
+            self.assertEqual(stale(), [], "a fresh write is not stale")
+            for d in (site, readme):
+                (d / ".DS_Store").write_bytes(b"")
+            self.assertEqual(stale(), [], "a dotfile is no orphan")
+            (readme / f"{name}.png").write_bytes(b"")
+            self.assertEqual(
+                stale(),
+                [f"readme: orphaned {name}.png"],
+                "an icon in the other format is an orphan",
+            )
+            (site / "gone.png").write_bytes(b"")
+            (readme / "gone.svg").write_bytes(b"")
+            readme_orphans = ", ".join(sorted(["gone.svg", f"{name}.png"]))
+            self.assertEqual(
+                stale(),
+                ["site: orphaned gone.png", f"readme: orphaned {readme_orphans}"],
+                "a removed icon's files are orphans",
+            )
+            generate(site, readme, check=False, icons=one)
+            self.assertEqual(
+                {p.name for d in (site, readme) for p in d.iterdir()},
+                {f"{name}.png", f"{name}.svg", ".DS_Store"},
+                "a write deletes the orphans and keeps the dotfiles",
+            )
+            out = readme / f"{name}.svg"
+            out.write_text(out.read_text(encoding="utf-8") + " ", encoding="utf-8")
+            self.assertEqual(
+                stale(), [f"readme/{name} (differs)"], "an edited SVG differs"
+            )
+            out.unlink()
+            self.assertEqual(
+                stale(), [f"readme/{name} (missing)"], "a deleted SVG is missing"
+            )
 
 
 def main():
     if "--selftest" in sys.argv[1:]:
-        sys.exit(selftest())
+        unittest.main(argv=sys.argv[:1])
     check = "--check" in sys.argv[1:]
     stale = generate(OUT, README_OUT, check)
     if stale:
         sys.exit(f"gen-pix-icons --check: {', '.join(stale)} — run just gen-icons")
     if check:
-        print(f"gen-pix-icons --check: OK ({len(ICONS)} icons match in both output dirs)")
+        print(
+            f"gen-pix-icons --check: OK ({len(ICONS)} icons match in both output dirs)"
+        )
 
 
 if __name__ == "__main__":

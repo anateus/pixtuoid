@@ -7,31 +7,30 @@
 //! tui_drive <source> <scenario> <log> <prompt> -- <program> [args...]
 //! ```
 //!
-//! Exits with the CLI's status; when the driver gave up or the `BUDGET` ran
-//! out, with what [`Driver::gave_up`] says; and `USAGE_ERROR` on a bad command
-//! line.
+//! Exits with the CLI's status; when the driver gave up or the [`BUDGET`] ran
+//! out, with what [`Driver::gave_up`] says, and why at [`GAVE_UP_NOTE`]; and
+//! `USAGE_ERROR` on a bad command line.
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::num::NonZeroU16;
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use pixtuoid_core::harness::hermetic::tui::{
-    Action, Answer, CommandLine, Driver, GAVE_UP, Key, Tui,
-};
-use pixtuoid_core::harness::hermetic::{self, Surface};
+use pixtuoid_core::harness::hermetic;
+use pixtuoid_core::harness::hermetic::tui::{Action, BUDGET, CommandLine, Driver, GAVE_UP, Key};
+use pixtuoid_core::harness::{DRIVER_DIR_ENV, GAVE_UP_NOTE};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
-/// How long one run may take, end to end, before the CLI is killed: well under
-/// the hermetic job's timeout, which every scenario of every CLI shares.
-const BUDGET: Duration = Duration::from_secs(120);
 /// How long a CLI may take to exit after its quit keys.
 const QUIT_GRACE: Duration = Duration::from_secs(10);
 /// How often the screen is re-judged when no output arrives.
 const TICK: Duration = Duration::from_millis(100);
 /// The pause between two writes, so a TUI reads keys one at a time, never as
-/// a paste.
-const KEY_GAP: Duration = Duration::from_millis(80);
+/// a paste: past codewhale's `PASTE_ENTER_SUPPRESS_WINDOW`, in which an Enter
+/// after typed text is a newline (`crates/tui/src/tui/paste_burst.rs:7` at v0.10.2).
+const KEY_GAP: Duration = Duration::from_millis(200);
 /// A size every CLI lays out in: a 0x0 pty renders nothing at all.
 const SIZE: PtySize = PtySize {
     rows: 40,
@@ -57,21 +56,26 @@ fn main() {
         eprintln!("{USAGE}");
         std::process::exit(USAGE_ERROR);
     };
-    let code = drive(line).unwrap_or_else(|e| {
-        eprintln!("tui_drive: {e}");
+    let code = drive(line, BUDGET).unwrap_or_else(|e| {
+        let why = format!("tui_drive: {e}");
+        eprintln!("{why}");
+        say_why(&why);
         GAVE_UP
     });
     std::process::exit(code);
 }
 
-fn tui_of(source: &str, scenario: &str) -> std::io::Result<(&'static Tui, Answer)> {
+/// `source`'s TUI `scenario`'s driver, typing `prompt` first.
+fn driver_of(
+    source: &str,
+    scenario: &str,
+    prompt: String,
+    now: Instant,
+) -> std::io::Result<Driver<'static>> {
     hermetic::profile(source)
         .ok_or_else(|| std::io::Error::other(format!("{source}: not a profiled source")))?
         .scenario(scenario)
-        .and_then(|s| match s.surface {
-            Surface::Tui { row, answer } => Some((row, answer)),
-            Surface::Headless => None,
-        })
+        .and_then(|s| s.tui_driver(prompt, now))
         .ok_or_else(|| std::io::Error::other(format!("{source}: no TUI scenario {scenario}")))
 }
 
@@ -79,28 +83,30 @@ fn tui_of(source: &str, scenario: &str) -> std::io::Result<(&'static Tui, Answer
 /// portable-pty's own base environment merges the Windows registry's over it
 /// (`src/cmdbuilder.rs:74-190` at 0.9.0), which would let a key set with
 /// `setx` past the tier's sandbox.
-fn command(argv: &[OsString], env: impl Iterator<Item = (OsString, OsString)>) -> CommandBuilder {
+fn command(
+    argv: &[OsString],
+    env: impl Iterator<Item = (OsString, OsString)>,
+) -> std::io::Result<CommandBuilder> {
     let mut cmd = CommandBuilder::from_argv(argv.to_vec());
     cmd.env_clear();
     for (k, v) in env {
         cmd.env(k, v);
     }
     cmd.env("TERM", TERM);
-    if let Ok(cwd) = std::env::current_dir() {
-        cmd.cwd(cwd);
-    }
-    cmd
+    cmd.cwd(std::env::current_dir()?);
+    Ok(cmd)
 }
 
-fn drive(line: CommandLine) -> std::io::Result<i32> {
-    let (tui, answer) = tui_of(&line.source, &line.scenario)?;
+fn drive(line: CommandLine, budget: Duration) -> std::io::Result<i32> {
+    let started = Instant::now();
+    let mut driver = driver_of(&line.source, &line.scenario, line.prompt, started)?;
     let mut log = std::fs::File::create(&line.log)?;
     let pair = NativePtySystem::default()
         .openpty(SIZE)
         .map_err(std::io::Error::other)?;
     let mut child = pair
         .slave
-        .spawn_command(command(&line.program, std::env::vars_os()))
+        .spawn_command(command(&line.program, std::env::vars_os())?)
         .map_err(std::io::Error::other)?;
     drop(pair.slave);
     let mut reader = pair
@@ -122,9 +128,7 @@ fn drive(line: CommandLine) -> std::io::Result<i32> {
         }
     });
 
-    let started = Instant::now();
-    let mut screen = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
-    let mut driver = Driver::new(tui, answer, line.prompt, started);
+    let mut screen = parser();
     let mut quit_at: Option<Instant> = None;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -136,10 +140,13 @@ fn drive(line: CommandLine) -> std::io::Result<i32> {
             return Ok(i32::try_from(status.exit_code()).unwrap_or(GAVE_UP));
         }
         let now = Instant::now();
-        let out_of_time = now.duration_since(started) >= BUDGET
-            || quit_at.is_some_and(|at| now.duration_since(at) >= QUIT_GRACE);
-        if out_of_time {
-            return give_up(&mut log, &mut child, "out of time", &screen, &driver);
+        if now.duration_since(started) >= budget {
+            let why = format!("the {budget:?} budget ran out");
+            return give_up(&mut log, &mut child, &why, &screen, &driver);
+        }
+        if quit_at.is_some_and(|at| now.duration_since(at) >= QUIT_GRACE) {
+            let why = format!("the CLI was still up {QUIT_GRACE:?} after its quit keys");
+            return give_up(&mut log, &mut child, &why, &screen, &driver);
         }
         if let Ok(chunk) = rx.recv_timeout(TICK) {
             log.write_all(&chunk)?;
@@ -177,8 +184,14 @@ fn drive(line: CommandLine) -> std::io::Result<i32> {
     }
 }
 
+/// A screen the pty's size.
+fn parser() -> vt100::Parser {
+    let side = |n| NonZeroU16::new(n).expect("SIZE is never 0x0");
+    vt100::Parser::new(side(SIZE.rows), side(SIZE.cols), 0)
+}
+
 /// The screen row by row: `contents()` joins a wrapped row onto the next
-/// (`src/grid.rs:212-213` at vt100 0.17.0), and a ConPTY repaint wraps a
+/// (`src/grid.rs:289-290` at vt100 0.18.1), and a ConPTY repaint wraps a
 /// full-width rule into the composer's row (`hermetic.yml`'s Windows leg, run
 /// 39172132633's `claude-code/permission/tui.log`).
 fn shown(screen: &vt100::Screen) -> String {
@@ -198,8 +211,16 @@ fn give_up(
         log,
         &format!("gave up: {why}\n--- screen ---\n{}", shown(screen.screen())),
     );
+    say_why(why);
     child.kill()?;
     Ok(driver.gave_up())
+}
+
+/// Tell the recorder that runs this driver why it gave up.
+fn say_why(why: &str) {
+    if let Some(dir) = std::env::var_os(DRIVER_DIR_ENV) {
+        let _ = std::fs::write(Path::new(&dir).join(GAVE_UP_NOTE), why);
+    }
 }
 
 fn send(writer: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
@@ -224,15 +245,48 @@ mod tests {
 
     #[test]
     fn a_composer_under_a_rule_the_cli_let_wrap_takes_the_prompt() {
-        let mut screen = vt100::Parser::new(SIZE.rows, SIZE.cols, 0);
+        let mut screen = parser();
         let rule = "─".repeat(usize::from(SIZE.cols));
         screen.process(format!("{rule}❯ ").as_bytes());
-        let (tui, answer) = tui_of("claude-code", "permission").expect("a TUI row");
         let now = Instant::now();
-        let mut driver = Driver::new(tui, answer, "hi".to_owned(), now);
+        let mut driver =
+            driver_of("claude-code", "permission", "hi".to_owned(), now).expect("a TUI row");
         assert_eq!(
             driver.step(&shown(screen.screen()), now),
             Action::Type("hi".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_driver_gives_up_before_the_recorder_kills_it() {
+        assert!(BUDGET + QUIT_GRACE <= *hermetic::TURN_BUDGET.here());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_past_its_budget_gives_up_as_its_driver_says_and_tells_the_recorder_why() {
+        let dir = tempfile::tempdir().expect("dir");
+        let line = CommandLine {
+            source: "claude-code".into(),
+            scenario: "permission".into(),
+            log: dir.path().join("tui.log"),
+            prompt: "hi".into(),
+            program: vec!["sh".into(), "-c".into(), "sleep 600".into()],
+        };
+        let unprompted = driver_of(
+            &line.source,
+            &line.scenario,
+            line.prompt.clone(),
+            Instant::now(),
+        )
+        .expect("a TUI row");
+        let budget = Duration::from_millis(500);
+        let code = temp_env::with_var(DRIVER_DIR_ENV, Some(dir.path()), || drive(line, budget))
+            .expect("it drove");
+        assert_eq!(code, unprompted.gave_up());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(GAVE_UP_NOTE)).expect("its note"),
+            format!("the {budget:?} budget ran out")
         );
     }
 
@@ -242,7 +296,8 @@ mod tests {
         let cmd = command(
             &["cli".into()],
             given.iter().map(|(k, v)| ((*k).into(), (*v).into())),
-        );
+        )
+        .expect("cwd");
         let got: std::collections::BTreeMap<&str, &str> = cmd.iter_full_env_as_str().collect();
         assert_eq!(
             got,

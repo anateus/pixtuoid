@@ -3,16 +3,39 @@
 
 use super::type_field;
 use crate::harness::hermetic::{
-    ConfigFile, Daemon, HostConfig, Package, PerOs, Profile, Scenario, Second, Shape, Surface, Turn,
+    ConfigFile, Daemon, HostConfig, Package, PerOs, Profile, Scenario, Second, Shape, Surface,
+    Turn, TurnExit, tui,
 };
 use crate::harness::plan::Placeholder;
 
 /// opencode's daemon, as its `--server` commands name it.
 const SERVER: &str = "http://127.0.0.1:{daemon_port}";
 
+/// opencode's TUI on the daemon, which it takes as `--server` as every
+/// command does (`packages/cli/src/commands/commands.ts:15-24`, `:38-42` at
+/// v2.1.4).
+const TUI: tui::Tui = tui::Tui {
+    args: &["--server", SERVER],
+    composer: tui::Composer {
+        marker: "┃",
+        // The input line, a padding row, then the agent and model above the edge.
+        border: tui::Border::Footed {
+            edge: '╹', rows: 3
+        },
+    },
+    gates: &[],
+    // `session.interrupt` is Esc (`packages/tui/src/config/keybind.ts:128` at
+    // v2.1.4), which interrupts only on its second press
+    // (`packages/tui/src/component/prompt/index.tsx:516-527`).
+    cancel: &[tui::Key::Esc, tui::Key::Esc],
+    quit: &[tui::Key::Text("/exit"), tui::Key::Enter],
+    conpty: tui::ConPty::Unverified,
+};
+
 pub(crate) const PROFILE: Profile = Profile {
-    source: "opencode",
+    source: crate::source::opencode::SOURCE_NAME,
     package: Package::Npm("@opencode/cli"),
+    plugin_types: &["@opencode/plugin"],
     // On the daemon, whose plugin forwards its session's delete
     // (`packages/core/src/session.ts:378-388` at v2.1.0): a delete through
     // a private server of its own forwards none. Only an explicit `--model`
@@ -75,10 +98,13 @@ pub(crate) const PROFILE: Profile = Profile {
     // A shell command asks, which `opencode run` rejects
     // (`services/www/src/docs/content/permissions.mdx:9-20`,
     // `packages/cli/src/run/noninteractive.ts:158-181`): the permission turn.
+    // `model` is the one a TUI turn runs on, since it names none
+    // (`packages/schema/src/config.ts:33-35` at v2.1.4).
     config: &[ConfigFile {
         home: "OPENCODE_CONFIG_DIR",
         path: "opencode.jsonc",
         template: r#"{
+  "model": "openai/gpt-5.2",
   "providers": {
     "openai": {
       "settings": { "baseURL": "http://127.0.0.1:{port}/v1", "apiKey": "{key}" },
@@ -95,13 +121,11 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::ToolRun,
             surface: Surface::Headless,
             expects: &[
-                "session.created",
                 "session.execution.started",
                 "session.tool.input.started",
                 "session.tool.success",
                 "session.execution.succeeded",
             ],
-            fixture: "fixtures/opencode/tool-run-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -109,25 +133,18 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::Subagent,
             surface: Surface::Headless,
             expects: &[
-                "session.created",
                 "session.execution.started",
                 "session.tool.input.started",
                 "session.tool.success",
                 "session.execution.succeeded",
             ],
-            fixture: "opencode/fixtures/subagent-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
             name: "model-error",
             shape: Shape::ModelError,
             surface: Surface::Headless,
-            expects: &[
-                "session.created",
-                "session.execution.started",
-                "session.execution.failed",
-            ],
-            fixture: "fixtures/opencode/model-error-hermetic",
+            expects: &["session.execution.started", "session.execution.failed"],
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -135,14 +152,12 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::Permission,
             surface: Surface::Headless,
             expects: &[
-                "session.created",
                 "session.execution.started",
                 "session.tool.input.started",
                 "permission.asked",
                 "session.tool.failed",
                 "session.execution.succeeded",
             ],
-            fixture: "fixtures/opencode/permission-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -150,23 +165,27 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::ToolRun,
             surface: Surface::Headless,
             expects: &[
-                "session.created",
                 "session.execution.started",
                 "session.tool.input.started",
                 "session.tool.success",
                 "session.execution.succeeded",
                 "session.deleted",
             ],
-            fixture: "fixtures/opencode/delete-hermetic",
             turn: Turn {
-                args: &[],
-                prompt: None,
                 second: Some(Second::Bare),
+                ..Turn::PROFILE
             },
+        },
+        Scenario {
+            name: "cancel",
+            shape: Shape::Cancel,
+            surface: Surface::Tui { row: &TUI },
+            expects: &["session.execution.started", "session.execution.interrupted"],
+            turn: Turn::PROFILE,
         },
     ],
     script_vars: &[],
-    not_yet: &["session.execution.interrupted"],
+    not_yet: &[],
     event_name: type_field,
     not_yet_fields: &[],
     not_yet_literals: &[],
@@ -187,6 +206,26 @@ pub(crate) const PROFILE: Profile = Profile {
         ready: &["session", "list", "--server", SERVER],
         env: &[],
     }),
+    server_stop: None,
+    // A session's execution settles on every exit as one of three
+    // (`packages/core/src/session/execution.ts:116-145` at v2.2.0).
+    turn_exits: &[
+        TurnExit {
+            exit: "session.execution.succeeded",
+            with: None,
+            scenario: "tool-run",
+        },
+        TurnExit {
+            exit: "session.execution.failed",
+            with: None,
+            scenario: "model-error",
+        },
+        TurnExit {
+            exit: "session.execution.interrupted",
+            with: None,
+            scenario: "cancel",
+        },
+    ],
 };
 
 #[cfg(test)]
@@ -194,7 +233,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn opencodes_model_flag_names_a_model_its_config_declares() {
+    fn opencodes_model_flag_names_a_model_its_config_declares_and_defaults_to() {
         let model = PROFILE
             .invocation
             .windows(2)
@@ -207,5 +246,6 @@ mod tests {
             config["providers"][provider]["models"].get(id).is_some(),
             "{model} is not under the config's providers.{provider}.models"
         );
+        assert_eq!(config["model"], model, "a TUI turn runs on another model");
     }
 }

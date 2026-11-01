@@ -70,7 +70,7 @@ impl Literal {
             return *owner;
         }
         let head = self.module.split('/').next().unwrap_or_default();
-        let name = head.trim_end_matches(".rs").replace('_', "-");
+        let name = crate::harness::source_of(head.trim_end_matches(".rs"));
         crate::source::registry::registered_source_names()
             .find(|s| *s == name)
             .map_or(Owner::Unowned, Owner::Source)
@@ -125,10 +125,6 @@ const OWNERS: &[(&str, Owner)] = &[
     ("hook/unix.rs", Owner::Nobody(OUR_SHIM)),
     ("hook/windows.rs", Owner::Nobody(OUR_SHIM)),
     ("hook/pid_watch.rs", Owner::Nobody(OUR_SHIM)),
-    (
-        "registry.rs",
-        Owner::Nobody("the roster: ids, labels, pins and home variables"),
-    ),
 ];
 
 /// Why a path or environment name needs no fixture.
@@ -194,6 +190,13 @@ pub(crate) fn population() -> std::io::Result<BTreeSet<Literal>> {
         out.extend(collect(&module, &file));
     }
     Ok(out)
+}
+
+/// Whether `ty` is a source's registry row. Its id, label and pin are ours, a
+/// profiled row's version probe is one the hermetic run calls, and its home
+/// variable is a resolver axis ([`PATH_AXIS`]).
+fn is_roster_row(ty: &syn::Type) -> bool {
+    matches!(ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "SourceDescriptor"))
 }
 
 /// Whether `attrs` hold a `cfg` only a test build meets: `test`, or an
@@ -380,7 +383,9 @@ impl<'ast> Visit<'ast> for Collect {
     }
 
     fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
-        self.within(c.ident.to_string(), |v| v.lits_in(&c.expr));
+        if !is_roster_row(&c.ty) {
+            self.within(c.ident.to_string(), |v| v.lits_in(&c.expr));
+        }
     }
 
     fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
@@ -804,14 +809,6 @@ mod tests {
     const LOSS_APPROVE: &str = "loss list: the tier only refuses, so no run approves";
     const LOSS_SIBLING: &str =
         "loss list: a sibling on one arm of a name a scenario reaches or its profile owes";
-    const LOSS_LEGACY: &str = "loss list: only a Legacy-history codex rollout carries it, \
-         which only a thread store without paginated lists gets, as `EM_RESUME` cites; \
-         the tier's rollouts are Paginated";
-    const LOSS_NO_EMITTER: &str = "loss list: codex writes it only for a model's tool_search \
-         call (`codex-rs/core/src/tools/spec_plan.rs:392-399` at rust-v0.163.0), which no \
-         aimock fixture block makes (`src/types.ts:423-435` at v1.45.1)";
-    const LOSS_CACHE_WRITE: &str = "loss list: aimock's Messages usage carries no cache \
-         writes, as claude-code's `cache_creation_input_tokens` row cites";
     /// Why agy's input steps need none: their line decodes to nothing, so the
     /// strip blanks it whole, and renamed, one only ends a call no step began.
     const AG_INPUT_STEP: &str = "an agy input step: its line decodes to nothing either way";
@@ -868,6 +865,12 @@ mod tests {
             "ULTRA_EXIT_LABEL",
             "a label we write, not one CC sends",
         ),
+        item("codewhale.rs", "KEYS", LABEL_DETAIL),
+        item(
+            "codewhale.rs",
+            "DELEGATING_ACTIONS",
+            "an agent call naming one decodes as one naming none, so the strip blanks it",
+        ),
         item("copilot.rs", "KEYS", LABEL_DETAIL),
         literal(
             "decoder.rs",
@@ -876,7 +879,6 @@ mod tests {
         ),
         item("decoder.rs", "describe_tool_target", LABEL_DETAIL),
         item("decoder.rs", "SUBAGENTS_DIR", PATH_AXIS),
-        item("codex/native.rs", "codex_probe_root_resolved", PATH_AXIS),
         item("codex/native.rs", "is_rollout_filename", PATH_AXIS),
         item("grok.rs", "is_updates_jsonl", PATH_AXIS),
         item("grok/native.rs", "grok_probe_root_resolved", PATH_AXIS),
@@ -884,6 +886,9 @@ mod tests {
         literal("grok.rs", "idle_prompt", IGNORE_ARM),
         literal("grok.rs", "task_complete", IGNORE_ARM),
         item("hermes.rs", "KEYS", LABEL_DETAIL),
+        item("hermes.rs", "resolve_hermes_home", PATH_AXIS),
+        item("hermes.rs", "expand_home", PATH_AXIS),
+        item("hermes.rs", "python_home", PATH_AXIS),
         item("omp.rs", "AGENT_SUBDIR", PATH_AXIS),
         item("omp.rs", "EXTENSIONS_SUBDIR", PATH_AXIS),
         item("omp.rs", "PROFILES_SUBDIR", PATH_AXIS),
@@ -893,7 +898,6 @@ mod tests {
         item("omp.rs", "with_omp_dotenv", PATH_AXIS),
         item("omp.rs", "from_process", PATH_AXIS),
         item("omp.rs", "parse_omp_env_file", PATH_AXIS),
-        item("omp/native.rs", "omp_probe_root_resolved", PATH_AXIS),
         item("omp/native.rs", "omp_recognize", PATH_AXIS),
         item("omp.rs", "KEYS", LABEL_DETAIL),
         item("reasonix.rs", "KEYS", LABEL_DETAIL),
@@ -907,11 +911,6 @@ mod tests {
         sibling("reasonix.rs", "review", "explore"),
         sibling("reasonix.rs", "security_review", "explore"),
         sibling("antigravity.rs", "ask_permission", "ask_question"),
-        literal("codex.rs", "patch_apply_end", LOSS_LEGACY),
-        literal("codex.rs", "web_search_end", LOSS_LEGACY),
-        literal("codex.rs", "tool_search_call", LOSS_NO_EMITTER),
-        literal("codex.rs", "tool_search_output", LOSS_NO_EMITTER),
-        literal("dsh.rs", "cacheWriteTokens", LOSS_CACHE_WRITE),
         literal("antigravity.rs", "CONVERSATION_HISTORY", AG_INPUT_STEP),
         literal("antigravity.rs", "USER_INPUT", AG_INPUT_STEP),
     ];
@@ -930,7 +929,7 @@ mod tests {
 
     #[test]
     fn every_literal_a_decoder_reads_is_recorded_owed_or_exempt() {
-        let absent = NOT_HERMETIC.iter().map(|(s, _)| *s).collect();
+        let absent = NOT_HERMETIC.iter().map(|u| u.source).collect();
         let owing: Vec<Owing<'_>> = PROFILES.iter().map(Owing::of).collect();
         let found = problems(
             &population().expect("the decoders parse"),
@@ -1189,6 +1188,12 @@ mod tests {
                 "decode_omp_hook_payload",
                 "ty",
                 "DECODED_HOOK_EVENTS",
+            ),
+            (
+                "hermes.rs",
+                "decode_hermes_hook_payload",
+                "event",
+                "DECODED_EVENTS",
             ),
         ] {
             let src = std::fs::read_to_string(source_root().join(module)).expect("readable");

@@ -24,18 +24,19 @@ use crate::install::io;
 use crate::install::target::MergeOutcome;
 
 /// Events we register == events we decode (`source/codewhale.rs`). The `bool` is
-/// `env_mode`: `true` events carry identity via `DEEPSEEK_*` env vars, so their
+/// `env_mode`: `true` events carry identity via env vars, so their
 /// command bakes `--event <name>` and the shim builds the envelope from env;
 /// `false` events (the subagent observer hooks) are forwarded RAW on stdin.
 ///
-/// turn_end / mode_change / on_error / shell_env are deliberately absent
-/// (per-turn noise / no lifecycle meaning). CodeWhale has NO approval hook in the
-/// TUI path, so there is no Waiting event to register — no signal exists.
+/// `session_idle` ends a turn or a wait, so turn_end and session_busy are
+/// absent, as are mode_change / on_error / shell_env (no lifecycle meaning).
 pub(crate) const CODEWHALE_EVENTS: &[(&str, bool)] = &[
     ("session_start", true),
     ("message_submit", true),
     ("tool_call_before", true),
     ("tool_call_after", true),
+    ("waiting_for_user", true),
+    ("session_idle", true),
     ("session_end", true),
     ("subagent_spawn", false),
     ("subagent_complete", false),
@@ -162,11 +163,11 @@ pub(crate) fn hook_command(resolved: &Path, _explicit: bool) -> Result<String> {
     // `_explicit` is Claude's bare-name-vs-absolute switch — CodeWhale always
     // embeds the absolute path, so the flag changes nothing here.
     let p = crate::install::merge::hook_path_str(resolved)?;
-    crate::install::hook_cmd::shell_hook_command(p, "codewhale")
+    crate::install::hook_cmd::shell_hook_command(p, pixtuoid_core::source::codewhale::SOURCE_NAME)
 }
 
 pub(crate) fn merge_install(content: &str, base_cmd: &str) -> Result<MergeOutcome> {
-    crate::install::merge::toml_merge_outcome(content, |doc| toml_merge_install(doc, base_cmd))
+    crate::install::merge::toml_merge_outcome(content, |root| toml_merge_install(root, base_cmd))
 }
 
 pub(crate) fn merge_uninstall(content: &str) -> Result<MergeOutcome> {
@@ -180,8 +181,8 @@ fn is_managed_entry(entry: &toml::Value) -> bool {
 fn managed_entry(event: &str, env_mode: bool, base_cmd: &str) -> toml::Value {
     let mut entry = Table::new();
     entry.insert("event".into(), toml::Value::String(event.into()));
-    // env-mode events bake `--event <name>` (the shim reads DEEPSEEK_* env); the
-    // subagent observer events forward the raw stdin JSON, so no `--event`.
+    // env-mode events bake `--event <name>` (the shim reads CodeWhale's hook env);
+    // the subagent observer events forward the raw stdin JSON, so no `--event`.
     let command = if env_mode {
         format!("{base_cmd}{}{event}", crate::install::hook_cmd::EVENT_FLAG)
     } else {
@@ -239,15 +240,8 @@ pub(crate) fn verify_schema(content: &str) -> crate::install::verify::SchemaPars
     assemble(&missing, !entries.is_empty(), shim, extra)
 }
 
-fn toml_merge_install(doc: toml::Value, base_cmd: &str) -> toml::Value {
-    let mut root = doc.as_table().cloned().unwrap_or_default();
-    let hooks = root
-        .entry("hooks".to_string())
-        .or_insert_with(|| toml::Value::Table(Table::new()));
-    if !hooks.is_table() {
-        *hooks = toml::Value::Table(Table::new());
-    }
-    if let Some(hooks) = hooks.as_table_mut() {
+fn toml_merge_install(mut root: Table, base_cmd: &str) -> Table {
+    crate::install::merge::with_toml_table(&mut root, "hooks", |hooks| {
         // Set the gate ONLY when the user made no explicit choice: an explicit
         // `enabled = false` is their own "all CodeWhale hooks off" switch, and we
         // could not faithfully restore it on disconnect. Ours then won't fire, but
@@ -255,28 +249,19 @@ fn toml_merge_install(doc: toml::Value, base_cmd: &str) -> toml::Value {
         hooks
             .entry("enabled".to_string())
             .or_insert_with(|| toml::Value::Boolean(true));
-        let arr = hooks
-            .entry("hooks".to_string())
-            .or_insert_with(|| toml::Value::Array(vec![]));
-        if !arr.is_array() {
-            *arr = toml::Value::Array(vec![]);
-        }
-        if let Some(arr) = arr.as_array_mut() {
+        crate::install::merge::with_toml_array(hooks, "hooks", |arr| {
             arr.retain(|e| !is_managed_entry(e));
             for (ev, env_mode) in CODEWHALE_EVENTS {
                 arr.push(managed_entry(ev, *env_mode, base_cmd));
             }
-        }
-    }
-    toml::Value::Table(root)
+        });
+    });
+    root
 }
 
-fn toml_merge_uninstall(mut doc: toml::Value) -> toml::Value {
-    let Some(root) = doc.as_table_mut() else {
-        return doc;
-    };
+fn toml_merge_uninstall(mut root: Table) -> Table {
     let Some(toml::Value::Table(hooks)) = root.get_mut("hooks") else {
-        return doc;
+        return root;
     };
     if let Some(arr) = hooks.get_mut("hooks").and_then(|h| h.as_array_mut()) {
         arr.retain(|e| !is_managed_entry(e));
@@ -297,7 +282,7 @@ fn toml_merge_uninstall(mut doc: toml::Value) -> toml::Value {
     if ours_only {
         root.remove("hooks");
     }
-    doc
+    root
 }
 
 #[cfg(test)]
@@ -793,10 +778,11 @@ command = "echo hi"
     fn every_registered_codewhale_event_decodes() {
         use pixtuoid_core::source::decoder::decode_hook_payload;
         for (ev, _env_mode) in CODEWHALE_EVENTS {
-            // Carry every identity field a decoder arm might need: `cwd` for the
+            // Every identity field a decoder arm reads: `session_id`/`cwd` for the
             // env-mode events, `agent_id`/`workspace` for the subagent events.
             let payload = serde_json::json!({
                 "event": ev,
+                "session_id": "sess_1",
                 "cwd": "/repo",
                 "agent_id": "agent-1",
                 "workspace": "/repo",
@@ -822,6 +808,8 @@ command = "echo hi"
                 ("message_submit", true),
                 ("tool_call_before", true),
                 ("tool_call_after", true),
+                ("waiting_for_user", true),
+                ("session_idle", true),
                 ("session_end", true),
                 ("subagent_spawn", false),
                 ("subagent_complete", false),

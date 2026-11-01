@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn neon_hue_is_the_brand_until_someone_waits() {
         let theme = &crate::theme::NORMAL;
-        assert_eq!(look(NeonLevels::BUSY).halo, theme.ui.neon_brand);
+        assert_eq!(look(NeonLevels::RUNNING).halo, theme.ui.neon_brand);
         assert_eq!(look(NeonLevels::CALM).halo, theme.ui.neon_brand);
         assert_eq!(look(NeonLevels::ALERT).halo, theme.ui.neon_alert);
     }
@@ -371,7 +371,9 @@ mod tests {
             },
         );
         let patch = Emitter {
-            kind: EmitterKind::MonitorHalo(pixtuoid_core::state::ToolKind::Edit),
+            kind: EmitterKind::MonitorHalo(crate::lighting::ScreenWork::ToolUse(
+                pixtuoid_core::state::ToolKind::Edit,
+            )),
             light: Light::Patch {
                 centre: Point { x: 60, y: 20 },
             },

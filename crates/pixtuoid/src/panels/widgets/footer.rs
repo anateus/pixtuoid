@@ -74,7 +74,7 @@ pub(crate) fn build_status_summary(inputs: &FooterInputs<'_>, term_width: u16) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixtuoid_core::state::ActivityState;
+    use pixtuoid_core::state::{ActivityState, ToolUse};
     use pixtuoid_core::{AgentId, AgentSlot, GlobalDeskIndex};
     use pixtuoid_scene::footer::{FooterTone, RungKind};
     use std::path::PathBuf;
@@ -82,7 +82,7 @@ mod tests {
     use std::time::SystemTime;
 
     #[test]
-    fn build_status_spans_tints_the_active_rung_via_the_shared_tone_authority() {
+    fn build_status_spans_tints_the_running_rung_via_the_shared_tone_authority() {
         let theme = &pixtuoid_scene::theme::NORMAL;
         let slot = AgentSlot {
             agent_id: AgentId::from_transcript_path("/p/a.jsonl"),
@@ -90,20 +90,21 @@ mod tests {
             session_id: Arc::from("s"),
             cwd: Arc::from(PathBuf::from("/p").as_path()),
             label: "a".into(),
-            state: ActivityState::Active {
-                tool_use_id: Some(Arc::from("t")),
-                detail: Some(Arc::from("Bash ls")),
-                kind: pixtuoid_core::state::ToolKind::Bash,
+            state: ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some(Arc::from("t")),
+                    detail: Some(Arc::from("Bash ls")),
+                    kind: pixtuoid_core::state::ToolKind::Bash,
+                }),
             },
             state_started_at: SystemTime::UNIX_EPOCH,
             created_at: SystemTime::UNIX_EPOCH,
             last_event_at: SystemTime::UNIX_EPOCH,
             exiting_at: None,
-            pending_idle_at: None,
             desk_index: GlobalDeskIndex(0),
             floor_idx: 0,
             tool_call_count: 0,
-            active_ms: 0,
+            running_ms: 0,
             unknown_cwd: false,
             parent_id: None,
             pid: None,
@@ -116,11 +117,11 @@ mod tests {
         scene.agents.insert(slot.agent_id, slot);
         let inputs = FooterInputs::new(&scene, footer_context(&scene, None, false, None, None));
         let spans = build_status_spans(&inputs, 200, theme);
-        let active_rgb = FooterTone::Rung(RungKind::Active).rgb(theme);
+        let running_rgb = FooterTone::Rung(RungKind::Running).rgb(theme);
         let rung = spans
             .iter()
-            .find(|s| s.content.contains("\u{25cf}1 A"))
-            .expect("active rung span present");
-        assert_eq!(rung.style.fg, Some(to_color(active_rgb)));
+            .find(|s| s.content.contains("\u{25cf}1 R"))
+            .expect("running rung span present");
+        assert_eq!(rung.style.fg, Some(to_color(running_rgb)));
     }
 }

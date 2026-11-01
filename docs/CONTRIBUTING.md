@@ -12,11 +12,11 @@ comments on the lines it governs, before changing it.
 
 ## Build & test
 
-Requires a recent stable Rust toolchain and [`just`](https://github.com/casey/just)
-(`brew install just`). On Linux you also need `lld`, `pkg-config` and the ALSA
-headers (`apt install lld pkg-config libasound2-dev`), and, with no GPU driver,
-Mesa's software Vulkan for the GPU tests (`apt install mesa-vulkan-drivers`).
-The git hooks and most CI jobs call `justfile` recipes.
+Requires a recent stable Rust toolchain and [`mise`](https://mise.jdx.dev),
+[activated](https://mise.jdx.dev/getting-started.html#activate-mise), whose `mise install`
+brings `just` and the other dev tools. On Linux you also need `lld`, `pkg-config`
+and the ALSA headers (`apt install lld pkg-config libasound2-dev`), and, with no GPU
+driver, Mesa's software Vulkan for the GPU tests (`apt install mesa-vulkan-drivers`).
 
 ```bash
 just              # list recipes
@@ -256,9 +256,9 @@ before re-litigating.
 
 ## Adding a new agent CLI
 
-The registration steps (4–7, 9) and step 11's roster literals are test-forced —
+The registration steps (4–7, 9) and step 11's roster literal are test-forced —
 skipping one fails `just test`. Step 8 is forced only for hook-only sources;
-step 10 by the theme guards; steps 1–3 and step 11's `#[test]` are on you.
+step 10 by the theme guards; steps 1–3 are on you.
 
 1. **Verify the wire format against the CLI's actual source/releases first** —
    transcript location, line shape, hooks, session identity; pin every fact
@@ -271,20 +271,20 @@ step 10 by the theme guards; steps 1–3 and step 11's `#[test]` are on you.
    `default_paths()` and the installer's `default_config_path()` so they
    can't disagree.
 2. **Write the source module** — `crates/pixtuoid-core/src/source/<name>.rs`:
-   `SOURCE_NAME`, a `LineDecoder` fn (one JSONL line → `Vec<AgentEvent>`), a
-   label deriver, unit tests per event mapping. Format knowledge lives HERE.
+   `SOURCE_NAME`, a `LineDecoder` fn (one JSONL line → `Vec<AgentEvent>`), a label
+   deriver, unit tests for mappings no fixture reaches. Format knowledge lives HERE.
 3. **Implement the `Source` trait** (an async `run(self, tx)` watching +
    decoding until the session universe ends). **Hook-only CLI?** Skip the
    decoder, trait, and step 7: `transcript: None` in the registry row, format
    knowledge in a `HookDecoding::ClaimsAll` decoder, and do step 8 instead.
-4. **Add ONE `SourceDescriptor` row** in `source/registry.rs` — label prefix,
+4. **Add the module's `DESCRIPTOR`**, listed in `source/registry.rs`'s `REGISTRY` — label prefix,
    decoder, `HookDecoding` (a `Shared` row's `tool_id_key` verified against a
    CAPTURED tool call — kimi's `ToolCall` cost a source its tool ids), truthful
    capability flags, `verified_version` + `version_probe`. Lifecycle policy
    derives from the flags; you do **not** edit the reducer.
 5. The descriptor's `name` **is the roster** — `registered_source_names()`
    projects `REGISTRY`; the conformance suite then requires a fixture, and
-   `harness/hermetic/mod.rs` a `PROFILES` row or a `NOT_HERMETIC` reason. The
+   `harness/hermetic/mod.rs` a `PROFILES` row or a `NOT_HERMETIC` reason and feed. The
    `sources --json` golden (`crates/pixtuoid/tests/snapshots/cli/sources.json`)
    must list it: `SNAPSHOTS=overwrite just test -p pixtuoid --test cli_json`.
 6. **Record the fixture** — the test steps in
@@ -302,9 +302,8 @@ step 10 by the theme guards; steps 1–3 and step 11's `#[test]` are on you.
 10. **Add the per-source badge hue** — a `SourceColors` field + value in EVERY
     theme file + `badge_color` in the manifest row; the coverage, legibility
     and site-bridge tests fail until it exists.
-11. **Two roster literals in two test binaries** (a scoped run misses them):
-    the row-by-row byte pin in `corpus_check.rs`; a case row + `#[test]` in
-    `crates/pixtuoid/tests/wire_to_pixels.rs`.
+11. **A roster literal in a second test binary** (a scoped run misses it): a
+    case row in `crates/pixtuoid/tests/wire_to_pixels.rs`'s `agent_cases()`.
 
 ## License
 

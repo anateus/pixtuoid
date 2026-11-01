@@ -1,9 +1,8 @@
 // Invariant #5 (non-negotiable): the shim must never block CC — it always exits 0
-// silently on any error. A prod `unwrap()`/`expect()`/`panic!` violates that, so
-// they are compiler-denied here (tests unwrap freely).
-// Indexing joins them because `release` sets `panic = "abort"`: an out-of-bounds
-// slice is a SIGABRT the agent CLI sees, and the parsers this crate feeds on
-// untrusted process rows are exactly where one would land.
+// silently (`silence_panics` makes even a panic do so). A panic still drops the
+// event, so `unwrap()`/`expect()`/`panic!` and indexing are compiler-denied here
+// (tests unwrap freely); the parsers fed untrusted process rows are where an
+// out-of-bounds slice would land.
 #![cfg_attr(
     not(test),
     deny(
@@ -23,6 +22,7 @@ use serde_json::Value;
 mod cli_pid;
 use cli_pid::cli_pid;
 
+mod keys;
 mod paths;
 use paths::default_socket_path;
 
@@ -37,23 +37,23 @@ const STAMP_HEADROOM: u64 = 256;
 /// stall→watchdog→drop, never a block of CC.
 const STDIN_CAP: u64 = (1 << 20) - STAMP_HEADROOM;
 
-/// Saturating `u128 → u64` narrowing: a truncating `as` cast would wrap anything
-/// above `u64::MAX` to a small number.
-fn ms_u128_to_u64(ms: u128) -> u64 {
-    u64::try_from(ms).unwrap_or(u64::MAX)
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| ms_u128_to_u64(d.as_millis()))
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Runs before the panic runtime, so a panic exits 0 silently under abort and unwind.
+fn silence_panics() {
+    std::panic::set_hook(Box::new(|_| std::process::exit(0)));
 }
 
 fn main() {
+    silence_panics();
     let socket = default_socket_path();
 
     // `args_os` + lossy, NOT `args()`: `std::env::args()` PANICS on any
-    // non-Unicode argument (legal Unix argv), breaching invariant #5. Lossy
+    // non-Unicode argument (legal Unix argv), dropping the event. Lossy
     // rather than filter_map: dropping a non-UTF-8 arg would shift
     // `--source <value>` pairing so the NEXT arg gets read as the value.
     let args: Vec<String> = std::env::args_os()
@@ -70,13 +70,11 @@ fn main() {
             };
             Value::Object(payload)
         }
-        // CodeWhale env-mode: identity arrives as `DEEPSEEK_*` env vars with
-        // `--event <name>` baked into the registered command. Critically,
-        // CodeWhale does NOT pipe stdin for these events, so the hook child
-        // inherits the TUI's terminal stdin and a blind `read_to_string` would
-        // BLOCK (freezing the synchronous tool call until the hook timeout) —
-        // when `--event` is present we never touch stdin.
-        (false, Some(event)) => Value::Object(env_payload(&event)),
+        // CodeWhale env-mode: identity arrives as env vars with `--event <name>`
+        // baked into the registered command, so the envelope needs no stdin, and
+        // a read it doesn't need is a wait the watchdog (armed below) never
+        // bounds: invariant 5.
+        (false, Some(event)) => Value::Object(env_payload_from(&event, |k| std::env::var_os(k))),
         (false, None) => {
             let mut buf = String::new();
             if std::io::stdin()
@@ -139,18 +137,6 @@ fn jcode_payload() -> Option<serde_json::Map<String, Value>> {
     (map.contains_key("event") && map.contains_key("session_id")).then_some(map)
 }
 
-/// CodeWhale env-mode: synthesize the hook envelope from `DEEPSEEK_*` env vars.
-/// The `std::env` reads live here so `env_payload_from` stays testable without
-/// mutating process-global env.
-fn env_payload(event: &str) -> serde_json::Map<String, Value> {
-    // CodeWhale runs the hook with current_dir = its working dir (= the
-    // workspace), so the shim's own cwd is the reliable fallback.
-    let cwd_fallback = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
-    env_payload_from(event, cwd_fallback, |k| std::env::var_os(k))
-}
-
 /// Per-field byte cap on env-mode values. The stdin arm enforces `STDIN_CAP`
 /// before parsing; the env arm has no such gate and `DEEPSEEK_TOOL_ARGS` can be
 /// large, so capping each folded field keeps the serialized line under the
@@ -162,28 +148,21 @@ fn cap_env_field(mut val: String) -> String {
     val
 }
 
+/// CodeWhale env-mode: synthesize the hook envelope from CodeWhale's hook env
+/// vars `get` reads, so a test need not mutate process-global env.
 fn env_payload_from(
     event: &str,
-    cwd_fallback: Option<String>,
     get: impl Fn(&str) -> Option<OsString>,
 ) -> serde_json::Map<String, Value> {
     let get = |k: &str| get(k).map(|v| v.to_string_lossy().into_owned());
     let mut map = serde_json::Map::new();
     map.insert("event".into(), Value::from(event));
-    // cwd is the AgentId KEY (the decoder drops a cwd-less event), and
-    // DEEPSEEK_WORKSPACE is UNSET for a fresh `codewhale` launched without `-C`
-    // until the workspace resolves — so `session_start` would otherwise never
-    // register a sprite. The fallback resolves to the same path the workspace
-    // eventually does, so a session's events coalesce on one AgentId.
-    if let Some(cwd) = get("DEEPSEEK_WORKSPACE")
-        .filter(|v| !v.is_empty())
-        .or_else(|| cwd_fallback.filter(|v| !v.is_empty()))
-    {
-        map.insert("cwd".into(), Value::from(cap_env_field(cwd)));
-    }
     for (env_key, field) in [
+        ("DEEPSEEK_WORKSPACE", "cwd"),
+        ("CODEWHALE_SESSION_ID", "session_id"),
         ("DEEPSEEK_TOOL_NAME", "tool"),
         ("DEEPSEEK_TOOL_ARGS", "tool_args"),
+        ("CODEWHALE_TOOL_CALL_ID", "tool_call_id"),
     ] {
         if let Some(val) = get(env_key).filter(|v| !v.is_empty()) {
             map.insert(field.into(), Value::from(cap_env_field(val)));
@@ -243,23 +222,23 @@ fn enrich_payload(
     ts_ms: u64,
     resolve_pid: impl FnOnce() -> Option<u32>,
 ) {
-    map.remove("_pixtuoid_source");
-    map.remove("_pixtuoid_event");
-    map.insert("_shim_ts_ms".into(), Value::from(ts_ms));
+    map.remove(keys::SOURCE_STAMP);
+    map.remove(keys::EVENT_STAMP);
+    map.insert(keys::SHIM_STAMP.into(), Value::from(ts_ms));
     if let Some(src) = source
         && !src.is_empty()
     {
-        map.insert("_pixtuoid_source".into(), Value::from(src));
+        map.insert(keys::SOURCE_STAMP.into(), Value::from(src));
     }
     if let Some(event) = hook_event {
-        map.insert("_pixtuoid_event".into(), Value::from(event));
+        map.insert(keys::EVENT_STAMP.into(), Value::from(event));
     }
     // The opencode/OpenClaw plugins stamp `process.pid` from inside the CLI —
     // keep theirs, and stay LAZY so they never pay for the Windows snapshot.
-    if !map.contains_key("_pid")
+    if !map.contains_key(keys::PID_STAMP)
         && let Some(pid) = resolve_pid()
     {
-        map.insert("_pid".into(), Value::from(pid));
+        map.insert(keys::PID_STAMP.into(), Value::from(pid));
     }
 }
 

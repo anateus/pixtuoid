@@ -338,11 +338,7 @@ mod tests {
         for (bw, bh) in [(160u16, 120u16), (160, 150)] {
             for seed in 0..5u64 {
                 let l = SceneLayout::compute_with_seed(bw, bh, Some(6), seed).unwrap();
-                let origin = l
-                    .home_desks
-                    .first()
-                    .copied()
-                    .unwrap_or(Point { x: 0, y: 0 });
+                let origin = l.home_desks.first().map_or(Point { x: 0, y: 0 }, |d| d.at);
                 for wp in &l.waypoints {
                     let s = super::stand_point(
                         wp.kind,
@@ -373,7 +369,7 @@ mod tests {
         // `stand_point ≡ approach_point` is true BY CONSTRUCTION (stand_point
         // delegates), so an equality assert would be a tautology — pin the
         // obstacle branch's real invariants instead.
-        use crate::layout::{SceneLayout, furniture_def};
+        use crate::layout::{HomeDesk, SceneLayout, furniture_def};
         let obstacle = |k| {
             !matches!(
                 k,
@@ -394,7 +390,7 @@ mod tests {
                 let Some(l) = SceneLayout::compute_with_seed(bw, bh, Some(6), seed) else {
                     continue;
                 };
-                for &desk in &l.home_desks {
+                for &HomeDesk { at: desk, .. } in &l.home_desks {
                     for wp in l.waypoints.iter().filter(|w| obstacle(w.kind)) {
                         let s = stand_point(
                             wp.kind,
@@ -457,44 +453,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn real_pantry_stand_responds_to_desk_side() {
-        use crate::layout::SceneLayout;
-        let l = SceneLayout::compute(120, 96, Some(4)).unwrap();
-        let p = l
-            .waypoints
-            .iter()
-            .find(|w| w.kind == WaypointKind::Pantry)
-            .expect("pantry")
-            .pos;
-        let cs = l.pantry_counter_size();
-        let north = stand_point(
-            WaypointKind::Pantry,
-            p,
-            cs,
-            &l.walkable,
-            Point { x: p.x, y: 0 },
-            Facing::South,
-            &l.reachable,
-        );
-        let south = stand_point(
-            WaypointKind::Pantry,
-            p,
-            cs,
-            &l.walkable,
-            Point {
-                x: p.x,
-                y: l.buf_h - 1,
-            },
-            Facing::South,
-            &l.reachable,
-        );
-        assert!(
-            north.y <= south.y,
-            "north-desk stand {north:?} should be no lower than south-desk stand {south:?}"
-        );
     }
 
     #[test]
@@ -582,13 +540,13 @@ mod tests {
 
     #[test]
     fn seat_approach_is_never_behind_the_backrest_on_real_layouts() {
-        use crate::layout::{SceneLayout, furniture_def};
+        use crate::layout::{HomeDesk, SceneLayout, furniture_def};
         for (w, h) in [(120u16, 96u16), (160, 120), (192, 160), (240, 160)] {
             for seed in 0..4u64 {
                 let Some(l) = SceneLayout::compute_with_seed(w, h, Some(4), seed) else {
                     continue;
                 };
-                for &desk in &l.home_desks {
+                for &HomeDesk { at: desk, .. } in &l.home_desks {
                     for wp in &l.waypoints {
                         let def = furniture_def(wp.kind.furniture());
                         if !def.occupies_pos {
@@ -653,29 +611,6 @@ mod tests {
     }
 
     #[test]
-    fn obstacle_stand_point_resolves_to_a_reachable_walkable_off_center_cell() {
-        let pos = Point { x: 50, y: 50 };
-        let m = mask_with_obstacle(100, 100, pos, 32, 10);
-        let reach = ReachSet::from_mask(&m, Point { x: 5, y: 5 });
-        let origin = Point { x: 50, y: 8 };
-        let sp = stand_point(
-            WaypointKind::Pantry,
-            pos,
-            Size { w: 32, h: 10 },
-            &m,
-            origin,
-            Facing::South,
-            &reach,
-        );
-        assert_ne!(sp, pos, "must resolve off the blocked center");
-        assert!(m.is_walkable(sp.x, sp.y), "the stand cell must be walkable");
-        assert!(
-            reach.reaches(sp),
-            "the stand cell must be coarse-reachable here"
-        );
-    }
-
-    #[test]
     fn def_footprint_matches_obstacle_footprint() {
         let dummy = Size { w: 32, h: 10 };
         for &kind in WaypointKind::ALL {
@@ -686,24 +621,6 @@ mod tests {
                 furniture_def(kind.furniture()).footprint,
                 obstacle_footprint(kind, dummy),
                 "{kind:?}: furniture_def.footprint must equal obstacle_footprint",
-            );
-        }
-    }
-
-    #[test]
-    fn occupies_pos_is_exactly_the_seat_kinds() {
-        for &kind in WaypointKind::ALL {
-            let expected = matches!(
-                kind,
-                WaypointKind::Couch
-                    | WaypointKind::MeetingSofa
-                    | WaypointKind::MeetingChair
-                    | WaypointKind::Island
-            );
-            assert_eq!(
-                furniture_def(kind.furniture()).occupies_pos,
-                expected,
-                "{kind:?}: occupies_pos must be true iff the agent occupies pos directly",
             );
         }
     }

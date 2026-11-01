@@ -1,7 +1,8 @@
 //! The frame-pacing bench's way into the real TUI painter: a renderer over
 //! ratatui's own crossterm encoder and, for an image protocol, the real tile
 //! sink, both writing into a [`Wire`] that counts bytes and the time spent
-//! writing them. Mechanism for `examples/pacing.rs`, not a contract.
+//! writing them. Mechanism for `examples/pacing.rs` and `snapshot --cutaway`'s
+//! fit, not a contract.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -63,9 +64,6 @@ struct Carried {
     write_ns: AtomicU64,
     #[cfg(test)]
     writes: AtomicU64,
-    /// Refuse the next write, as a full terminal does.
-    #[cfg(test)]
-    refuse: std::sync::atomic::AtomicBool,
 }
 
 /// A writer that discards what it is given, counting its bytes and timing each
@@ -89,12 +87,6 @@ impl Wire {
         )
     }
 
-    /// Refuse the next write with `WouldBlock`.
-    #[cfg(test)]
-    fn refuse_next(&self) {
-        self.0.refuse.store(true, Ordering::Relaxed);
-    }
-
     fn timed<T>(&self, f: impl FnOnce() -> T) -> T {
         let start = Instant::now();
         let out = f();
@@ -106,10 +98,6 @@ impl Wire {
 
 impl Write for Wire {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        #[cfg(test)]
-        if self.0.refuse.swap(false, Ordering::Relaxed) {
-            return Err(std::io::ErrorKind::WouldBlock.into());
-        }
         self.timed(|| {
             #[cfg(test)]
             self.0.writes.fetch_add(1, Ordering::Relaxed);
@@ -236,31 +224,25 @@ pub fn renderer(
     Ok((r, wire))
 }
 
-/// The cutaway's office in logical units, and its scale, on a `cols`×`rows`
-/// terminal of `cell_px` cells: `None` where the cell fits no cutaway.
+/// The cutaway the TUI fits to a `cols`×`rows` terminal of `cell_px` cells:
+/// `None` where the cell fits no cutaway.
 pub fn cutaway_office(
     cols: u16,
     rows: u16,
     cell_px: (u16, u16),
     pack: &OfficeArt,
-) -> Option<(u16, u16, u16)> {
+) -> Option<pixtuoid_scene::render_scale::PixelFit> {
     let cell = CellSize {
         w: cell_px.0,
         h: cell_px.1,
     };
     let area = crate::tui::renderer::scene_rect(Rect::new(0, 0, cols, rows)).as_size();
-    let fit = cutaway_fit(cell, area, pack.max_density_variant())?;
-    Some((fit.logical().w, fit.logical().h, fit.scale().get()))
+    cutaway_fit(cell, area, pack.max_density_variant())
 }
 
 /// Warm `r`'s caches on `scene` at `now`, as the TUI does at boot.
-pub fn warm(
-    r: &mut TuiRenderer<PacedBackend>,
-    scene: &SceneState,
-    pack: &OfficeArt,
-    now: std::time::SystemTime,
-) {
-    r.warm(scene, pack, now);
+pub fn warm(r: &mut TuiRenderer<PacedBackend>, scene: &SceneState, now: std::time::SystemTime) {
+    r.warm(scene, now);
 }
 
 /// Paint and send `r`'s next frame whole.
@@ -278,91 +260,15 @@ mod tests {
     fn a_rendered_frame_is_one_write() {
         let pack =
             std::sync::Arc::new(pixtuoid_scene::pack::load_bundled_pack().expect("the pack"));
-        let (mut r, wire) = super::renderer(
-            Protocol::Kitty,
-            120,
-            40,
-            (8, 16),
-            vec![],
-            std::sync::Arc::clone(&pack),
-        )
-        .expect("a cutaway");
+        let (mut r, wire) =
+            super::renderer(Protocol::Kitty, 120, 40, (8, 16), vec![], pack).expect("a cutaway");
         let scene = pixtuoid_core::SceneState::uniform(8);
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         wire.take_writes();
-        r.render(&scene, &pack, now).expect("render");
+        r.render(&scene, now).expect("render");
         let (bytes, _) = wire.take();
         assert!(bytes > 100_000, "a whole frame of tiles: {bytes}");
         assert_eq!(wire.take_writes(), 1);
-    }
-
-    /// A frame the terminal refused is dropped, though ratatui counts its
-    /// cells as shown: the next repaints every cell and every tile, at least
-    /// the first frame's bytes.
-    #[test]
-    fn a_frame_after_a_refused_one_is_whole() {
-        let pack =
-            std::sync::Arc::new(pixtuoid_scene::pack::load_bundled_pack().expect("the pack"));
-        let (mut r, wire) = super::renderer(
-            Protocol::Kitty,
-            120,
-            40,
-            (8, 16),
-            vec![],
-            std::sync::Arc::clone(&pack),
-        )
-        .expect("a cutaway");
-        let scene = pixtuoid_core::SceneState::uniform(8);
-        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        wire.take();
-        r.render(&scene, &pack, now).expect("render");
-        let (first, _) = wire.take();
-        r.render(&scene, &pack, now).expect("render");
-        let (steady, _) = wire.take();
-        assert!(steady < first / 10, "nothing moved: {steady} of {first}");
-        wire.refuse_next();
-        r.render(&scene, &pack, now)
-            .expect("a full terminal is no error");
-        r.render(&scene, &pack, now).expect("render");
-        let (after, _) = wire.take();
-        assert!(
-            after >= first,
-            "{after} after a refused frame, {first} first"
-        );
-    }
-
-    /// A terminal that stays full warns once, not a line a frame.
-    #[test]
-    fn a_run_of_refused_frames_warns_once() {
-        let pack =
-            std::sync::Arc::new(pixtuoid_scene::pack::load_bundled_pack().expect("the pack"));
-        let (mut r, wire) = super::renderer(
-            Protocol::Kitty,
-            120,
-            40,
-            (8, 16),
-            vec![],
-            std::sync::Arc::clone(&pack),
-        )
-        .expect("a cutaway");
-        let scene = pixtuoid_core::SceneState::uniform(8);
-        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let logged = crate::test_capture::capture(|| {
-            for _ in 0..3 {
-                wire.refuse_next();
-                r.render(&scene, &pack, now)
-                    .expect("a full terminal is no error");
-            }
-            r.render(&scene, &pack, now).expect("render");
-            wire.refuse_next();
-            r.render(&scene, &pack, now)
-                .expect("a full terminal is no error");
-        });
-        let warns = logged
-            .lines()
-            .filter(|l| l.contains("frame write failed") && l.contains(" WARN "))
-            .count();
-        assert_eq!(warns, 2, "one per run of refusals: {logged}");
     }
 
     /// The bench measures every protocol the cutaway speaks: a new

@@ -10,19 +10,21 @@ pub(crate) use driver::run;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pixtuoid_core::SceneState;
 use pixtuoid_core::source::manager::SourceDeath;
-use pixtuoid_core::state::{ActivityState, DaemonState, MAX_FLOORS};
+use pixtuoid_core::state::{ActivityState, DaemonState, MAX_FLOORS, ToolUse};
 use ratatui::layout::Size as TermSize;
-use tokio::sync::watch;
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::graphics::Plan;
 
-/// The reducer publishes a fresh `Arc<SceneState>` on every mutation through this watch
-/// channel. Consumers (renderer, headless summary loop) hold a `Receiver`, call
-/// `borrow()` for an O(1) pointer read, and never block the writer.
+/// A painter's (TUI, floating) scene feed: [`SceneSink::Latest`](pipeline::SceneSink)
+/// publishes a fresh `Arc<SceneState>` after each change; the painter holds a
+/// `Receiver`, calls `borrow()` for an O(1) pointer read, and never blocks the
+/// writer.
 pub(crate) type SceneRx = watch::Receiver<Arc<SceneState>>;
 
 /// Fallback desk capacity when the terminal cannot be queried (e.g. headless mode).
@@ -43,8 +45,8 @@ pub(crate) struct RunConfig {
     /// source's events are dropped + its sprites evicted.
     pub(crate) connected: HashSet<String>,
     /// Where the warn-floor log lives, which the Sources panel reads for each
-    /// source's drift history. `None` = no log.
-    pub(crate) log: Option<crate::run_log::LogLocation>,
+    /// source's drift history.
+    pub(crate) log: crate::run_log::LogLocation,
     /// The sources this run's decode drift has named, for the footer nudge.
     pub(crate) drift: crate::doctor::DriftSeen,
     /// Nothing is connected over a config that loaded (`sources::is_first_run`) —
@@ -150,15 +152,25 @@ fn summarize(scene: &SceneState) -> String {
         .map(|a| {
             let state = match &a.state {
                 ActivityState::Idle => "idle".to_string(),
-                ActivityState::Active { detail, .. } => {
-                    format!(
-                        "active({})",
-                        sanitize_line(detail.as_deref().unwrap_or("?"))
-                    )
+                ActivityState::Running {
+                    item:
+                        Some(ToolUse {
+                            detail: Some(detail),
+                            ..
+                        }),
+                } => {
+                    format!("running({})", sanitize_line(detail))
                 }
-                ActivityState::Waiting { reason } => {
-                    format!("waiting({})", sanitize_line(reason))
+                ActivityState::Running {
+                    item: Some(ToolUse { detail: None, .. }),
                 }
+                | ActivityState::Running { item: None } => "running".to_string(),
+                ActivityState::RequiresAction {
+                    reason: Some(reason),
+                } => {
+                    format!("requires_action({})", sanitize_line(reason))
+                }
+                ActivityState::RequiresAction { reason: None } => "requires_action".to_string(),
             };
             format!("{}@{}:{}", sanitize_line(&a.label), a.desk_index.0, state)
         })
@@ -172,7 +184,7 @@ fn summarize(scene: &SceneState) -> String {
         .map(|(source, instance, p)| {
             let state = match p.display_state() {
                 DaemonState::Idle => "idle",
-                DaemonState::Busy => "busy",
+                DaemonState::Running => "running",
                 DaemonState::Degraded => "degraded",
                 DaemonState::Down => "down",
             };
@@ -194,6 +206,88 @@ fn summarize(scene: &SceneState) -> String {
     )
 }
 
+/// Headless stdout: one [`summarize`] line per change of the scene. It follows
+/// every applied event, never a sample, so a state that lasts no frame (a call
+/// that starts and ends in one transcript read) is still logged.
+#[derive(Default)]
+pub(crate) struct TransitionLog {
+    last: String,
+}
+
+impl TransitionLog {
+    /// `scene`'s line, when it differs from the last one logged.
+    pub(crate) fn line(&mut self, scene: &SceneState) -> Option<String> {
+        let line = summarize(scene);
+        (line != self.last).then(|| {
+            self.last.clone_from(&line);
+            line
+        })
+    }
+}
+
+/// How many lines headless stdout may fall behind before its reader counts as
+/// stalled and the run ends: far past a live burst (a long transcript's first
+/// sight replays every call), and at about a hundred bytes a line, a few MB.
+pub(crate) const TRANSITION_LOG_CAPACITY: usize = 1 << 16;
+
+/// Headless stdout's bounded queue. Its producers (the reducer's transitions,
+/// headless's health lines) never block: a line that finds it full flags a
+/// stall, which ends the run, since dropping or merging lines would leave the
+/// log silently incomplete.
+#[derive(Clone)]
+pub(crate) struct LogQueue {
+    lines: mpsc::Sender<String>,
+    stall: Arc<Stall>,
+}
+
+#[derive(Default)]
+struct Stall {
+    flagged: Notify,
+    refused: AtomicUsize,
+}
+
+impl LogQueue {
+    /// A queue of `capacity` lines, and the receiver its reader drains.
+    pub(crate) fn bounded(capacity: usize) -> (Self, mpsc::Receiver<String>) {
+        let (lines, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                lines,
+                stall: Arc::default(),
+            },
+            rx,
+        )
+    }
+
+    /// Queue `line`; `false` once the reader has left or stalled.
+    pub(crate) fn push(&self, line: String) -> bool {
+        match self.lines.try_send(line) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.stall.refused.fetch_add(1, Ordering::Relaxed);
+                self.stall.flagged.notify_one();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.lines.is_closed()
+    }
+
+    /// Resolves once a push found the queue full.
+    pub(crate) async fn stalled(&self) {
+        self.stall.flagged.notified().await;
+    }
+
+    /// Lines a stalled reader leaves unwritten: those queued, and those refused.
+    pub(crate) fn unwritten(&self) -> usize {
+        self.lines.max_capacity() - self.lines.capacity()
+            + self.stall.refused.load(Ordering::Relaxed)
+    }
+}
+
 /// Format a `SourceDeath` for the headless stdout health line. Both fields are
 /// `sanitize_line`d before printing: `error` is `format!("{e:#}")` of an `anyhow` chain
 /// that can embed external strings carrying terminal escapes, and `source` is sanitized
@@ -211,9 +305,9 @@ fn format_source_death(d: &SourceDeath) -> String {
 /// count — logging the whole borrow on every change would re-warn all prior deaths,
 /// reading as repeated crashes in forensics.
 pub(crate) fn unseen_deaths<'a>(deaths: &'a [SourceDeath], seen: &mut usize) -> &'a [SourceDeath] {
-    let start = (*seen).min(deaths.len());
+    let unseen = &deaths[*seen..];
     *seen = deaths.len();
-    &deaths[start..]
+    unseen
 }
 
 /// A boxed quit arm.
@@ -557,6 +651,46 @@ mod tests {
         assert_eq!(caps, [FALLBACK_DESKS; MAX_FLOORS]);
     }
 
+    /// A queue nobody drains: the pushes past its capacity are refused and
+    /// counted, the stall is flagged, and the lines it kept are the first ones,
+    /// in order.
+    #[tokio::test]
+    async fn a_full_log_queue_refuses_and_counts_past_its_capacity() {
+        const CAP: usize = 4;
+        const OVER: usize = 3;
+        let (queue, mut lines) = LogQueue::bounded(CAP);
+        let sent: Vec<String> = (0..CAP + OVER).map(|n| format!("line {n}")).collect();
+        let taken: Vec<bool> = sent.iter().map(|line| queue.push(line.clone())).collect();
+        assert_eq!(taken, [[true; CAP].as_slice(), &[false; OVER]].concat());
+        assert_eq!(queue.unwritten(), CAP + OVER);
+        tokio::time::timeout(std::time::Duration::from_secs(5), queue.stalled())
+            .await
+            .expect("a refused push flags the stall");
+        let kept: Vec<String> = std::iter::from_fn(|| lines.try_recv().ok()).collect();
+        assert_eq!(kept, sent[..CAP]);
+    }
+
+    #[test]
+    fn a_transition_log_writes_a_scene_again_only_once_it_changed() {
+        let mut log = TransitionLog::default();
+        let mut scene = SceneState::new([8; MAX_FLOORS]);
+        assert_eq!(log.line(&scene).as_deref(), Some("agents=[] daemons=[]"));
+        assert_eq!(log.line(&scene), None, "a sweep that changed nothing");
+        Reducer::new().apply(
+            &mut scene,
+            pixtuoid_core::source::AgentEvent::SessionStart {
+                agent_id: pixtuoid_core::AgentId::from_transcript_path("/p/a.jsonl"),
+                source: "claude-code".into(),
+                session_id: "s".into(),
+                cwd: std::path::PathBuf::from("/repo"),
+                parent_id: None,
+            },
+            SystemTime::now(),
+            Transport::Hook,
+        );
+        assert!(log.line(&scene).is_some());
+    }
+
     #[test]
     fn summarize_reports_each_activity_state() {
         use pixtuoid_core::AgentId;
@@ -585,7 +719,7 @@ mod tests {
         seat(&mut reducer, &mut scene, a);
         reducer.apply(
             &mut scene,
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id: a,
                 tool_use_id: Some("t1".into()),
                 detail: Some("Edit: foo.rs".into()),
@@ -598,11 +732,11 @@ mod tests {
         seat(&mut reducer, &mut scene, b);
         reducer.apply(
             &mut scene,
-            AgentEvent::Waiting {
-                agent_id: b,
-                reason: "permission".into(),
-                tool_use_id: None,
-            },
+            AgentEvent::user_action_request(
+                b,
+                Some("permission".into()),
+                pixtuoid_core::source::RequestKeys::default(),
+            ),
             now,
             Transport::Hook,
         );
@@ -610,10 +744,42 @@ mod tests {
         let c = AgentId::from_transcript_path("/p/c.jsonl");
         seat(&mut reducer, &mut scene, c);
 
+        // An open turn between items: running, with no tool token.
+        let d = AgentId::from_parts("opencode", "ses_d");
+        reducer.apply(
+            &mut scene,
+            AgentEvent::SessionStart {
+                agent_id: d,
+                source: "opencode".into(),
+                session_id: "ses_d".into(),
+                cwd: std::path::PathBuf::from("/turn"),
+                parent_id: None,
+            },
+            now,
+            Transport::Hook,
+        );
+        reducer.apply(
+            &mut scene,
+            AgentEvent::TurnStart {
+                agent_id: d,
+                turn: pixtuoid_core::state::TurnKey::Seq(1),
+            },
+            now,
+            Transport::Hook,
+        );
+
         let summary = summarize(&scene);
+        let turn = summary
+            .split(['[', ',', ']'])
+            .find(|e| e.trim_start().starts_with("oc\u{b7}turn@"))
+            .unwrap_or_else(|| panic!("no open-turn agent in {summary}"));
+        assert!(turn.ends_with(":running"), "got: {summary}");
         assert!(summary.starts_with("agents=["), "got: {summary}");
-        assert!(summary.contains("active(Edit: foo.rs)"), "got: {summary}");
-        assert!(summary.contains("waiting(permission)"), "got: {summary}");
+        assert!(summary.contains("running(Edit: foo.rs)"), "got: {summary}");
+        assert!(
+            summary.contains("requires_action(permission)"),
+            "got: {summary}"
+        );
         assert!(summary.contains(":idle"), "got: {summary}");
         assert!(summary.contains('@'), "got: {summary}");
     }
@@ -653,23 +819,23 @@ mod tests {
         apply_presence(
             &mut scene,
             &gw,
-            DaemonPresenceUpdate::RunStarted {
-                run_key: "r".into(),
+            DaemonPresenceUpdate::TurnStarted {
+                turn: pixtuoid_core::state::TurnKey::Id("r".into()),
             },
             now,
         );
         assert!(
-            summarize(&scene).contains("daemons=[openclaw@18789:busy]"),
+            summarize(&scene).contains("daemons=[openclaw@18789:running]"),
             "got: {}",
             summarize(&scene)
         );
 
-        // RunFailed drains the in-flight run, so the later GatewayDown still reads down.
+        // TurnFailed drains the in-flight turn, so the later GatewayDown still reads down.
         apply_presence(
             &mut scene,
             &gw,
-            DaemonPresenceUpdate::RunFailed {
-                run_key: "r".into(),
+            DaemonPresenceUpdate::TurnFailed {
+                turn: pixtuoid_core::state::TurnKey::Id("r".into()),
             },
             now,
         );
@@ -685,6 +851,66 @@ mod tests {
             "got: {}",
             summarize(&scene)
         );
+    }
+
+    #[test]
+    fn summarize_names_a_reasonless_requires_action_bare() {
+        use pixtuoid_core::AgentId;
+        use pixtuoid_core::source::AgentEvent;
+
+        let mut scene = SceneState::new([8; MAX_FLOORS]);
+        let mut reducer = Reducer::new();
+        let now = SystemTime::now();
+        let id = AgentId::from_parts("cc", "bare");
+        for event in [
+            AgentEvent::SessionStart {
+                agent_id: id,
+                source: "claude-code".into(),
+                session_id: "s".into(),
+                cwd: PathBuf::from("/r"),
+                parent_id: None,
+            },
+            AgentEvent::user_action_request(
+                id,
+                None,
+                pixtuoid_core::source::RequestKeys::default(),
+            ),
+        ] {
+            reducer.apply(&mut scene, event, now, Transport::Hook);
+        }
+
+        let out = summarize(&scene);
+        assert!(out.contains(":requires_action]"), "{out}");
+    }
+
+    #[test]
+    fn summarize_names_a_detailless_running_bare() {
+        use pixtuoid_core::AgentId;
+        use pixtuoid_core::source::AgentEvent;
+
+        let mut scene = SceneState::new([8; MAX_FLOORS]);
+        let mut reducer = Reducer::new();
+        let now = SystemTime::now();
+        let id = AgentId::from_parts("cc", "plain");
+        for event in [
+            AgentEvent::SessionStart {
+                agent_id: id,
+                source: "claude-code".into(),
+                session_id: "s".into(),
+                cwd: PathBuf::from("/r"),
+                parent_id: None,
+            },
+            AgentEvent::ToolUseStart {
+                agent_id: id,
+                tool_use_id: Some("t".into()),
+                detail: None,
+            },
+        ] {
+            reducer.apply(&mut scene, event, now, Transport::Hook);
+        }
+
+        let out = summarize(&scene);
+        assert!(out.contains(":running]"), "{out}");
     }
 
     #[test]
@@ -712,11 +938,11 @@ mod tests {
         );
         reducer.apply(
             &mut scene,
-            AgentEvent::Waiting {
-                agent_id: id,
-                reason: "needs \u{1b}[2J approval".to_string(),
-                tool_use_id: None,
-            },
+            AgentEvent::user_action_request(
+                id,
+                Some("needs \u{1b}[2J approval".to_string()),
+                pixtuoid_core::source::RequestKeys::default(),
+            ),
             now,
             Transport::Hook,
         );

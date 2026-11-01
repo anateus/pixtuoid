@@ -364,7 +364,7 @@ pub enum Furniture {
     /// by reachability.
     SnackShelf,
     /// The agent's OWNED home workstation. Not a [`WaypointKind`] (per-agent,
-    /// forced-seat when Active, never a wander destination) but a first-class
+    /// forced-seat when Running, never a wander destination) but a first-class
     /// geometry row, so desk and couch share ONE table and the same
     /// `seated_foot_cell` + approach/settle path. Its footprint is stamped
     /// TOP-LEFT in `mask.rs`, not centered — the full sprite width (the side
@@ -765,13 +765,13 @@ impl GroundAlign {
     /// The pixel offset from the visual box's low edge for a `footprint`-long span
     /// inside a `visual`-long box. `Center` is `floor(v/2) − floor(f/2)`, NOT
     /// `floor((v−f)/2)` — the two differ by 1px at opposite parity, which lifts the
-    /// floor lamp's block off its disc. `saturating_sub` keeps a (malformed)
-    /// footprint-larger-than-visual row at offset 0 rather than wrapping.
+    /// floor lamp's block off its disc. Needs `footprint <= visual`, which
+    /// `furniture_def_invariants_hold_for_every_row` pins for every row.
     pub(crate) const fn offset(self, visual: u16, footprint: u16) -> u16 {
         match self {
             GroundAlign::Start => 0,
-            GroundAlign::Center => (visual / 2).saturating_sub(footprint / 2),
-            GroundAlign::End => visual.saturating_sub(footprint),
+            GroundAlign::Center => visual / 2 - footprint / 2,
+            GroundAlign::End => visual - footprint,
         }
     }
 }
@@ -1165,40 +1165,12 @@ mod tests {
     }
 
     #[test]
-    fn desk_is_a_furniture_def_with_desk_geometry() {
-        let d = desk_furniture_def();
+    fn the_desk_row_uses_the_desk_approach_policy() {
         assert_eq!(
-            d,
-            furniture_def(Furniture::Desk),
-            "desk_furniture_def must be sugar over the Furniture::Desk row"
-        );
-        assert_eq!(
-            d.footprint,
-            Some(Size {
-                w: DESK_W + 4,
-                h: DESK_FOOT_H,
-            }),
-            "desk footprint"
-        );
-        assert_eq!(
-            d.ground_y,
-            GroundAlign::End,
-            "desk walk-behind: south-anchored"
-        );
-        let Size { w: fw, h: fh } = d.footprint.unwrap();
-        assert!(
-            fw <= d.visual.w && fh <= d.visual.h,
-            "desk footprint must not exceed its visual"
-        );
-        assert!(
-            d.occupies_pos,
-            "agent renders ON the desk (seated_top_left); seat = seated_foot_cell(Desk)"
-        );
-        assert_eq!(
-            d.approach, DESK_APPROACH,
+            furniture_def(Furniture::Desk).approach,
+            DESK_APPROACH,
             "desk uses the editable DESK_APPROACH policy"
         );
-        assert!(d.dwell.range_ms > 0, "seated dwell range must be positive");
     }
 
     #[test]
@@ -1211,7 +1183,7 @@ mod tests {
             let dx = def.ground_x.offset(def.visual.w, fp.w);
             let dy = def.ground_y.offset(def.visual.h, fp.h);
             assert!(
-                dx + fp.w <= def.visual.w.max(fp.w) && dy + fp.h <= def.visual.h.max(fp.h),
+                dx + fp.w <= def.visual.w && dy + fp.h <= def.visual.h,
                 "{kind:?}: blocked rect must not poke past the visual box"
             );
             let center_exception =

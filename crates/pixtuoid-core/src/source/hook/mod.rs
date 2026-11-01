@@ -1,11 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tracing::{debug, warn};
 
 use crate::AgentId;
-use crate::source::decoder::{checked_pid, decode_hook_payload, hook_source};
+use crate::source::decoder::{
+    PID_STAMP, SOURCE_STAMP, checked_pid, decode_hook_object, hook_object, hook_source,
+};
 use crate::source::registry::SourceDescriptor;
 use crate::source::{AgentEvent, TaggedSender, Transport};
 
@@ -67,7 +69,6 @@ impl std::error::Error for SocketBusy {}
 #[derive(Debug)]
 pub struct HookSocketListener {
     inner: imp::Listener,
-    path: PathBuf,
     pid_watch: Option<HookPidWatch>,
     presence_tx: Option<PresenceSender>,
 }
@@ -86,15 +87,9 @@ impl HookSocketListener {
         let inner = imp::Listener::bind(&path).await?;
         Ok(Self {
             inner,
-            path,
             pid_watch: None,
             presence_tx: None,
         })
-    }
-
-    /// The bound socket/pipe path.
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Attach a [`HookPidWatch`] so hook payloads carrying a `_pid` register a
@@ -274,17 +269,22 @@ pub(crate) async fn handle_conn(
                         continue;
                     }
                 };
+                let obj = match hook_object(&v) {
+                    Ok(obj) => obj,
+                    Err(e) => {
+                        warn!(error = %e, "hook decode error");
+                        continue;
+                    }
+                };
                 // DAEMON demux, registry-DRIVEN so a 2nd daemon needs NO edit
                 // here: `presence_decoder_for` returns `None` for every agent
                 // source, and a daemon's payloads decode to presence deltas on
                 // the sibling channel instead of `AgentEvent`s.
-                if let (Some(ptx), Some(src)) = (
-                    presence_tx.as_ref(),
-                    v.get("_pixtuoid_source")
-                        .and_then(serde_json::Value::as_str),
-                ) && let Some(decode) = crate::source::registry::presence_decoder_for(src)
+                if let Some(ptx) = presence_tx.as_ref()
+                    && let Some(src) = obj.get(SOURCE_STAMP).and_then(serde_json::Value::as_str)
+                    && let Some(decode) = crate::source::registry::presence_decoder_for(src)
                 {
-                    match decode(&v) {
+                    match decode(obj) {
                         Ok(decoded) => {
                             let key = crate::source::daemon::DaemonInstanceKey::new(
                                 src,
@@ -302,25 +302,21 @@ pub(crate) async fn handle_conn(
                     // A daemon produces no AgentEvents — never the agent arms.
                     continue;
                 }
-                // Peek the shim-supplied CLI pid BEFORE `v` is consumed by
-                // decode. Deliberately NOT gated on `pid_watch`: a platform with
-                // no exit-watch backend, or one that failed to init, must not
-                // take the focus-jump pid cache down with it — only the BIND
-                // below needs the watch.
-                let pid = v
-                    .get("_pid")
+                // The shim-supplied CLI pid, deliberately NOT gated on `pid_watch`:
+                // a platform with no exit-watch backend, or one that failed to
+                // init, must not take the focus-jump pid cache down with it —
+                // only the BIND below needs the watch.
+                let pid = obj
+                    .get(PID_STAMP)
                     .and_then(serde_json::Value::as_i64)
                     .and_then(checked_pid);
-                let source = v.as_object().map(|o| hook_source(o).to_owned());
-                match decode_hook_payload(v) {
+                match decode_hook_object(obj) {
                     // One payload can decode to multiple events (#221) — sent in
                     // order on the same channel, so the reducer registers with
                     // real identity before the activity event applies.
                     Ok(evs) => {
-                        if let (Some(pid), Some(source), Some(watch)) =
-                            (pid, source.as_deref(), pid_watch.as_ref())
-                        {
-                            for (agent_id, corroborate) in bind_targets(source, &evs) {
+                        if let (Some(pid), Some(watch)) = (pid, pid_watch.as_ref()) {
+                            for (agent_id, corroborate) in bind_targets(hook_source(obj), &evs) {
                                 watch.note(pid, agent_id, corroborate);
                             }
                         }
@@ -353,6 +349,7 @@ mod tests {
     use super::*;
     use crate::AgentId;
     use crate::source::AgentEvent;
+    use crate::source::decoder::test_obj;
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -366,7 +363,7 @@ mod tests {
                 cwd: None,
                 pid: None,
             },
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id: id,
                 tool_use_id: None,
                 detail: None,
@@ -385,7 +382,7 @@ mod tests {
 
     #[test]
     fn patch_identity_pids_stamps_only_a_focus_target() {
-        for source in ["claude-code", "codex", "copilot", "opencode"] {
+        for source in ["claude-code", "codex", "copilot", "opencode", "hermes"] {
             let mut evs = vec![AgentEvent::Identity {
                 agent_id: AgentId::from_parts(source, "ses_t"),
                 source: source.into(),
@@ -399,14 +396,7 @@ mod tests {
                 "{source} Identity must stay pid: None"
             );
         }
-        for source in [
-            "antigravity",
-            "cursor",
-            "codewhale",
-            "hermes",
-            "reasonix",
-            "omp",
-        ] {
+        for source in ["antigravity", "cursor", "codewhale", "reasonix", "omp"] {
             let mut evs = vec![AgentEvent::Identity {
                 agent_id: AgentId::from_parts(source, "ses_t"),
                 source: source.into(),
@@ -481,12 +471,12 @@ mod tests {
     /// now load-bearing — and a PluginStamp pid needs no corroboration.
     #[test]
     fn an_omp_session_batch_pairs_start_and_identity_and_binds_once_trusted() {
-        let evs = crate::source::omp::decode_omp_hook_payload(&serde_json::json!({
+        let evs = crate::source::omp::decode_omp_hook_payload(test_obj(&serde_json::json!({
             "type": "session_start",
             "sessionFile": "/h/.omp/agent/sessions/-repo/2026-08-30T01-00-00-000Z_01a00000-0000-7000-8000-000000000001.jsonl",
             "sessionId": "01a00000-0000-7000-8000-000000000001",
             "cwd": "/repo",
-        }))
+        })))
         .unwrap();
         assert!(
             matches!(
@@ -505,13 +495,13 @@ mod tests {
 
         // The switch batch: the current id's Start+Identity pair still collapses
         // to one trusted sighting, and the ended id binds a no-op beside it.
-        let evs = crate::source::omp::decode_omp_hook_payload(&serde_json::json!({
+        let evs = crate::source::omp::decode_omp_hook_payload(test_obj(&serde_json::json!({
             "type": "session_switch",
             "sessionFile": "/h/.omp/agent/sessions/-repo/2026-08-30T01-00-00-000Z_01a00000-0000-7000-8000-000000000002.jsonl",
             "previousSessionFile": "/h/.omp/agent/sessions/-repo/2026-08-30T01-00-00-000Z_01a00000-0000-7000-8000-000000000001.jsonl",
             "sessionId": "01a00000-0000-7000-8000-000000000002",
             "cwd": "/repo",
-        }))
+        })))
         .unwrap();
         assert_eq!(
             evs.len(),
@@ -562,20 +552,21 @@ mod tests {
                 cwd: None,
                 pid: None,
             },
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id: id,
                 tool_use_id: None,
                 detail: None,
             },
-            AgentEvent::ActivityEnd {
+            AgentEvent::ToolUseEnd {
                 agent_id: id,
                 tool_use_id: None,
             },
-            AgentEvent::Waiting {
-                agent_id: id,
-                reason: "x".into(),
-                tool_use_id: None,
-            },
+            AgentEvent::turn_end(id),
+            AgentEvent::user_action_request(
+                id,
+                Some("x".into()),
+                crate::source::RequestKeys::default(),
+            ),
             AgentEvent::SessionEnd {
                 agent_id: id,
                 as_child: false,
@@ -593,8 +584,8 @@ mod tests {
 
     use crate::test_capture::capture_warns;
 
-    // Decodes to TWO events (Identity + ActivityStart) — the shape the
-    // mid-payload loss path needs: more than one event per payload.
+    // Decodes to THREE events (Identity + ToolUsePending + ToolUseStart) — the
+    // shape the mid-payload loss path needs: more than one event per payload.
     const PRE_TOOL_USE_LINE: &[u8] = b"{\"hook_event_name\":\"PreToolUse\",\
         \"session_id\":\"ses-abc\",\
         \"transcript_path\":\"/p/ses-abc.jsonl\",\
@@ -668,8 +659,11 @@ mod tests {
         ));
         client
             .write_all(
-                b"{\"_pixtuoid_source\":\"openclaw\",\"type\":\"gateway_start\",\
-                  \"gatewayPort\":18789,\"_pid\":4242}\n",
+                format!(
+                    "{{\"{SOURCE_STAMP}\":\"openclaw\",\"type\":\"gateway_start\",\
+                     \"gatewayPort\":18789,\"_pid\":4242}}\n"
+                )
+                .as_bytes(),
             )
             .await
             .unwrap();
@@ -731,9 +725,12 @@ mod tests {
         ));
         client
             .write_all(
-                b"{\"_pixtuoid_source\":\"opencode\",\"type\":\"session.created\",\
-                  \"data\":{\"sessionID\":\"ses_neg\",\"location\":{\"directory\":\"/repo\"}},\
-                  \"_pid\":5555}\n",
+                format!(
+                    "{{\"{SOURCE_STAMP}\":\"opencode\",\"type\":\"session.execution.started\",\
+                     \"data\":{{\"sessionID\":\"ses_neg\",\"location\":{{\"directory\":\"/repo\"}}}},\
+                     \"_pid\":5555}}\n"
+                )
+                .as_bytes(),
             )
             .await
             .unwrap();
@@ -743,7 +740,7 @@ mod tests {
         assert_eq!(transport, Transport::Hook);
         assert!(
             matches!(ev, AgentEvent::SessionStart { .. }),
-            "opencode session.created decodes to SessionStart, got {ev:?}"
+            "opencode session.execution.started decodes to SessionStart, got {ev:?}"
         );
         assert!(
             prx.try_recv().is_err(),
@@ -775,12 +772,12 @@ mod tests {
         assert!(matches!(ev, AgentEvent::Identity { .. }));
         assert!(
             rx.try_recv().is_err(),
-            "second event must have been dropped"
+            "the later events must have been dropped"
         );
 
         let out = logs.contents();
         assert!(
-            out.contains("events=1"),
+            out.contains("events=2"),
             "loss breadcrumb missing from logs: {out:?}"
         );
         assert!(
@@ -836,10 +833,10 @@ mod tests {
         // TWO payloads: the CLI's own pid rides every hook event, and that
         // repeat is what arms the watch (#896).
         let line = format!(
-            "{{\"_pixtuoid_source\":\"codewhale\",\"event\":\"session_start\",\
-             \"cwd\":\"/repo\",\"_pid\":{pid}}}\n\
-             {{\"_pixtuoid_source\":\"codewhale\",\"event\":\"tool_call_before\",\
-             \"cwd\":\"/repo\",\"tool\":\"read_file\",\"_pid\":{pid}}}\n"
+            "{{\"{SOURCE_STAMP}\":\"codewhale\",\"event\":\"session_start\",\
+             \"session_id\":\"sess_t\",\"cwd\":\"/repo\",\"_pid\":{pid}}}\n\
+             {{\"{SOURCE_STAMP}\":\"codewhale\",\"event\":\"tool_call_before\",\
+             \"session_id\":\"sess_t\",\"cwd\":\"/repo\",\"tool\":\"read_file\",\"_pid\":{pid}}}\n"
         );
         client.write_all(line.as_bytes()).await.unwrap();
 
@@ -848,7 +845,7 @@ mod tests {
 
         child.kill().expect("kill the watched child");
         let _ = child.wait();
-        let expected = AgentId::from_parts("codewhale", "/repo");
+        let expected = AgentId::from_parts("codewhale", "sess_t");
         let end = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             // The decoded payloads land first; the pid's death arrives behind them.
             loop {
@@ -890,9 +887,9 @@ mod tests {
                 None,
             ));
             let line = format!(
-                "{{\"_pixtuoid_source\":\"kimi\",\"hook_event_name\":\"SessionStart\",\
+                "{{\"{SOURCE_STAMP}\":\"kimi\",\"hook_event_name\":\"SessionStart\",\
                  \"session_id\":\"s\",\"cwd\":\"/repo\",\"_pid\":{pid}}}\n\
-                 {{\"_pixtuoid_source\":\"kimi\",\"hook_event_name\":\"{end}\",\
+                 {{\"{SOURCE_STAMP}\":\"kimi\",\"hook_event_name\":\"{end}\",\
                  \"session_id\":\"s\",\"cwd\":\"/repo\",\"_pid\":{pid}}}\n"
             );
             client.write_all(line.as_bytes()).await.unwrap();
@@ -940,7 +937,7 @@ mod tests {
             None,
         ));
         let line = format!(
-            "{{\"_pixtuoid_source\":\"cursor\",\"hook_event_name\":\"preToolUse\",\
+            "{{\"{SOURCE_STAMP}\":\"cursor\",\"hook_event_name\":\"preToolUse\",\
              \"session_id\":\"sess-A\",\"workspace_roots\":[\"/repo\"],\
              \"tool_name\":\"Read\",\"_pid\":{pid}}}\n"
         );
@@ -985,7 +982,7 @@ mod tests {
             None,
         ));
         let line = format!(
-            "{{\"_pixtuoid_source\":\"kimi\",\"hook_event_name\":\"SessionStart\",\
+            "{{\"{SOURCE_STAMP}\":\"kimi\",\"hook_event_name\":\"SessionStart\",\
              \"session_id\":\"s\",\"cwd\":\"/repo\",\"_pid\":{pid}}}\n"
         );
         client.write_all(line.as_bytes()).await.unwrap();
@@ -1030,8 +1027,13 @@ mod tests {
             matches!(&ev, AgentEvent::Identity { source, pid: None, .. } if source == "claude-code"),
             "CC Identity must stay pid: None through the socket loop, got {ev:?}"
         );
-        let (_, ev) = rx.recv().await.expect("the paired ActivityStart");
-        assert!(matches!(ev, AgentEvent::ActivityStart { .. }), "got {ev:?}");
+        let (_, ev) = rx.recv().await.expect("the paired pre-use");
+        assert!(
+            matches!(ev, AgentEvent::ToolUsePending { .. }),
+            "got {ev:?}"
+        );
+        let (_, ev) = rx.recv().await.expect("the paired ToolUseStart");
+        assert!(matches!(ev, AgentEvent::ToolUseStart { .. }), "got {ev:?}");
     }
 
     #[tokio::test]
@@ -1042,7 +1044,7 @@ mod tests {
         let task = tokio::spawn(handle_conn(server.take(MAX_CONN_BYTES), tx, None, None));
         for event in ["SessionStart", "Stop"] {
             let line = serde_json::json!({
-                "_pixtuoid_source": "antigravity",
+                SOURCE_STAMP: "antigravity",
                 EVENT_STAMP: event,
                 "conversationId": "c1",
                 "workspacePaths": ["/repo"],
@@ -1076,8 +1078,8 @@ mod tests {
         // and an allocatable pid can be a live process on a busy CI host — an
         // unallocatable one guarantees `started: None`.
         let line = format!(
-            "{{\"_pixtuoid_source\":\"codewhale\",\"event\":\"tool_call_before\",\
-             \"cwd\":\"/repo\",\"tool\":\"exec_shell\",\"_pid\":{}}}\n",
+            "{{\"{SOURCE_STAMP}\":\"codewhale\",\"event\":\"tool_call_before\",\
+             \"session_id\":\"sess_t\",\"cwd\":\"/repo\",\"tool\":\"exec_shell\",\"_pid\":{}}}\n",
             i32::MAX
         );
         client.write_all(line.as_bytes()).await.unwrap();
@@ -1176,7 +1178,7 @@ mod tests {
         ));
         // An object without `type` — the openclaw decoder errs on it.
         client
-            .write_all(b"{\"_pixtuoid_source\":\"openclaw\"}\n")
+            .write_all(format!("{{\"{SOURCE_STAMP}\":\"openclaw\"}}\n").as_bytes())
             .await
             .unwrap();
         client

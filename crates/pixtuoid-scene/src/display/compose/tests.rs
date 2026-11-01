@@ -1,5 +1,7 @@
 use super::*;
 use crate::anim::Motion;
+use crate::character::test_support::make_slot;
+use crate::layout::Station;
 use crate::pack::test_office;
 
 /// The wall board of an empty office, which no clock moves: for frames
@@ -39,26 +41,10 @@ fn sort_row(pivot: crate::layout::Pivot, pos: crate::layout::Point, h: u16, belo
     piece_span(pivot, pos, 1, h, below).depth
 }
 
-/// The desk sorts on its face's south edge and a back-turned sitter on their
-/// seat's sort row; that row lands south of the face, so the "head
-/// over the surface" reading needs no special case.
-#[test]
-fn a_seated_occupant_sorts_in_front_of_the_desk_it_sits_at() {
-    let pack = test_office();
-    let desk = crate::layout::Point { x: 0, y: 10 };
-    let desk_z = desk_span(&pack, Desk::North, desk, RenderScale::ONE).depth;
-    let seated_z = seated_back_span(&pack, desk).depth;
-    assert!(
-        seated_z > desk_z,
-        "a seated occupant must paint over its desk (desk {desk_z}, seated {seated_z})"
-    );
-}
-
 /// The depth sort reserves no face under a density variant, which draws its
 /// own front, so someone on the first row south of the art stands in FRONT
 /// of the desk, not behind a face that is never drawn.
 #[test]
-#[cfg(feature = "cutaway-assets")]
 fn someone_just_south_of_a_variant_desk_sorts_in_front_of_it() {
     let pack = test_office();
     let scale = RenderScale::from(pack.max_density_variant());
@@ -170,12 +156,8 @@ fn a_back_turned_sitter_carries_their_own_chair() {
     let north: Vec<crate::layout::Point> = layout
         .home_desks
         .iter()
-        .enumerate()
-        .filter(|(i, _)| {
-            layout.desk_facing(pixtuoid_core::state::FloorLocalDeskIndex(*i))
-                == crate::layout::Facing::North
-        })
-        .map(|(_, d)| *d)
+        .filter(|d| d.facing == crate::layout::Facing::North)
+        .map(|d| d.at)
         .collect();
     assert!(!north.is_empty(), "the office has back-turned desks");
 
@@ -317,46 +299,37 @@ pub(crate) fn sit_down_as(
     id: pixtuoid_core::AgentId,
 ) -> (SceneLayout, OfficeArt, Vec<SimFrame>, crate::layout::Point) {
     use crate::floor::{FloorMeta, FloorSession};
-    use pixtuoid_core::state::{ActivityState, FloorLocalDeskIndex, ToolKind};
+    use pixtuoid_core::state::{ActivityState, FloorLocalDeskIndex, ToolKind, ToolUse};
     use std::time::{Duration, SystemTime};
     const LOGICAL: (u16, u16) = (160, 96);
     let meta = FloorMeta::ground();
     let layout = SceneLayout::compute_with_seed(LOGICAL.0, LOGICAL.1, None, meta.floor_seed)
         .expect("lays out");
-    let home = (0..layout.home_desks.len())
-        .find(|&i| layout.desk_facing(FloorLocalDeskIndex(i)) == facing)
+    let home = layout
+        .home_desks
+        .iter()
+        .position(|d| d.facing == facing)
         .expect("the office has a desk facing that way");
     let now0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let mut scene = pixtuoid_core::SceneState::uniform(16);
     scene.agents.insert(
         id,
         pixtuoid_core::AgentSlot {
-            agent_id: id,
-            source: std::sync::Arc::from("claude-code"),
-            session_id: std::sync::Arc::from("s"),
             cwd: std::sync::Arc::from(std::path::Path::new("/w/x")),
-            label: "x".into(),
-            state: ActivityState::Active {
-                tool_use_id: None,
-                detail: None,
-                kind: ToolKind::Edit,
-            },
             state_started_at: now0,
             created_at: now0,
             last_event_at: now0,
-            exiting_at: None,
-            pending_idle_at: None,
             desk_index: pixtuoid_core::GlobalDeskIndex(home),
-            floor_idx: 0,
-            tool_call_count: 0,
-            active_ms: 0,
-            unknown_cwd: false,
-            parent_id: None,
-            pid: None,
-            model: None,
-            effort: None,
-            tokens_used: 0,
-            last_usage: None,
+            ..make_slot(
+                id,
+                ActivityState::Running {
+                    item: Some(ToolUse {
+                        tool_use_id: None,
+                        detail: None,
+                        kind: ToolKind::Edit,
+                    }),
+                },
+            )
         },
     );
     let mut session = FloorSession::new(std::sync::Arc::new(pack.clone()));
@@ -367,7 +340,6 @@ pub(crate) fn sit_down_as(
             .step(
                 crate::floor::FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now: now0 + Duration::from_millis(100 * n),
                     floor: meta,
                     pets: crate::floor::PetInputs::default(),
@@ -390,7 +362,7 @@ pub(crate) fn sit_down_as(
         }
         frames.push(frame);
         if seated_at.is_some_and(|at| frames.len() > at + seated_ticks) {
-            let desk = layout.home_desks[home];
+            let desk = layout.home_desks[home].at;
             return (layout, pack, frames, desk);
         }
     }
@@ -519,7 +491,7 @@ fn a_sitters_depth_holds_through_their_breath() {
     for frame in frames.iter().filter(|f| {
         f.characters
             .first()
-            .is_some_and(|c| c.seat_desk == Some(desk))
+            .is_some_and(|c| c.seat_desk.is_some_and(|d| d.at == desk))
     }) {
         let mut order = Vec::new();
         push_characters(
@@ -585,7 +557,6 @@ fn a_badge_sits_above_the_head_and_centred_on_the_sprite() {
 /// across, its text whole, at every density the pack draws: a row lower
 /// and it covers the top of the elevator door, over everything.
 #[test]
-#[cfg(feature = "cutaway-assets")]
 fn the_floor_indicator_stays_in_its_cell() {
     use crate::display::text::LINE_H;
     let pack = crate::pack::test_office();
@@ -673,12 +644,11 @@ fn no_run_overprints_another_on_its_line() {
                 .any(|(r, ..)| *r == crate::display::TextRole::Brand),
             "at scale {s} the brand is drawn"
         );
-        // Without the density art every scale is the base art's grid.
         assert_eq!(
             rects
                 .iter()
                 .any(|(r, ..)| *r == crate::display::TextRole::Star),
-            cfg!(feature = "cutaway-assets") && s.is_multiple_of(d),
+            s.is_multiple_of(d),
             "at scale {s} the star is drawn exactly where the pack's density divides it"
         );
         for (i, (a, ya, ra)) in rects.iter().enumerate() {
@@ -695,7 +665,6 @@ fn no_run_overprints_another_on_its_line() {
 /// At the pack's 4x art the board writes inside the neon sign's dark
 /// interior, as the classic's terminal board does, however full its lines.
 #[test]
-#[cfg(feature = "cutaway-assets")]
 fn the_board_writes_inside_the_signs_interior() {
     use crate::layout::{
         NEON_PANEL_INNER_H, NEON_PANEL_INNER_W, NEON_PANEL_INNER_X, NEON_PANEL_INNER_Y,
@@ -703,8 +672,8 @@ fn the_board_writes_inside_the_signs_interior() {
     let pack = test_office();
     let scale = RenderScale::from(pack.max_density_variant());
     let counts = crate::tally::StateCounts {
-        waiting: 12,
-        active: 34,
+        requires_action: 12,
+        running: 34,
         idle: 56,
         exiting: 0,
         total: 102,

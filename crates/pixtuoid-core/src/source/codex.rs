@@ -13,18 +13,63 @@ use crate::source::decoder::{DecodeError, DecodeResult as Result};
 use serde_json::{Map, Value};
 
 use crate::AgentId;
-use crate::source::decoder::{MAX_DECODED_FIELD_CHARS, ellipsize, make_tool_detail};
-use crate::source::{AgentEvent, ToolDetail};
+use crate::source::decoder::{
+    HookSubject, MAX_DECODED_FIELD_CHARS, accept_all_paths, ellipsize, generic_tool_display,
+    hook_identity, hook_session_id, hook_tool_id_key, hook_tool_name, make_tool_detail, non_empty,
+};
+use crate::source::registry::{
+    ChildEndInference, FocusChannel, HookDecoding, HookObject, Hyphen, SourceCaps,
+    SourceDescriptor, SourceKind, ToolIdKey, Transcript,
+};
+use crate::source::{AgentEvent, RequestKeys, Resolution, ToolDetail};
+use crate::state::TurnKey;
 
 #[cfg(feature = "native")]
 mod native;
 #[cfg(feature = "native")]
 pub use native::CodexSource;
-#[cfg(feature = "native")]
-pub(crate) use native::live_codex_rollout_ids;
 
 /// The Codex source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "codex";
+
+pub(crate) const DESCRIPTOR: SourceDescriptor = SourceDescriptor {
+    name: SOURCE_NAME,
+    label_prefix: "cx",
+    verified_version: "0.166.0",
+    version_probe: Some(&["codex", "--version"]),
+    version_hyphen: Hyphen::Prerelease,
+    home_env: Some("CODEX_HOME"),
+    kind: SourceKind::Agent {
+        transcript: Some(Transcript {
+            line_decoder: decode_codex_line,
+            // The rollout filename's trailing UUID (the stem also has a timestamp).
+            id_from_path: codex_id_from_path,
+            path_filter: accept_all_paths,
+            cwd_extractor: extract_codex_cwd,
+            parent_extractor: Some(extract_codex_parent),
+        }),
+        hook: Some(HookDecoding::Shared {
+            tool_id_key: ToolIdKey::ToolUse,
+            // Its arms and why: `decode_codex_hook_custom`.
+            extend: decode_codex_hook_custom,
+        }),
+        caps: SourceCaps {
+            // Still false after #710 registered Codex's SessionEnd hook: it is
+            // teardown-only, so flipping this regresses abrupt exits to a 30-min reap.
+            has_exit_signal: false,
+            resurrects_on_prompt: true,
+            delegations_are_hook_silent: false,
+            // `spawn_agent` returns at launch, and a child's SubagentStop ends
+            // it (`codex-rs/core/src/hook_runtime.rs:401-437` at rust-v0.163.0).
+            child_end_inference: ChildEndInference::None,
+            child_hooks_unnamed: false,
+            brackets_turns: true,
+        },
+        focus: FocusChannel::TranscriptProbe,
+    },
+    #[cfg(feature = "native")]
+    native: native::NATIVE,
+};
 
 /// Trailing canonical UUID (`8-4-4-4-12`) of a `rollout-<ts>-<UUID>.jsonl`
 /// filename. Equals the hook payload's `session_id`, so hook and JSONL events
@@ -56,15 +101,15 @@ pub(crate) const DISPATCH_TOOL: &str = "spawn_agent";
 /// The `session_meta` field naming a child rollout's parent.
 const PARENT_THREAD_ID: &str = "parent_thread_id";
 
-/// Codex's source-specific hook arms, which change the event's SUBJECT to a
-/// child's AgentId where the shared session-keyed arms cannot:
-/// `SubagentStart`/`SubagentStop`, and any other event a child fires. A
-/// `spawn_agent` call's start is a Task wherever it fires; every other root
-/// event falls through (`Ok(None)`) to the shared arms.
-pub(crate) fn decode_codex_hook_custom(v: &Value) -> Result<Option<Vec<AgentEvent>>> {
-    let Some(obj) = v.as_object() else {
-        return Ok(None); // shared path reports the malformed payload
-    };
+/// The field naming the turn on codex's rollout payloads and hooks.
+const TURN_ID: &str = "turn_id";
+
+/// Codex's source-specific hook arms. The hooks carry only what the rollout
+/// lacks: a call about to run, the approval prompt, and its answers; the
+/// rollout owns the turns and the items. `SubagentStart`/`SubagentStop`
+/// change the event's SUBJECT to a child's AgentId; every other session event
+/// falls through to the shared arms, a child's under its own id.
+pub(crate) fn decode_codex_hook_custom(obj: &HookObject) -> Result<Option<Vec<AgentEvent>>> {
     let event = obj
         .get("hook_event_name")
         .and_then(|s| s.as_str())
@@ -73,18 +118,11 @@ pub(crate) fn decode_codex_hook_custom(v: &Value) -> Result<Option<Vec<AgentEven
     // `session_id`/`agent_id` would mint a phantom that never coalesces with
     // the real rollout.
     let guards = |obj: &Map<String, Value>| -> Result<(String, Option<String>)> {
-        let session_id = obj
-            .get("session_id")
-            .and_then(|s| s.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| DecodeError::missing(SOURCE_NAME, "session_id"))?
-            .to_string();
-        let child = obj
-            .get(crate::source::decoder::SUBAGENT_ID)
-            .and_then(|s| s.as_str())
-            .filter(|s| !s.is_empty())
-            .map(String::from);
-        Ok((session_id, child))
+        let subject = HookSubject::of(obj);
+        let session_id = subject
+            .root
+            .ok_or_else(|| DecodeError::missing(SOURCE_NAME, "session_id"))?;
+        Ok((session_id.to_owned(), subject.child.map(String::from)))
     };
     match event {
         // The subagent owns a SEPARATE rollout (filename UUID == this payload's
@@ -126,44 +164,97 @@ pub(crate) fn decode_codex_hook_custom(v: &Value) -> Result<Option<Vec<AgentEven
                 as_child: true,
             }]))
         }
+        "PreToolUse" | "PostToolUse" | "PermissionRequest" | "Stop" => {
+            decode_approval_hook(obj, event).map(Some)
+        }
         // A child's other events name it in `agent_id` beside the root's
         // `session_id`; a root's name none (`codex-rs/hooks/src/schema.rs:282-285`,
         // `core/src/hook_runtime.rs:1042-1061` at rust-v0.163.0).
-        _ => {
-            let dispatch = obj.get("tool_name").and_then(Value::as_str) == Some(DISPATCH_TOOL);
-            let evs = match crate::source::decoder::subagent_fired(obj, SOURCE_NAME, str::to_owned)?
-            {
-                Some(evs) => evs,
-                None if dispatch => crate::source::decoder::shared_hook_arms(
-                    obj,
-                    SOURCE_NAME,
-                    crate::source::registry::descriptor_for(SOURCE_NAME),
-                )?,
-                None => return Ok(None),
-            };
-            Ok(Some(if dispatch {
-                evs.into_iter().map(dispatched).collect()
-            } else {
-                evs
-            }))
-        }
+        _ => crate::source::decoder::subagent_fired(obj, SOURCE_NAME, str::to_owned),
     }
 }
 
-/// The shared arms detail only CC's dispatch as a Task.
-fn dispatched(event: AgentEvent) -> AgentEvent {
-    match event {
-        AgentEvent::ActivityStart {
-            agent_id,
-            tool_use_id,
-            ..
-        } => AgentEvent::ActivityStart {
-            agent_id,
-            tool_use_id,
-            detail: Some(ToolDetail::Task),
-        },
-        other => other,
+/// The approval's hooks, which the rollout lacks, on their [`HookSubject`].
+/// `PostToolUse` fires only on success and `PreToolUse` only for a tool with a
+/// pre-use payload (`codex-rs/core/src/tools/registry.rs` at rust-v0.164.0), so
+/// neither is an item: the rollout's call and output are.
+fn decode_approval_hook(obj: &HookObject, event: &str) -> Result<Vec<AgentEvent>> {
+    let session_id = match HookSubject::of(obj).child {
+        Some(child) => child.to_owned(),
+        None => hook_session_id(obj, SOURCE_NAME, event)?,
+    };
+    let agent_id = AgentId::from_parts(SOURCE_NAME, &session_id);
+    let turn = turn_of(obj, event);
+    let identity = || hook_identity(agent_id, SOURCE_NAME, &session_id, obj);
+    let tool_id_key = hook_tool_id_key(crate::source::registry::descriptor_for(SOURCE_NAME));
+    let call = || {
+        let call = non_empty(obj, tool_id_key).map(str::to_owned);
+        if call.is_none() {
+            crate::source::drift::missing_field(SOURCE_NAME, event, tool_id_key);
+        }
+        call
+    };
+    let tool_name = || hook_tool_name(obj, SOURCE_NAME, event);
+    Ok(match event {
+        "PreToolUse" => {
+            let tool_name = tool_name();
+            let pending = call().map(|tool_use_id| AgentEvent::ToolUsePending {
+                agent_id,
+                tool_use_id,
+                tool_name,
+                turn,
+            });
+            [identity()].into_iter().chain(pending).collect()
+        }
+        "PostToolUse" => {
+            let ran = call().map(|c| AgentEvent::UserActionResolved {
+                agent_id,
+                by: Resolution::Call(c),
+            });
+            [identity()].into_iter().chain(ran).collect()
+        }
+        // The rollout never persists an approval (`codex-rs/rollout/src/policy.rs:195-200`
+        // at rust-v0.164.0), so this is its only signal. A `write_stdin`
+        // prompt names its own call (`core/src/tools/approvals.rs:156-187`),
+        // which no `PreToolUse` announces.
+        "PermissionRequest" => vec![
+            identity(),
+            AgentEvent::user_action_request(
+                agent_id,
+                Some("permission".into()),
+                RequestKeys {
+                    tool_use_id: obj
+                        .get("tool_input")
+                        .and_then(Value::as_object)
+                        .and_then(|input| non_empty(input, "approval_id"))
+                        .map(str::to_owned),
+                    tool_name: tool_name(),
+                    turn,
+                },
+            ),
+        ],
+        // Stop runs only with no follow-up pending, yet a blocking Stop hook
+        // continues the turn (`core/src/session/turn.rs:722-759` at
+        // rust-v0.164.0): it answers the turn's requests, and ends nothing.
+        _ => turn
+            .map(|turn| AgentEvent::UserActionResolved {
+                agent_id,
+                by: Resolution::Turn(turn),
+            })
+            .into_iter()
+            .collect(),
+    })
+}
+
+/// The turn a hook or rollout payload names; codex stamps every one
+/// (`codex-rs/hooks/src/schema.rs` at rust-v0.164.0), so a missing one is
+/// drift.
+fn turn_of(obj: &Map<String, Value>, event: &str) -> Option<TurnKey> {
+    let turn = non_empty(obj, TURN_ID).map(|t| TurnKey::Id(t.into()));
+    if turn.is_none() {
+        crate::source::drift::missing_field(SOURCE_NAME, event, TURN_ID);
     }
+    turn
 }
 
 /// `payload.cwd`, on the head `session_meta` and each `turn_context`.
@@ -187,46 +278,28 @@ pub(crate) const EVENT_MSG: &str = "event_msg";
 pub(crate) const RESPONSE_ITEM: &str = "response_item";
 pub(crate) const TURN_CONTEXT: &str = "turn_context";
 
-const SANDBOX_PERMISSIONS_FIELD: &str = "sandbox_permissions";
-const REQUIRE_ESCALATED: &str = "require_escalated";
-
 /// The rollout inners, grouped BY BEHAVIOUR: each group is the matcher (the
 /// arms below guard on `contains`).
 const EM_TURN_START: &[&str] = &["task_started"];
-/// Written only to a Legacy-history rollout (`codex-rs/rollout/src/policy.rs:141-155`):
-/// exec and the TUI ask for a Paginated one (`codex-rs/exec/src/lib.rs:1462`,
-/// `codex-rs/tui/src/app_server_session.rs:2175`), which a thread store without
-/// paginated lists refuses, and exec then retries with none, the Legacy default
-/// (`codex-rs/app-server/src/request_processors/thread_processor.rs:1179-1186`,
-/// `codex-rs/exec/src/lib.rs:1426-1432`, `codex-rs/protocol/src/protocol.rs:880-882`,
-/// at `rust-v0.163.0`).
-const EM_RESUME: &[&str] = &["patch_apply_end"];
-/// As [`EM_RESUME`].
-const EM_SEARCH: &[&str] = &["web_search_end"];
 const EM_TURN_END: &[&str] = &["task_complete", "turn_aborted"];
 const EM_TOKENS: &[&str] = &["token_count"];
 
 const RI_TOOL_START: &[&str] = &["function_call", "custom_tool_call"];
 const RI_CALL_OUTPUT: &str = "function_call_output";
 const RI_CUSTOM_OUTPUT: &str = "custom_tool_call_output";
-const RI_RESUME: &[&str] = &[RI_CALL_OUTPUT, RI_CUSTOM_OUTPUT];
+const RI_CALL_END: &[&str] = &[RI_CALL_OUTPUT, RI_CUSTOM_OUTPUT];
 /// The call an output answers. Optional on a `function_call_output`, which
 /// codex also writes for a host-delivered output that answers no call
 /// (`codex-rs/protocol/src/models.rs:1151-1153` at `rust-v0.163.0`), and
 /// required on a `custom_tool_call_output` (`:1195`).
 const CALL_ID: &str = "call_id";
-const RI_SEARCH: &[&str] = &["web_search_call", "tool_search_call", "tool_search_output"];
 
-/// Decode one transcript line. Only an output's End carries its call's id
-/// (`tool_use_id`), so only that End meets the hook-wins dedup (#150).
-///
-/// # Errors
-///
-/// Never: the `Result` is the [`LineDecoder`](crate::source::decoder::LineDecoder) signature, and a malformed line decodes to `vec![]`.
-pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Result<Vec<AgentEvent>> {
+/// Decode one rollout line: the turns' brackets and the items, each keyed by
+/// the wire's own id.
+pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Vec<AgentEvent> {
     let agent_id = AgentId::from_parts(source, &codex_id_from_path(Path::new(transcript_path)));
     let Some(obj) = v.as_object() else {
-        return Ok(vec![]);
+        return vec![];
     };
     let outer = obj.get("type").and_then(|s| s.as_str()).unwrap_or("");
     let payload = obj.get("payload").and_then(|p| p.as_object());
@@ -235,64 +308,44 @@ pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Resul
         .and_then(|s| s.as_str())
         .unwrap_or("");
 
-    let start = || AgentEvent::ActivityStart {
-        agent_id,
-        tool_use_id: None,
-        detail: None,
-    };
-    let end = || AgentEvent::ActivityEnd {
-        agent_id,
-        tool_use_id: None,
-    };
-
-    let out = match (outer, inner) {
-        (EVENT_MSG, i) if EM_TURN_START.contains(&i) => vec![start()],
+    // The turns ride the rollout, which is complete and in order; their keys
+    // are `sub_id` (`codex-rs/core/src/tasks/mod.rs:848-850` at rust-v0.164.0).
+    let turn = || payload.and_then(|p| turn_of(p, inner));
+    match (outer, inner) {
+        (EVENT_MSG, i) if EM_TURN_START.contains(&i) => turn()
+            .map(|turn| AgentEvent::TurnStart { agent_id, turn })
+            .into_iter()
+            .collect(),
         // `custom_tool_call` is the SAME item under codex's custom-tool API and is
         // what a modern session serializes — `a_custom_tool_call_is_a_tool_call`.
         (RESPONSE_ITEM, i) if RI_TOOL_START.contains(&i) => {
-            if function_call_needs_approval(payload) {
-                vec![AgentEvent::Waiting {
-                    agent_id,
-                    reason: "permission".to_string(),
-                    tool_use_id: None,
-                }]
-            } else {
-                vec![codex_tool_start(agent_id, payload)]
-            }
+            vec![codex_tool_start(agent_id, i, payload)]
         }
-        // Resume signals: a command/patch finished, or a call was refused. Each
-        // is an ActivityStart so the reducer clears any Waiting set by the
-        // permission gate. A call's output also ENDS that call: a refused call
-        // gets no `PostToolUse`, so this is its only end.
-        (RESPONSE_ITEM, i) if RI_RESUME.contains(&i) => {
-            let call = payload
-                .and_then(|p| p.get(CALL_ID))
-                .and_then(Value::as_str)
-                .filter(|c| !c.is_empty());
+        // A call's output ends it, answering a request that holds it: a
+        // refused call gets no `PostToolUse`, so this is its only end.
+        (RESPONSE_ITEM, i) if RI_CALL_END.contains(&i) => {
+            let call = payload.and_then(|p| non_empty(p, CALL_ID));
             if call.is_none() && i == RI_CUSTOM_OUTPUT {
                 crate::source::drift::missing_field(SOURCE_NAME, i, CALL_ID);
             }
-            call.map(|c| AgentEvent::ActivityEnd {
+            call.map(|c| AgentEvent::ToolUseEnd {
                 agent_id,
                 tool_use_id: Some(c.to_owned()),
             })
             .into_iter()
-            .chain([start()])
             .collect()
         }
-        (EVENT_MSG, i) if EM_RESUME.contains(&i) => vec![start()],
-        // Web/tool search are turn-INTERNAL work pulses that keep the agent
-        // Active; only task_complete / turn_aborted end the turn. Searching is
-        // never permission-prompted — no Waiting branch.
-        (RESPONSE_ITEM, i) if RI_SEARCH.contains(&i) => vec![start()],
-        (EVENT_MSG, i) if EM_SEARCH.contains(&i) => vec![start()],
-        (EVENT_MSG, i) if EM_TURN_END.contains(&i) => vec![end()],
+        (EVENT_MSG, i) if EM_TURN_END.contains(&i) => vec![match turn() {
+            Some(turn) => AgentEvent::keyed_turn_end(agent_id, turn),
+            None => AgentEvent::turn_end(agent_id),
+        }],
         // `last_token_usage` is that turn's reading; the cumulative twin
         // `total_token_usage` must NOT be read — the reducer accumulates
         // deltas, so summing a running total would double-count. codex's
         // `input_tokens` INCLUDES the cached share (verified), so fresh input
         // = input − cached, saturating because upstream reporting quirks must
-        // not wrap; `reasoning_output_tokens` is additive alongside `output`.
+        // not wrap. `output_tokens` already holds `reasoning_output_tokens`
+        // (codex-rs/codex-api/src/sse/responses.rs `parses_cache_write_token_usage`).
         (EVENT_MSG, i) if EM_TOKENS.contains(&i) => {
             let last = payload
                 .and_then(|p| p.get("info"))
@@ -303,7 +356,6 @@ pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Resul
                 field("input_tokens")
                     .saturating_sub(field("cached_input_tokens"))
                     .saturating_add(field("output_tokens"))
-                    .saturating_add(field("reasoning_output_tokens"))
             });
             if fresh > 0 {
                 vec![AgentEvent::Usage {
@@ -338,59 +390,60 @@ pub fn decode_codex_line(transcript_path: &str, source: &str, v: Value) -> Resul
             }
         }
         _ => vec![],
-    };
-    Ok(out)
+    }
 }
 
-/// A Codex `function_call` requesting escalated sandbox permissions
-/// (`arguments` is a JSON string carrying `sandbox_permissions:
-/// "require_escalated"`) is an approval gate → Waiting. A bare `justification`
-/// is intentionally NOT a signal: Codex emits it on auto-approved commands too,
-/// so keying on it would false-Wait.
-/// Codex has TWO tool surfaces and only this one marks escalation in the
-/// rollout. A `custom_tool_call` carries `input` — a JS snippet, not JSON args —
-/// and a recorded escalated run on that surface shows no marker anywhere, so
-/// there the gate exists ONLY on the hook wire (`PermissionRequest`). Which
-/// surface a turn takes is model-chosen, so neither is dead: a local rollout
-/// census found real `require_escalated` calls, and codex 0.147.0's system
-/// prompt still instructs the model to send exactly this parameter.
-fn function_call_needs_approval(payload: Option<&Map<String, Value>>) -> bool {
-    let Some(args_str) = payload
-        .and_then(|p| p.get("arguments"))
-        .and_then(|a| a.as_str())
-    else {
-        return false;
-    };
-    let args = match serde_json::from_str::<Value>(args_str) {
-        Ok(v) => v,
-        Err(e) => {
-            crate::source::drift::shape_drift(
-                SOURCE_NAME,
-                &format!("function_call arguments not parseable: {e}"),
-            );
-            return false;
-        }
-    };
-    args.get(SANDBOX_PERMISSIONS_FIELD).and_then(|s| s.as_str()) == Some(REQUIRE_ESCALATED)
-}
+/// codex's code-mode tool: a JavaScript cell whose nested calls run inside it,
+/// so the cell is the item (`codex-rs/code-mode-protocol/src/lib.rs:54` at
+/// rust-v0.164.0).
+const CODE_MODE_TOOL: &str = "exec";
 
-fn codex_tool_start(agent_id: AgentId, payload: Option<&Map<String, Value>>) -> AgentEvent {
-    let name = payload
-        .and_then(|p| p.get("name"))
-        .and_then(|s| s.as_str())
-        .unwrap_or_else(|| {
-            crate::source::drift::missing_field(SOURCE_NAME, "tool call", "name");
-            "tool"
-        });
-    AgentEvent::ActivityStart {
+/// Where a code-mode cell finds its nested tools, each named by a JavaScript
+/// identifier (`codex-rs/code-mode-protocol/src/description.rs:25` at
+/// rust-v0.164.0).
+const CELL_TOOLS: &str = "tools.";
+
+fn codex_tool_start(
+    agent_id: AgentId,
+    inner: &str,
+    payload: Option<&Map<String, Value>>,
+) -> AgentEvent {
+    let field = |k: &str| payload.and_then(|p| p.get(k)).and_then(Value::as_str);
+    let name = field("name").unwrap_or_else(|| {
+        crate::source::drift::missing_field(SOURCE_NAME, "tool call", "name");
+        "tool"
+    });
+    let tool_use_id = payload
+        .and_then(|p| non_empty(p, CALL_ID))
+        .map(str::to_owned);
+    if tool_use_id.is_none() {
+        crate::source::drift::missing_field(SOURCE_NAME, inner, CALL_ID);
+    }
+    AgentEvent::ToolUseStart {
         agent_id,
-        tool_use_id: None,
-        detail: Some(if name == DISPATCH_TOOL {
-            ToolDetail::Task
-        } else {
-            make_tool_detail(SOURCE_NAME, name, None)
+        tool_use_id,
+        detail: Some(match name {
+            DISPATCH_TOOL => ToolDetail::Task,
+            CODE_MODE_TOOL => generic_tool_display(name, field("input").and_then(cell_tool)),
+            _ => make_tool_detail(SOURCE_NAME, name, None),
         }),
     }
+}
+
+/// The first nested tool a code-mode cell calls by name, the informative part
+/// of its source.
+fn cell_tool(source: &str) -> Option<&str> {
+    let mut rest = source;
+    while let Some((_, after)) = rest.split_once(CELL_TOOLS) {
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .unwrap_or(after.len());
+        if let Some(name) = after.get(..end).filter(|n| !n.is_empty()) {
+            return Some(name);
+        }
+        rest = after;
+    }
+    None
 }
 
 /// The Codex home dir, matching codex's own precedence (`codex-rs`
@@ -423,6 +476,7 @@ fn resolve_codex_home(codex_home_env: Option<PathBuf>, home: PathBuf) -> PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::decoder::test_obj;
 
     #[test]
     fn codex_home_uses_env_when_it_points_at_an_existing_dir() {
@@ -458,16 +512,15 @@ mod tests {
                             "model": "gpt-5.6-sol", "effort": "xhigh",
                             "info": {"last_token_usage": {"input_tokens": 1}}},
             });
-            decode_codex_line("/p/rollout-2026-07-10-abc.jsonl", "codex", v)
-                .is_ok_and(|e| !e.is_empty())
+            !decode_codex_line("/p/rollout-2026-07-10-abc.jsonl", "codex", v).is_empty()
         };
-        for inner in [EM_TURN_START, EM_RESUME, EM_SEARCH, EM_TURN_END, EM_TOKENS].concat() {
+        for inner in [EM_TURN_START, EM_TURN_END, EM_TOKENS].concat() {
             assert!(
                 drive(EVENT_MSG, inner),
                 "event_msg/{inner} must reach an arm"
             );
         }
-        for inner in [RI_TOOL_START, RI_RESUME, RI_SEARCH].concat() {
+        for inner in [RI_TOOL_START, RI_CALL_END].concat() {
             assert!(
                 drive(RESPONSE_ITEM, inner),
                 "response_item/{inner} must reach an arm",
@@ -493,7 +546,7 @@ mod tests {
             "type": "turn_context",
             "payload": {"turn_id": "t1", "cwd": "/r", "model": "gpt-5.6-sol", "effort": "xhigh"}
         });
-        let evs = decode_codex_line("/p/rollout-2026-07-10-abc.jsonl", "codex", v).unwrap();
+        let evs = decode_codex_line("/p/rollout-2026-07-10-abc.jsonl", "codex", v);
         assert!(
             evs.iter().any(
                 |e| matches!(e, AgentEvent::ModelInfo { model: Some(m), effort: Some(f), .. }
@@ -505,17 +558,13 @@ mod tests {
             "type": "turn_context",
             "payload": {"turn_id": "t2", "cwd": "/r", "model": "gpt-5.5"}
         });
-        let evs = decode_codex_line("/p/rollout-2026-07-10-abc.jsonl", "codex", v).unwrap();
+        let evs = decode_codex_line("/p/rollout-2026-07-10-abc.jsonl", "codex", v);
         assert!(
             evs.iter().any(|e| matches!(e, AgentEvent::ModelInfo { model: Some(m), effort: None, .. } if m == "gpt-5.5")),
             "got {evs:?}"
         );
         let v = serde_json::json!({"type": "turn_context", "payload": {"turn_id": "t3"}});
-        assert!(
-            decode_codex_line("/p/rollout-2026-07-10-abc.jsonl", "codex", v)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(decode_codex_line("/p/rollout-2026-07-10-abc.jsonl", "codex", v).is_empty());
     }
 
     #[test]
@@ -538,22 +587,26 @@ mod tests {
         for event in ["SubagentStart", "SubagentStop"] {
             let no_session = json!({"hook_event_name": event, "agent_id": "child"});
             assert!(
-                decode_codex_hook_custom(&no_session).is_err(),
+                decode_codex_hook_custom(test_obj(&no_session)).is_err(),
                 "{event} without session_id must Err (claim-fully), not fall through"
             );
             let empty_child = json!({"hook_event_name": event, "session_id": "s", "agent_id": ""});
             assert!(
-                decode_codex_hook_custom(&empty_child).is_err(),
+                decode_codex_hook_custom(test_obj(&empty_child)).is_err(),
                 "{event} with empty agent_id must Err — a phantom child never coalesces"
             );
         }
     }
 
     #[test]
-    fn a_roots_events_fall_through_to_shared_arms() {
-        let stop = json!({"hook_event_name": "Stop", "session_id": "s"});
-        assert!(matches!(decode_codex_hook_custom(&stop), Ok(None)));
-        assert!(matches!(decode_codex_hook_custom(&json!("nope")), Ok(None)));
+    fn a_roots_session_events_fall_through_to_shared_arms() {
+        for event in ["SessionStart", "UserPromptSubmit", "SessionEnd"] {
+            let v = json!({"hook_event_name": event, "session_id": "s"});
+            assert!(
+                matches!(decode_codex_hook_custom(test_obj(&v)), Ok(None)),
+                "{event}"
+            );
+        }
     }
 
     const ROOT: &str = "01a14e36-774b-7a43-a766-5159e4eb32f6";
@@ -631,37 +684,99 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_agent_call_is_a_task_on_either_transport() {
-        let spawn = json!({"tool_name": DISPATCH_TOOL, "tool_use_id": "call_Fxnld0qmszdIwSfB",
+    fn a_spawn_agent_call_is_a_task_on_the_rollout_and_only_pending_on_the_hook() {
+        const CALL: &str = "call_Fxnld0qmszdIwSfB";
+        let spawn = json!({"tool_name": DISPATCH_TOOL, "tool_use_id": CALL,
                            "tool_input": {"message": "CHILD-TASK"}});
         for child in [false, true] {
             let evs = hook("PreToolUse", child, spawn.clone());
             assert!(
-                evs.iter().any(|e| matches!(e, AgentEvent::ActivityStart {
-                    detail: Some(d), tool_use_id: Some(_), .. } if d.is_task())),
+                matches!(&evs[..], [AgentEvent::Identity { .. }, AgentEvent::ToolUsePending {
+                    tool_use_id, tool_name, .. }]
+                    if tool_use_id == CALL && tool_name.as_deref() == Some(DISPATCH_TOOL)),
                 "child={child}: {evs:?}"
             );
         }
         let line = json!({"type": "response_item", "payload": {"type": "function_call",
             "name": DISPATCH_TOOL, "namespace": "multi_agent_v1",
-            "arguments": "{\"message\":\"CHILD-TASK\"}", "call_id": "call_Fxnld0qmszdIwSfB"}});
-        let evs =
-            decode_codex_line("/p/rollout-2026-10-18T01-52-34-x.jsonl", "codex", line).unwrap();
+            "arguments": "{\"message\":\"CHILD-TASK\"}", "call_id": CALL}});
+        let evs = decode_codex_line("/p/rollout-2026-10-18T01-52-34-x.jsonl", "codex", line);
         assert!(
-            evs.iter().any(|e| matches!(e, AgentEvent::ActivityStart {
-                detail: Some(d), .. } if d.is_task())),
+            matches!(&evs[..], [AgentEvent::ToolUseStart {
+                tool_use_id: Some(c), detail: Some(d), .. }] if c == CALL && d.is_task()),
             "{evs:?}"
         );
-        let other = hook(
-            "PreToolUse",
+    }
+
+    #[test]
+    fn the_hooks_carry_only_what_the_rollout_lacks() {
+        const TURN: &str = "01a14e36-7827-7f92-a603-b700dc3aa71c";
+        let turn = Some(TurnKey::Id(TURN.into()));
+        let tool = json!({"tool_name": "Bash", "tool_input": {"command": "rm NOTE.txt"},
+                          "tool_use_id": "call_P60"});
+        let pre = hook("PreToolUse", false, tool.clone());
+        assert!(
+            matches!(&pre[..], [AgentEvent::Identity { .. }, AgentEvent::ToolUsePending {
+                tool_use_id, tool_name, turn: t, .. }]
+                if tool_use_id == "call_P60" && tool_name.as_deref() == Some("Bash") && *t == turn),
+            "{pre:?}"
+        );
+        let post = hook("PostToolUse", false, tool);
+        assert!(
+            matches!(&post[..], [AgentEvent::Identity { .. }, AgentEvent::UserActionResolved {
+                by: Resolution::Call(c), .. }] if c == "call_P60"),
+            "{post:?}"
+        );
+        let stop = hook("Stop", false, json!({"stop_hook_active": false}));
+        assert!(
+            matches!(&stop[..], [AgentEvent::UserActionResolved {
+                by: Resolution::Turn(t), .. }] if Some(t) == turn.as_ref()),
+            "{stop:?}"
+        );
+        let asked = hook(
+            "PermissionRequest",
             false,
-            json!({"tool_name": "Bash", "tool_use_id": "c",
-                                                    "tool_input": {"command": "ls"}}),
+            json!({"tool_name": "Bash", "tool_input": {"command": "rm NOTE.txt"}}),
         );
         assert!(
-            !other.iter().any(|e| matches!(e, AgentEvent::ActivityStart {
-                detail: Some(d), .. } if d.is_task())),
-            "{other:?}"
+            matches!(&asked[..], [AgentEvent::Identity { .. }, AgentEvent::UserActionRequest {
+                tool_use_id: None, tool_name: Some(n), turn: t, .. }]
+                if n == "Bash" && *t == turn),
+            "{asked:?}"
+        );
+        let stdin = hook(
+            "PermissionRequest",
+            false,
+            json!({"tool_name": "write_stdin",
+                   "tool_input": {"chars": "y\n", "approval_id": "call_stdin"}}),
+        );
+        assert!(
+            matches!(&stdin[..], [_, AgentEvent::UserActionRequest {
+                tool_use_id: Some(c), .. }] if c == "call_stdin"),
+            "a write_stdin prompt names its own call: {stdin:?}"
+        );
+    }
+
+    #[test]
+    fn a_hook_missing_its_keys_breadcrumbs_and_decodes_what_it_can() {
+        let logs = crate::test_capture::capture_logs(|| {
+            let mut v = json!({"hook_event_name": "Stop", "session_id": ROOT,
+                               "_pixtuoid_source": SOURCE_NAME});
+            assert!(
+                crate::source::decoder::decode_hook_payload(v.clone())
+                    .expect("decodes")
+                    .is_empty()
+            );
+            v["hook_event_name"] = json!("PreToolUse");
+            v["turn_id"] = json!("t");
+            assert!(matches!(
+                &crate::source::decoder::decode_hook_payload(v).expect("decodes")[..],
+                [AgentEvent::Identity { .. }]
+            ));
+        });
+        assert!(
+            logs.contains(TURN_ID) && logs.contains("tool_use_id"),
+            "{logs}"
         );
     }
 
@@ -674,7 +789,10 @@ mod tests {
             "reason": "other",
             "_pixtuoid_source": SOURCE_NAME,
         });
-        assert!(matches!(decode_codex_hook_custom(&payload), Ok(None)));
+        assert!(matches!(
+            decode_codex_hook_custom(test_obj(&payload)),
+            Ok(None)
+        ));
         let events = crate::source::decoder::decode_hook_payload(payload).unwrap();
         let expected = AgentId::from_parts(SOURCE_NAME, "019e7762-9ded-7e33-be41-946ecf105bf4");
         assert!(
@@ -693,13 +811,17 @@ mod tests {
             SOURCE_NAME,
             line,
         )
-        .unwrap()
     }
 
     #[test]
-    fn task_started_is_activity_start() {
+    fn task_started_opens_its_turn() {
         let out = ev(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}));
-        assert!(matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]));
+        assert!(
+            matches!(out.as_slice(), [
+                AgentEvent::TurnStart { turn: TurnKey::Id(t), .. },
+            ] if &**t == "t"),
+            "{out:?}"
+        );
     }
 
     /// codex's serde aliases are read-only (`codex-rs/protocol/src/protocol.rs`
@@ -716,52 +838,40 @@ mod tests {
     /// Captured off codex 2026-08: a real rollout serializes its tool calls as
     /// `custom_tool_call`, never the `function_call` the composed fixture used, so
     /// reading only the latter let four tool calls decode to nothing while the
-    /// turn still showed Active from `task_started`.
+    /// turn still showed Running from `task_started`.
     #[test]
     fn a_custom_tool_call_is_a_tool_call() {
         let out = ev(json!({"type":"response_item","payload":{
-            "type":"custom_tool_call","call_id":"call_x","name":"exec","input":"ls"}}));
-        match out.as_slice() {
-            [
-                AgentEvent::ActivityStart {
-                    detail: Some(d), ..
-                },
-            ] => {
-                assert!(
-                    format!("{d:?}").contains("exec"),
-                    "tool name must reach the detail: {d:?}"
-                )
-            }
-            other => panic!("expected an ActivityStart carrying the tool, got {other:?}"),
-        }
-        let resumed = ev(json!({"type":"response_item","payload":{
+            "type":"custom_tool_call","call_id":"call_x","name":"apply_patch","input":"*** Begin"}}));
+        assert!(
+            matches!(out.as_slice(), [AgentEvent::ToolUseStart {
+                tool_use_id: Some(c), detail: Some(d), .. }]
+                if c == "call_x" && d.display() == "apply_patch"),
+            "{out:?}"
+        );
+        let ended = ev(json!({"type":"response_item","payload":{
             "type":"custom_tool_call_output","call_id":"call_x","output":"ok"}}));
         assert!(
-            matches!(resumed.as_slice(), [
-                AgentEvent::ActivityEnd { tool_use_id: Some(c), .. },
-                AgentEvent::ActivityStart { .. },
+            matches!(ended.as_slice(), [
+                AgentEvent::ToolUseEnd { tool_use_id: Some(c), .. },
             ] if c == "call_x"),
-            "its output must end its call and resume work like function_call_output does"
+            "its output must end its call like function_call_output does"
         );
     }
 
     #[test]
-    fn function_call_output_ends_its_call_and_resumes_work() {
+    fn a_calls_output_ends_it() {
         let out = ev(
             json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"ok"}}),
         );
         assert!(matches!(out.as_slice(), [
-            AgentEvent::ActivityEnd { tool_use_id: Some(c), .. },
-            AgentEvent::ActivityStart { .. },
+            AgentEvent::ToolUseEnd { tool_use_id: Some(c), .. },
         ] if c == "c"));
         let logs = crate::test_capture::capture_logs(|| {
             let unpaired = ev(
                 json!({"type":"response_item","payload":{"type":"function_call_output","output":"ok"}}),
             );
-            assert!(matches!(
-                unpaired.as_slice(),
-                [AgentEvent::ActivityStart { .. }]
-            ));
+            assert!(unpaired.is_empty(), "{unpaired:?}");
         });
         assert!(
             !logs.contains("missing_field"),
@@ -773,10 +883,7 @@ mod tests {
                 if !call.is_null() {
                     line["payload"]["call_id"] = call.clone();
                 }
-                assert!(matches!(
-                    ev(line).as_slice(),
-                    [AgentEvent::ActivityStart { .. }]
-                ));
+                assert!(ev(line).is_empty());
             });
             assert!(
                 logs.contains("missing_field") && logs.contains("call_id"),
@@ -787,8 +894,7 @@ mod tests {
             let keyed = ev(json!({"type":"response_item","payload":{
                 "type":"custom_tool_call_output","call_id":"call_x","output":"ok"}}));
             assert!(matches!(keyed.as_slice(), [
-                AgentEvent::ActivityEnd { tool_use_id: Some(c), .. },
-                AgentEvent::ActivityStart { .. },
+                AgentEvent::ToolUseEnd { tool_use_id: Some(c), .. },
             ] if c == "call_x"));
         });
         assert!(
@@ -797,79 +903,107 @@ mod tests {
         );
     }
 
+    /// A cell's nested calls run inside it, so its detail is the first tool
+    /// it calls: slicing JS for a "first statement" has no answer without a
+    /// parser (a cell opening `try {`, a comment, a `;` inside a string).
     #[test]
-    fn patch_apply_end_resumes_work() {
-        let out =
-            ev(json!({"type":"event_msg","payload":{"type":"patch_apply_end","success":true}}));
-        assert!(matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]));
-    }
-
-    #[test]
-    fn web_and_tool_search_keep_the_agent_active() {
-        for line in [
-            json!({"type":"response_item","payload":{"type":"web_search_call","status":"completed","action":{}}}),
-            json!({"type":"event_msg","payload":{"type":"web_search_end","call_id":"c","query":"q","action":{}}}),
-            json!({"type":"response_item","payload":{"type":"tool_search_call","call_id":"c","status":"in_progress","arguments":"{}"}}),
-            json!({"type":"response_item","payload":{"type":"tool_search_output","call_id":"c","status":"completed","tools":[]}}),
+    fn a_code_mode_cell_shows_the_first_tool_it_calls() {
+        for (input, want) in [
+            (
+                "// @exec: {}\ntry {\n  text(await tools.exec_command({ cmd: \"cd src; ls\" }));\n} catch (e) {}",
+                Some("exec_command"),
+            ),
+            (
+                "// read the note\nconst r = await tools.mcp__fs__read_file$2({});",
+                Some("mcp__fs__read_file$2"),
+            ),
+            ("text(\"tools. alone\"); yield_control();", None),
+            ("const t = tools[name];", None),
         ] {
-            let out = ev(line.clone());
+            assert_eq!(cell_tool(input), want, "{input:?}");
+        }
+        for (input, want) in [
+            ("text(await tools.apply_patch(p))", Some("apply_patch")),
+            ("text(1)", None),
+        ] {
+            let out = ev(json!({"type":"response_item","payload":{
+                "type":"custom_tool_call","call_id":"call_x","name":CODE_MODE_TOOL,"input":input}}));
             assert!(
-                matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]),
-                "search event {line} must keep the agent Active"
+                matches!(out.as_slice(), [AgentEvent::ToolUseStart { detail: Some(d), .. }]
+                    if *d == generic_tool_display(CODE_MODE_TOOL, want)),
+                "{input:?}: {out:?}"
             );
         }
     }
 
     #[test]
-    fn escalated_function_call_is_waiting() {
-        let args = format!(
-            r#"{{"cmd":"date","{SANDBOX_PERMISSIONS_FIELD}":"{REQUIRE_ESCALATED}","justification":"allow?"}}"#
+    fn the_approval_hooks_read_the_rows_tool_id_key() {
+        let key = crate::source::decoder::hook_tool_id_key(
+            crate::source::registry::descriptor_for(SOURCE_NAME),
         );
-        let args = args.as_str();
-        let out = ev(
-            json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":args}}),
-        );
-        assert!(matches!(out.as_slice(), [AgentEvent::Waiting { .. }]));
-    }
-
-    #[test]
-    fn plain_function_call_is_activity_start() {
-        let args = r#"{"cmd":"ls"}"#;
-        let out = ev(
-            json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":args}}),
-        );
-        assert!(matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]));
-    }
-
-    #[test]
-    fn justification_without_escalation_is_not_waiting() {
-        let args = r#"{"cmd":"ls","justification":"because"}"#;
-        let out = ev(
-            json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":args}}),
+        let evs = hook(
+            "PostToolUse",
+            false,
+            json!({"tool_name": "Bash", key: "call_k"}),
         );
         assert!(
-            matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]),
+            matches!(&evs[..], [_, AgentEvent::UserActionResolved {
+                by: Resolution::Call(c), .. }] if c == "call_k"),
+            "{evs:?}"
+        );
+    }
+
+    /// No name on the wire is no binding key: the pending call still counts
+    /// for the sole-pending rule.
+    #[test]
+    fn a_pre_use_naming_no_tool_binds_by_no_name() {
+        let evs = hook("PreToolUse", false, json!({"tool_use_id": "c"}));
+        assert!(
+            matches!(
+                &evs[..],
+                [
+                    _,
+                    AgentEvent::ToolUsePending {
+                        tool_name: None,
+                        ..
+                    }
+                ]
+            ),
+            "{evs:?}"
+        );
+    }
+
+    #[test]
+    fn a_function_call_is_its_calls_start() {
+        let out = ev(
+            json!({"type":"response_item","payload":{"type":"function_call",
+            "name":"exec_command","arguments":r#"{"cmd":"ls"}"#,"call_id":"call_1"}}),
+        );
+        assert!(
+            matches!(out.as_slice(), [AgentEvent::ToolUseStart { tool_use_id: Some(c), .. }]
+                if c == "call_1"),
             "{out:?}"
         );
     }
 
     #[test]
-    fn malformed_arguments_does_not_panic_and_starts_work() {
-        let out = ev(
-            json!({"type":"response_item","payload":{"type":"function_call","name":"x","arguments":"{not json"}}),
-        );
-        assert!(matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]));
-    }
-
-    #[test]
-    fn task_complete_and_abort_end_activity() {
+    fn task_complete_and_abort_end_their_turn() {
         for t in ["task_complete", "turn_aborted"] {
             let out = ev(json!({"type":"event_msg","payload":{"type":t,"turn_id":"t"}}));
             assert!(
-                matches!(out.as_slice(), [AgentEvent::ActivityEnd { .. }]),
-                "{t}"
+                matches!(out.as_slice(), [AgentEvent::TurnEnd { turn: Some(TurnKey::Id(k)), .. }]
+                    if &**k == "t"),
+                "{t}: {out:?}"
             );
         }
+        let logs = crate::test_capture::capture_logs(|| {
+            let out = ev(json!({"type":"event_msg","payload":{"type":"task_complete"}}));
+            assert!(
+                matches!(out.as_slice(), [AgentEvent::TurnEnd { turn: None, .. }]),
+                "an end naming no turn still ends the work: {out:?}"
+            );
+        });
+        assert!(logs.contains(TURN_ID), "{logs}");
     }
 
     #[test]
@@ -881,7 +1015,7 @@ mod tests {
 
     #[test]
     fn token_count_emits_fresh_usage_from_last_reading() {
-        // fresh = (11480−9088) + 87 + 15.
+        // fresh = (11480−9088) + 87: the 15 reasoning tokens are part of the 87.
         let out = ev(
             json!({"type":"event_msg","payload":{"type":"token_count","info":{
             "total_token_usage":{"input_tokens":999999,"cached_input_tokens":0,"output_tokens":999999},
@@ -892,11 +1026,11 @@ mod tests {
             matches!(
                 out.as_slice(),
                 [AgentEvent::Usage {
-                    fresh_tokens: 2494,
+                    fresh_tokens: 2479,
                     ..
                 }]
             ),
-            "expected fresh=2494 from last_token_usage (never the totals), got {out:?}"
+            "expected fresh=2479 from last_token_usage (never the totals), got {out:?}"
         );
     }
 
@@ -946,8 +1080,7 @@ mod tests {
             path,
             SOURCE_NAME,
             json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}),
-        )
-        .unwrap();
+        );
         let expected = AgentId::from_parts(SOURCE_NAME, &codex_id_from_path(Path::new(path)));
         assert_eq!(
             events[0].agent_id(),
@@ -977,21 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn function_call_without_arguments_starts_work_not_waiting() {
-        let out = ev(json!({
-            "type": "response_item",
-            "payload": { "type": "function_call", "name": "x" }
-        }));
-        assert!(
-            matches!(out.as_slice(), [AgentEvent::ActivityStart { .. }]),
-            "{out:?}"
-        );
-    }
-
-    #[test]
     fn function_call_without_name_falls_back_to_tool_label() {
-        // The `arguments` must stay non-escalated so routing reaches
-        // codex_tool_start rather than the Waiting arm.
         use crate::source::ToolDetail;
         let out = ev(json!({
             "type": "response_item",
@@ -999,12 +1118,12 @@ mod tests {
         }));
         match out.as_slice() {
             [
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     detail: Some(ToolDetail::Generic { display }),
                     ..
                 },
             ] => assert_eq!(display, "tool"),
-            other => panic!("expected one Generic-detail ActivityStart, got {other:?}"),
+            other => panic!("expected one Generic-detail ToolUseStart, got {other:?}"),
         }
     }
 
@@ -1023,7 +1142,7 @@ mod tests {
             let line =
                 serde_json::json!({ "type": outer, "payload": { "type": "x", "message": "y" } });
             let quiet = crate::test_capture::capture_logs(|| {
-                decode_codex_line("/x/rollout.jsonl", SOURCE_NAME, line).unwrap();
+                decode_codex_line("/x/rollout.jsonl", SOURCE_NAME, line);
             });
             assert!(
                 !quiet.contains(crate::source::drift::TARGET),

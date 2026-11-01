@@ -3,6 +3,7 @@
 //! `--proof` frame sequences — so the visual output is verifiable without a real
 //! terminal.
 
+mod cutaway;
 mod encode;
 mod proof;
 
@@ -19,15 +20,16 @@ use std::time::SystemTime;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use pixtuoid::dev::{DrawCtx, draw_scene};
+use pixtuoid::dev::DrawCtx;
 use pixtuoid_core::SceneState;
 use pixtuoid_scene::pack::load_bundled_pack;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
+use crate::cutaway::CutawayOffice;
 use crate::encode::{
-    AnimJob, Timeline, centered_crop, compute_crop_rect, print_walkability_report, save_animation,
-    save_backend_as_png, save_renderer_animation,
+    AnimJob, Timeline, centered_crop, compute_crop_rect, draw_frame, print_walkability_report,
+    save_animation, save_backend_as_png, save_renderer_animation,
 };
 use crate::scenes::{
     GatewayState, anim_scene, capture_live_scene, dashboard_scene, inject_openclaw_presence,
@@ -84,6 +86,19 @@ struct SnapshotArgs {
     /// Output an animated GIF instead of a static PNG.
     #[arg(long)]
     gif: bool,
+
+    /// Draw the office as the cutaway the TUI fits to this terminal of
+    /// `CELL_W`×`CELL_H` cells, in place of the classic office, above its footer
+    /// and under its panels.
+    #[arg(long, conflicts_with_all = [
+        // `draw_over_image` hit-tests no pointer on the cutaway.
+        "hover",
+        // The cutaway never draws the walkable layer (`TuiRenderer::offers_walkable_debug`).
+        "debug_walkable",
+        // A crop moves the frame the cutaway paints from its top-left.
+        "crop_agent", "crop_furniture", "crop_mascot",
+    ])]
+    cutaway: bool,
 
     /// GIF duration in seconds (only with --gif, which --anim implies).
     #[arg(long, default_value_t = 5)]
@@ -147,31 +162,31 @@ struct SnapshotArgs {
     weather: Option<String>,
 
     /// Force the `?` keyboard help overlay open (for screenshots).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "animation")]
     help_open: bool,
 
     /// Force the source-death footer warning with the given source
     /// name (for screenshots), e.g. --source-warning claude-code.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "animation")]
     source_warning: Option<String>,
 
     /// Force the decode-drift footer nudge for the given comma-separated
     /// source label-prefixes (for screenshots), e.g. --drift-warning cc,cx.
     /// Lower priority than --source-warning (source-death preempts it).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "animation")]
     drift_warning: Option<String>,
 
     /// Force the theme picker open at the given row index (for screenshots).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "animation")]
     theme_picker: Option<usize>,
 
     /// Force the version popup fully visible (for screenshots).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "animation")]
     popup: bool,
 
     /// Force a hover tooltip at terminal cell "x,y" (for screenshots / shadow
     /// visual checks), e.g. --hover 30,40.
-    #[arg(long, value_name = "X,Y")]
+    #[arg(long, value_name = "X,Y", conflicts_with = "animation")]
     hover: Option<String>,
 
     /// Add a wandering office pet to a renderer-driven --gif capture
@@ -243,7 +258,8 @@ struct SnapshotArgs {
     anim_facing: Option<String>,
 
     /// Crop the generated PNG (and text preview) to the fixed crop window
-    /// centered on the agent with this label. Static-PNG path only.
+    /// centered on the agent with this session id, or the one agent with this
+    /// label. Static-PNG path only.
     // The --gif/--anim paths return before the crop is computed, so clap rejects
     // the combination instead of silently ignoring the flag.
     #[arg(long, conflicts_with_all = ["crop_furniture", "gif", "anim"])]
@@ -256,8 +272,8 @@ struct SnapshotArgs {
     #[arg(long, conflicts_with_all = ["gif", "anim"])]
     crop_furniture: Option<String>,
 
-    /// Give the agent with this label a Top burn tier (claude-fable-5 at
-    /// fresh ultra effort → ember hair + flame crown).
+    /// Give the agent with this session id, or the one agent with this label,
+    /// a Top burn tier (claude-fable-5 at fresh ultra effort → ember hair + flame crown).
     #[arg(long)]
     flame: Option<String>,
 
@@ -271,11 +287,11 @@ struct SnapshotArgs {
     )]
     crop_mascot: bool,
 
-    /// Render the §3 split-screen proof replay from a captured CC session
-    /// fixture: left = typed transcript, right = the real reducer+renderer
+    /// Render the §3 split-screen proof replay from a CC session transcript:
+    /// left = typed transcript, right = the real reducer+renderer
     /// replaying the same decoded events; annotations burned in. Emits PNG
     /// frame sequences to --frames-dir/{wide,tall}/.
-    #[arg(long, value_name = "FIXTURE", value_hint = clap::ValueHint::FilePath,
+    #[arg(long, value_name = "SESSION", value_hint = clap::ValueHint::FilePath,
           conflicts_with_all = ["gif", "anim", "meeting", "pets", "navigate_at",
           "dashboard", "connection", "onboarding", "empty", "live",
           "crop_agent", "crop_furniture", "crop_mascot", "debug_walkable"])]
@@ -415,23 +431,14 @@ fn main() -> Result<()> {
         eprintln!("WARMUP pre-roll = {skip_ms}ms (explicit --warmup-secs)");
     }
     let mut scene = scene;
-    if let Some(label) = &args.flame {
-        let hit = scene
-            .agents
-            .values_mut()
-            .find(|a| a.label.as_ref() == label.as_str());
-        match hit {
-            Some(a) => {
-                a.model = Some("claude-fable-5".into());
-                a.effort = Some(pixtuoid_core::state::EffortObservation::new(
-                    "ultra".into(),
-                    now,
-                ));
-            }
-            None => {
-                let labels: Vec<_> = scene.agents.values().map(|a| a.label.to_string()).collect();
-                anyhow::bail!("--flame {label:?} not found in scene; labels: {labels:?}");
-            }
+    if let Some(key) = &args.flame {
+        let id = scenes::agent_named(&scene, "--flame", key)?.agent_id;
+        if let Some(a) = scene.agents.get_mut(&id) {
+            a.model = Some("claude-fable-5".into());
+            a.effort = Some(pixtuoid_core::state::EffortObservation::new(
+                "ultra".into(),
+                now,
+            ));
         }
     }
     if let Some(state) = args.openclaw {
@@ -455,13 +462,13 @@ fn main() -> Result<()> {
         )
     })?;
 
-    if let Some(fixture) = args.proof.as_deref() {
+    if let Some(session) = args.proof.as_deref() {
         let frames_dir = args
             .frames_dir
             .as_deref()
             .context("--proof requires --frames-dir")?;
         proof::render_proof(&proof::ProofJob {
-            fixture,
+            session,
             frames_dir,
             cols,
             rows,
@@ -474,6 +481,7 @@ fn main() -> Result<()> {
             theme,
             pack: &pack,
             weather,
+            cutaway: args.cutaway,
         })?;
         println!("wrote proof frames → {}", frames_dir.display());
         return Ok(());
@@ -517,11 +525,15 @@ fn main() -> Result<()> {
     };
     let anim_dest = args.frames_dir.as_deref().unwrap_or(&args.out);
     if !navigations.is_empty() || !pet_vec.is_empty() {
-        save_renderer_animation(&anim_job, term, &navigations, pet_vec)?;
+        save_renderer_animation(&anim_job, term, &navigations, pet_vec, args.cutaway)?;
         println!("wrote {}", anim_dest.display());
         return Ok(());
     }
 
+    let mut cutaway = args
+        .cutaway
+        .then(|| CutawayOffice::of_draw_frame(&pack, cols, rows))
+        .transpose()?;
     let mut floor_meta = pixtuoid_scene::floor::FloorMeta::ground().with_weather(weather);
     floor_meta.floor_seed = args.floor_seed;
     if args.gif || args.anim.is_some() {
@@ -532,6 +544,7 @@ fn main() -> Result<()> {
             floor_meta,
             skip_ms,
             args.debug_walkable,
+            cutaway,
         )?;
         println!("wrote {}", anim_dest.display());
         return Ok(());
@@ -557,10 +570,8 @@ fn main() -> Result<()> {
         .unwrap_or_default();
     let warning_text = pixtuoid::dev::footer_warning(&deaths, &drifted);
     let mut office = pixtuoid_scene::floor::PerOffice::new();
-    // Static snapshots have no time to animate the fade — snap straight
-    // to the steady-state level for the chosen scene.
     if args.empty {
-        floor.ctx.vacancy_dim.snap_to_empty();
+        settle_empty(&mut floor, cutaway.as_mut());
     }
     let (dash_rows, dash_selected) = if args.dashboard {
         let folds = pixtuoid::dev::DashboardFolds::default();
@@ -573,7 +584,7 @@ fn main() -> Result<()> {
 
     // Deterministic — no FS probes — so the demo image is reproducible across
     // machines.
-    let (connection_rows, connection_live, connection_socket_line) = if args.connection {
+    let (connection_rows, connection_socket_line) = if args.connection {
         use pixtuoid::dev::{ConnState, ConnectionRow, DaemonRollup, LiveFacet, LiveInfo};
         use std::path::PathBuf;
         use std::time::Duration;
@@ -586,59 +597,6 @@ fn main() -> Result<()> {
             target: None,
             health: None,
         };
-        let rows = vec![
-            mk(
-                "claude-code",
-                "cc",
-                "Claude Code",
-                ConnState::Connected,
-                Some("~/.claude/settings.json"),
-            ),
-            mk(
-                "codex",
-                "cx",
-                "Codex",
-                ConnState::Disconnected,
-                Some("~/.codex/config.toml"),
-            ),
-            mk(
-                "reasonix",
-                "rx",
-                "Reasonix",
-                ConnState::NoCli { connected: false },
-                None,
-            ),
-            mk(
-                "codewhale",
-                "cw",
-                "CodeWhale",
-                ConnState::Connected,
-                Some("~/.codewhale/config.toml"),
-            ),
-            mk(
-                "opencode",
-                "oc",
-                "opencode",
-                ConnState::Disconnected,
-                Some("~/.config/opencode/plugins/pixtuoid.ts"),
-            ),
-            mk(
-                "antigravity",
-                "ag",
-                "Antigravity",
-                ConnState::Connected,
-                None,
-            ),
-            // A DAEMON row, so the captured panel shows the daemon LIVE cell next
-            // to the agent rows' N-agents form.
-            mk(
-                "openclaw",
-                "ok",
-                "OpenClaw",
-                ConnState::Connected,
-                Some("~/.openclaw/openclaw.json"),
-            ),
-        ];
         let agents = |n: usize, age_s: u64| LiveInfo {
             facet: LiveFacet::Agents {
                 agents: n,
@@ -646,31 +604,92 @@ fn main() -> Result<()> {
             },
             dead: false,
         };
-        let live = vec![
-            agents(2, 3),
-            LiveInfo::default(),
-            LiveInfo::default(),
-            LiveInfo {
-                facet: LiveFacet::default(),
-                dead: true,
-            },
-            LiveInfo::default(),
-            agents(1, 12),
-            LiveInfo {
-                facet: LiveFacet::Daemon(Some(DaemonRollup {
-                    instances: std::num::NonZeroUsize::new(2).expect("two gateways"),
-                    state: pixtuoid_core::state::DaemonState::Busy,
-                })),
-                dead: false,
-            },
+        let rows = vec![
+            (
+                mk(
+                    "claude-code",
+                    "cc",
+                    "Claude Code",
+                    ConnState::Connected,
+                    Some("~/.claude/settings.json"),
+                ),
+                agents(2, 3),
+            ),
+            (
+                mk(
+                    "codex",
+                    "cx",
+                    "Codex",
+                    ConnState::Disconnected,
+                    Some("~/.codex/config.toml"),
+                ),
+                LiveInfo::default(),
+            ),
+            (
+                mk(
+                    "reasonix",
+                    "rx",
+                    "Reasonix",
+                    ConnState::NoCli { connected: false },
+                    None,
+                ),
+                LiveInfo::default(),
+            ),
+            (
+                mk(
+                    "codewhale",
+                    "cw",
+                    "CodeWhale",
+                    ConnState::Connected,
+                    Some("~/.codewhale/config.toml"),
+                ),
+                LiveInfo {
+                    facet: LiveFacet::default(),
+                    dead: true,
+                },
+            ),
+            (
+                mk(
+                    "opencode",
+                    "oc",
+                    "opencode",
+                    ConnState::Disconnected,
+                    Some("~/.config/opencode/plugins/pixtuoid.ts"),
+                ),
+                LiveInfo::default(),
+            ),
+            (
+                mk(
+                    "antigravity",
+                    "ag",
+                    "Antigravity",
+                    ConnState::Connected,
+                    None,
+                ),
+                agents(1, 12),
+            ),
+            // A DAEMON row, so the captured panel shows the daemon LIVE cell next
+            // to the agent rows' N-agents form.
+            (
+                mk(
+                    "openclaw",
+                    "ok",
+                    "OpenClaw",
+                    ConnState::Connected,
+                    Some("~/.openclaw/openclaw.json"),
+                ),
+                LiveInfo {
+                    facet: LiveFacet::Daemon(Some(DaemonRollup {
+                        instances: std::num::NonZeroUsize::new(2).expect("two gateways"),
+                        state: pixtuoid_core::state::DaemonState::Running,
+                    })),
+                    dead: false,
+                },
+            ),
         ];
-        (
-            rows,
-            live,
-            "socket  /run/user/501/pixtuoid.sock".to_string(),
-        )
+        (rows, "socket  /run/user/501/pixtuoid.sock".to_string())
     } else {
-        (Vec::new(), Vec::new(), String::new())
+        (Vec::new(), String::new())
     };
     let onboarding_frame = if args.onboarding {
         use pixtuoid::dev::WelcomeRow;
@@ -703,7 +722,6 @@ fn main() -> Result<()> {
     let connection_frame = pixtuoid::dev::ConnectionFrame {
         open: args.connection,
         rows: connection_rows,
-        live: connection_live,
         selected: 0,
         confirm: None,
         result: None,
@@ -730,17 +748,9 @@ fn main() -> Result<()> {
         debug_walkable: args.debug_walkable,
         footer: pixtuoid::dev::footer_context(&scene, None, false, None, warning_text.as_deref()),
         overlays: frames.overlays(pixtuoid::dev::popup_whole(args.popup), &[]),
-        ..DrawCtx::offscreen(
-            &mut floor,
-            office.stores(),
-            theme,
-            &scene,
-            &pack,
-            now,
-            floor_meta,
-        )
+        ..DrawCtx::offscreen(&mut floor, office.stores(), theme, &scene, now, floor_meta)
     };
-    let drawn = draw_scene(&mut term, &mut draw_ctx)?;
+    let drawn = draw_frame(&mut term, &mut draw_ctx, cutaway.as_mut())?;
 
     if args.debug_walkable {
         print_walkability_report(&term, args.floor_seed)?;
@@ -759,7 +769,7 @@ fn main() -> Result<()> {
     };
     let area = crop_rect.unwrap_or(ratatui::layout::Rect::new(0, 0, cols, rows));
 
-    save_backend_as_png(&term, &args.out, area)?;
+    save_backend_as_png(&term, &args.out, area, cutaway.as_ref())?;
     println!("wrote {}", args.out.display());
 
     println!("\n--- text preview (symbols only) ---");
@@ -771,6 +781,17 @@ fn main() -> Result<()> {
         println!();
     }
     Ok(())
+}
+
+/// An empty office's still: `floor`, and `cutaway`'s where there is one, at
+/// the light they fade to. A still has no time to animate the fade.
+fn settle_empty(
+    floor: &mut pixtuoid_scene::floor::PerFloor,
+    cutaway: Option<&mut CutawayOffice<pixtuoid_scene::floor::FloorSession>>,
+) {
+    for floor in std::iter::once(floor).chain(cutaway.map(CutawayOffice::floor_mut)) {
+        floor.ctx.vacancy_dim.snap_to_empty();
+    }
 }
 
 /// Floors whose scheduled navigation comes due at `elapsed_ms`, firing each
@@ -879,7 +900,10 @@ mod tests {
             .iter()
             .find(|w| w.kind == pixtuoid_scene::layout::WaypointKind::Pantry)
             .unwrap();
-        let (cx, cy) = (pantry.pos.x, pantry.pos.y / 2);
+        let (cx, cy) = (
+            pantry.pos.x,
+            pantry.pos.y / pixtuoid_scene::layout::CELL_ROWS,
+        );
         assert!(rect.x <= cx && cx < rect.x + rect.width, "x not in crop");
         assert!(rect.y <= cy && cy < rect.y + rect.height, "y not in crop");
     }
@@ -897,17 +921,16 @@ mod tests {
             .values()
             .find(|a| a.floor_idx > 0)
             .expect("a scene with 9 agents over 4 desks must reach an upper floor");
-        let label = upper.label.to_string();
-        let floor = upper.floor_idx;
+        let (floor, desk) = (upper.floor_idx, upper.desk_index.0);
 
         let history = pixtuoid_scene::pose::PoseHistory::new();
-        let args = crop_args(&["--crop-agent", &label]);
+        let args = crop_args(&["--crop-agent", &upper.session_id]);
         let rect = compute_crop_rect(&args, &scene, &history, 192, 64, now)
-            .unwrap_or_else(|e| panic!("floor {floor} agent {label:?} must crop: {e}"))
+            .unwrap_or_else(|e| panic!("floor {floor} agent at desk {desk} must crop: {e}"))
             .expect("a seated agent crops");
         assert!(
             rect.width > 0 && rect.height > 0,
-            "empty crop for {label:?}"
+            "empty crop for desk {desk}"
         );
     }
 
@@ -936,7 +959,7 @@ mod tests {
 
         let ghost = crop_args(&["--crop-agent", "ghost"]);
         let err = compute_crop_rect(&ghost, &scene, &history, 192, 64, now).unwrap_err();
-        assert!(err.to_string().contains("labels:"), "{err}");
+        assert!(err.to_string().contains("(demo-turn)"), "{err}");
     }
 
     #[test]
@@ -1071,5 +1094,64 @@ mod tests {
         assert!(
             SnapshotArgs::try_parse_from(["snapshot", "out.png", "--dashboard", "--gif"]).is_err()
         );
+    }
+
+    #[test]
+    fn cutaway_conflicts_with_what_it_cannot_draw() {
+        let parses = |argv: &[&str]| SnapshotArgs::try_parse_from(argv).is_ok();
+        for flags in [
+            &["--hover", "1,1"][..],
+            &["--debug-walkable"],
+            &["--crop-agent", "x"],
+            &["--crop-furniture", "pantry"],
+            &["--crop-mascot", "--openclaw", "idle"],
+        ] {
+            let alone = [&["snapshot"][..], flags].concat();
+            assert!(parses(&alone), "rejected {alone:?}");
+            let with = [&alone[..], &["--cutaway"]].concat();
+            assert!(!parses(&with), "accepted {with:?}");
+        }
+        for argv in [
+            &["snapshot", "--cutaway"][..],
+            &["snapshot", "--cutaway", "--gif"],
+            &["snapshot", "--cutaway", "--gif", "--warmup-secs", "1"],
+            &["snapshot", "--cutaway", "--gif", "--pets", "cat"],
+            &["snapshot", "--cutaway", "--gif", "--navigate-at", "3:1"],
+            &["snapshot", "--cutaway", "--empty"],
+            &["snapshot", "--cutaway", "--proof", "session.jsonl"],
+            &["snapshot", "--cutaway", "--dashboard"],
+            &["snapshot", "--cutaway", "--connection"],
+            &["snapshot", "--cutaway", "--onboarding"],
+            &["snapshot", "--cutaway", "--help-open"],
+            &["snapshot", "--cutaway", "--theme-picker", "0"],
+            &["snapshot", "--cutaway", "--popup"],
+        ] {
+            assert!(parses(argv), "rejected {argv:?}");
+        }
+    }
+
+    /// A flag only a still draws is rejected beside every mode that drops it.
+    #[test]
+    fn still_only_flags_conflict_with_every_animation() {
+        let parses = |argv: &[&str]| SnapshotArgs::try_parse_from(argv).is_ok();
+        for flag in [
+            &["--help-open"][..],
+            &["--theme-picker", "0"],
+            &["--popup"],
+            &["--hover", "1,1"],
+            &["--source-warning", "claude-code"],
+            &["--drift-warning", "cc"],
+        ] {
+            let alone = [&["snapshot"][..], flag].concat();
+            assert!(parses(&alone), "rejected {alone:?}");
+            for mode in [
+                &["--gif"][..],
+                &["--anim", "sofa"],
+                &["--proof", "session.jsonl"],
+            ] {
+                let with = [&alone[..], mode].concat();
+                assert!(!parses(&with), "accepted {with:?}");
+            }
+        }
     }
 }

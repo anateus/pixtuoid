@@ -94,14 +94,15 @@ pub(crate) struct UiState {
     /// nowhere else.
     fake_now: Option<(Instant, SystemTime)>,
     /// Theme picker: `Some(preview index)` while open; `saved_theme_idx` is
-    /// the committed selection the quit/cancel paths revert to.
+    /// the committed selection the cancel path reverts to.
     pub(crate) theme_picker: Option<usize>,
     pub(crate) saved_theme_idx: usize,
     pub(crate) dashboard: DashboardUi,
     pub(crate) connection: ConnectionUi,
     drift: crate::doctor::DriftSeen,
     socket_path: std::path::PathBuf,
-    /// Where the warn-floor log lives, for the Sources panel (`None` = no log).
+    /// Where the warn-floor log lives, for the Sources panel; `None` for a
+    /// preview, which has no run.
     log: Option<crate::run_log::LogLocation>,
 }
 
@@ -124,7 +125,7 @@ pub(crate) struct Boot<'a> {
     pub(crate) first_run: bool,
     pub(crate) config_path: &'a std::path::Path,
     pub(crate) socket_path: std::path::PathBuf,
-    pub(crate) log: Option<crate::run_log::LogLocation>,
+    pub(crate) log: crate::run_log::LogLocation,
     pub(crate) drift: crate::doctor::DriftSeen,
     /// The sources connected at boot, for the notices a version popup opens
     /// with.
@@ -155,7 +156,7 @@ impl UiState {
     /// new to the config at `boot.config_path`.
     pub(crate) fn boot(boot: Boot<'_>) -> Self {
         let detected = if boot.first_run {
-            crate::sources::detect()
+            crate::sources::detect_targets()
         } else {
             Vec::new()
         };
@@ -163,7 +164,8 @@ impl UiState {
             boot,
             WelcomeUi::from_detected(&detected),
             crate::sources::detect,
-            env!("CARGO_PKG_VERSION"),
+            &semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("CARGO_PKG_VERSION is SemVer"),
         )
     }
 
@@ -173,7 +175,7 @@ impl UiState {
         boot: Boot<'_>,
         onboarding_ui: WelcomeUi,
         installed: impl FnOnce() -> Vec<&'static str>,
-        current: &str,
+        current: &semver::Version,
     ) -> Self {
         let decision = resolve_version_popup(boot.config_path, current);
         // Yields to the onboarding but still STAMPS `last_seen_version`: gated on
@@ -184,7 +186,7 @@ impl UiState {
             boot.theme,
             onboarding_ui,
             boot.socket_path,
-            boot.log,
+            Some(boot.log),
             boot.drift,
         );
         ui.notices.versions = decision.versions;
@@ -207,7 +209,7 @@ impl UiState {
         let saved_theme_idx = theme::ALL_THEMES
             .iter()
             .position(|t| std::ptr::eq(*t, boot_theme))
-            .unwrap_or(0);
+            .expect("the boot theme is one of ALL_THEMES");
         Self {
             onboarding_ui,
             onboarding_opened_at,
@@ -238,7 +240,6 @@ impl UiState {
             dashboard_open: self.dashboard.open,
             connection_open: self.connection.open,
             connection_confirm: self.connection.confirm.is_some(),
-            n_themes: theme::ALL_THEMES.len(),
         }
     }
 
@@ -460,8 +461,7 @@ impl UiState {
 
     /// Compute this frame's renderer mirrors from the live scene + health
     /// snapshot. Mutates the pieces that are themselves per-frame state: the
-    /// throttled drift re-scan, the dashboard reanchor/scroll clamp, the
-    /// connection selection clamp, and the onboarding close-fade expiry.
+    /// dashboard reanchor/scroll clamp and the onboarding close-fade expiry.
     pub(crate) fn build_frames(
         &mut self,
         now: SystemTime,
@@ -494,17 +494,13 @@ impl UiState {
         // after actions, NOT per frame, because it does FS reads. Only the LIVE
         // facet + socket line recompute here.
         let connection_frame = if self.connection.open {
-            self.connection.selected =
-                connection::move_selection(&self.connection.rows, self.connection.selected, 0);
-            let live = connection::live_view(now, &self.connection.rows, scene, health);
             // NOT "(listening)": a second pixtuoid instance loses the hook plane
             // to the lock-holding owner, so THIS process may own no socket at
             // all. Don't assert what we haven't checked.
             let socket_line = format!("socket  {}", self.socket_path.display());
             ConnectionFrame {
                 open: true,
-                rows: self.connection.rows.clone(),
-                live,
+                rows: connection::live_view(now, &self.connection.rows, scene, health),
                 selected: self.connection.selected,
                 confirm: self.connection.confirm,
                 result: self.connection.last_result.clone(),
@@ -564,7 +560,7 @@ impl UiState {
 impl UiState {
     /// A run an upgrade from `previous` to `current` booted, with its popup
     /// closed.
-    pub(crate) fn upgraded_from(previous: &str, current: &str) -> Self {
+    pub(crate) fn upgraded_from(previous: &str, current: &semver::Version) -> Self {
         let mut ui = Self::new(
             &theme::NORMAL,
             WelcomeUi::from_detected(&[]),
@@ -580,17 +576,17 @@ impl UiState {
 }
 
 /// Whether this version's popup shows, and the version before it, stamping
-/// `current_ver` as `last_seen_version` in the config at `config_path` at boot, so the popup
+/// `current` as `last_seen_version` in the config at `config_path` at boot, so the popup
 /// shows at most once per upgrade however the run exits. The config's warnings
 /// are dropped: `main`'s pre-altscreen pass already surfaced them.
 fn resolve_version_popup(
     config_path: &std::path::Path,
-    current_ver: &str,
+    current: &semver::Version,
 ) -> crate::version::BootDecision {
     let cfg = crate::config::load(config_path, &mut Vec::new());
-    let decision = crate::version::boot_decision(current_ver, cfg.last_seen_version.as_deref());
+    let decision = crate::version::boot_decision(current, cfg.last_seen_version.as_deref());
     if decision.should_persist
-        && let Err(e) = crate::config::save_version(config_path, current_ver)
+        && let Err(e) = crate::config::save_version(config_path, &current.to_string())
     {
         tracing::warn!(error = ?e, "failed to persist version");
     }
@@ -657,7 +653,6 @@ mod tests {
                 && !m.connection_confirm,
             "everything closed at boot (no detected CLIs, no version popup)"
         );
-        assert_eq!(m.n_themes, ALL_THEMES.len());
 
         ui.toggle_help();
         assert!(ui.modal().help_open);
@@ -678,7 +673,15 @@ mod tests {
         ui.close_dashboard();
         assert!(!ui.modal().dashboard_open);
 
-        ui.open_connection(Vec::new());
+        ui.open_connection(vec![ConnectionRow {
+            source_id: "codex",
+            label_prefix: "cx",
+            display_name: "Codex",
+            state: connection::ConnState::Connected,
+            config_path: None,
+            target: None,
+            health: None,
+        }]);
         assert!(ui.modal().connection_open);
         assert!(!ui.modal().connection_confirm);
         ui.connection.confirm = Some(0);
@@ -695,7 +698,7 @@ mod tests {
         use std::time::Duration;
         let mut ui = UiState::new(
             ALL_THEMES[0],
-            WelcomeUi::from_detected(&["codex"]),
+            WelcomeUi::from_ids(&["codex"]),
             std::path::PathBuf::from("sock"),
             None,
             crate::doctor::DriftSeen::default(),
@@ -720,7 +723,7 @@ mod tests {
 
         let mut ui = UiState::new(
             ALL_THEMES[0],
-            WelcomeUi::from_detected(&["codex", "claude-code"]),
+            WelcomeUi::from_ids(&["codex", "claude-code"]),
             std::path::PathBuf::from("/tmp/sock"),
             None,
             crate::doctor::DriftSeen::default(),
@@ -756,7 +759,7 @@ mod tests {
 
     /// A run of `current` booted over the config at `path`, with `welcome`'s
     /// onboarding and nothing connected.
-    fn boot_at(path: &std::path::Path, welcome: WelcomeUi, current: &str) -> UiState {
+    fn boot_at(path: &std::path::Path, welcome: WelcomeUi, current: &semver::Version) -> UiState {
         boot_into(path, welcome, current, &HashSet::new(), false)
     }
 
@@ -765,7 +768,7 @@ mod tests {
     fn boot_into(
         path: &std::path::Path,
         welcome: WelcomeUi,
-        current: &str,
+        current: &semver::Version,
         connected: &HashSet<String>,
         terminal_cutaway: bool,
     ) -> UiState {
@@ -775,7 +778,7 @@ mod tests {
                 first_run: false,
                 config_path: path,
                 socket_path: path.with_extension("sock"),
-                log: None,
+                log: crate::run_log::LogLocation::File(path.with_extension("log")),
                 drift: crate::doctor::DriftSeen::default(),
                 connected,
                 terminal_cutaway,
@@ -791,10 +794,9 @@ mod tests {
     #[test]
     fn a_new_version_pops_up_once_and_yields_to_the_onboarding() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let this = semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("SemVer");
         let boot = |path: &std::path::Path, welcome: WelcomeUi| {
-            boot_at(path, welcome, env!("CARGO_PKG_VERSION"))
-                .modal()
-                .version_popup_open
+            boot_at(path, welcome, &this).modal().version_popup_open
         };
         let stamped =
             |path: &std::path::Path| crate::config::load(path, &mut Vec::new()).last_seen_version;
@@ -809,7 +811,7 @@ mod tests {
 
         let path = tmp.path().join("onboarding.toml");
         crate::config::save_version(&path, "0.0.1").expect("seed an old version");
-        assert!(!boot(&path, WelcomeUi::from_detected(&["codex"])));
+        assert!(!boot(&path, WelcomeUi::from_ids(&["codex"])));
         assert_eq!(stamped(&path).as_deref(), Some(env!("CARGO_PKG_VERSION")));
     }
 
@@ -826,7 +828,7 @@ mod tests {
         let ui = boot_into(
             &path,
             WelcomeUi::from_detected(&[]),
-            &across.current.to_string(),
+            &across.current,
             &HashSet::from(["codex".to_string()]),
             true,
         );
@@ -907,7 +909,7 @@ mod tests {
             if let Some(seed) = seed {
                 crate::config::save_version(&path, seed).expect("seed a version");
             }
-            let mut ui = boot_at(&path, welcome, "0.20.0");
+            let mut ui = boot_at(&path, welcome, &semver::Version::new(0, 20, 0));
             ui.open_version_popup(&HashSet::new(), &[]);
             let frames = ui.build_frames(SystemTime::now(), &SceneState::new([0; 10]), &[]);
             frames.version_popup.upgraded
@@ -918,11 +920,7 @@ mod tests {
             WelcomeUi::from_detected(&[])
         ));
         assert!(
-            upgraded(
-                "held.toml",
-                Some("0.19.0"),
-                WelcomeUi::from_detected(&["codex"])
-            ),
+            upgraded("held.toml", Some("0.19.0"), WelcomeUi::from_ids(&["codex"])),
             "the onboarding held the popup back"
         );
         assert!(

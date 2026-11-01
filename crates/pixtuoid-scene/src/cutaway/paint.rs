@@ -727,12 +727,11 @@ pub(crate) fn assert_variant_desk_foot(
     let buf_w = usize::from(scale.to_buffer(layout.buf_w));
     let face = desk_front_h();
     // Each desk's columns and the first row below its art, in logical units.
-    let feet: Vec<(u16, u16, u16)> = (0..layout.home_desks.len())
-        .map(|i| {
-            let d = layout.home_desks[i];
-            let art =
-                Desk::facing(layout.desk_facing(pixtuoid_core::state::FloorLocalDeskIndex(i)))
-                    .piece();
+    let feet: Vec<(u16, u16, u16)> = layout
+        .home_desks
+        .iter()
+        .map(|&crate::layout::HomeDesk { at: d, facing }| {
+            let art = Desk::facing(facing).piece();
             let (w, h) = art_size(base_pack, art);
             (
                 d.x,
@@ -1795,7 +1794,6 @@ mod tests {
     /// and its text at every density the pack draws it, or a key names nothing
     /// and that screen never lights.
     #[test]
-    #[cfg(feature = "cutaway-assets")]
     fn the_bundled_back_turned_desk_draws_its_screen_in_the_screen_keys() {
         let pack = test_office();
         let art = PackPiece::DeskNorth;
@@ -2403,11 +2401,10 @@ mod tests {
         assert!(posts > 0, "this wall has posts");
     }
 
-    /// At the art's density the waiting mark and a z float clear of their
+    /// At the art's density the requires-action mark and a z float clear of their
     /// figure's badge however far the z has risen, the z only climbs and drifts
     /// away, and the dust lies along the stepping foot's row.
     #[test]
-    #[cfg(feature = "cutaway-assets")]
     fn the_dense_looks_keep_their_places() {
         looks_keep_their_places(test_office().max_density_variant().get());
     }
@@ -2452,7 +2449,7 @@ mod tests {
         };
         let clear =
             |s: Span| s.x1 < badge.x0 || badge.x1 < s.x0 || s.y1 < badge.y0 || badge.y1 < s.y0;
-        let (_, mark) = rider(K::WaitingMark);
+        let (_, mark) = rider(K::RequiresActionMark);
         assert!(
             clear(mark),
             "at scale {s} the mark {mark:?} lands on the badge {badge:?}"
@@ -2743,12 +2740,7 @@ mod tests {
                 }
             }
         }
-        // Only the density art draws bulbs.
-        let want: &[&str] = if cfg!(feature = "cutaway-assets") {
-            &["desk", "door", "hung decor", "prop"]
-        } else {
-            &["desk"]
-        };
+        let want: &[&str] = &["desk", "door", "hung decor", "prop"];
         assert_eq!(
             marked.into_iter().collect::<Vec<_>>(),
             want,
@@ -3224,7 +3216,6 @@ mod tests {
     /// a floor lamp's bulb, and the ceiling of an open elevator's car, while
     /// the room around them darkens.
     #[test]
-    #[cfg(feature = "cutaway-assets")]
     fn what_glows_of_its_own_keeps_its_colour_at_night() {
         let theme = crate::theme::theme_by_name("normal").expect("theme");
         let pack = test_office();
@@ -3606,7 +3597,6 @@ mod tests {
 
     /// [`face_rows`]' rule, through the real paint.
     #[test]
-    #[cfg(feature = "cutaway-assets")]
     fn only_the_top_down_base_desk_gets_a_derived_front_face() {
         let pack = test_office();
         let ground = pixtuoid_core::sprite::Rgb { r: 1, g: 2, b: 3 };
@@ -3759,7 +3749,6 @@ mod tests {
             .step(
                 crate::floor::FloorInputs {
                     scene: &pixtuoid_core::SceneState::uniform(16),
-                    pack: &pack,
                     now: std::time::SystemTime::UNIX_EPOCH,
                     floor: FloorMeta::ground(),
                     pets: crate::floor::PetInputs::default(),
@@ -3987,7 +3976,6 @@ mod tests {
             .step(
                 crate::floor::FloorInputs {
                     scene: &pixtuoid_core::SceneState::uniform(16),
-                    pack: &pack,
                     now: std::time::SystemTime::UNIX_EPOCH,
                     floor: FloorMeta::ground(),
                     pets: crate::floor::PetInputs::default(),
@@ -4104,7 +4092,6 @@ mod tests {
             .step(
                 crate::floor::FloorInputs {
                     scene: &pixtuoid_core::SceneState::uniform(16),
-                    pack: &pack,
                     now: std::time::SystemTime::UNIX_EPOCH,
                     floor: FloorMeta::ground(),
                     pets: crate::floor::PetInputs::default(),
@@ -4448,7 +4435,6 @@ mod tests {
                 .step(
                     crate::floor::FloorInputs {
                         scene: &pixtuoid_core::SceneState::uniform(16),
-                        pack: &pack,
                         now: std::time::SystemTime::UNIX_EPOCH,
                         floor: FloorMeta::ground(),
                         pets: crate::floor::PetInputs::default(),
@@ -5001,7 +4987,7 @@ mod tests {
                     None,
                     Some(K::FlameCrown),
                     Some(K::SleepZ),
-                    Some(K::WaitingMark)
+                    Some(K::RequiresActionMark)
                 ]
             );
         }
@@ -5378,7 +5364,6 @@ mod tests {
     /// desk faces and at every density its art is drawn at: the cutaway's art
     /// stands it on the side the desk faces.
     #[test]
-    #[cfg(feature = "cutaway-assets")]
     fn a_desk_lamp_pools_under_its_painted_bulb() {
         let theme = crate::theme::theme_by_name("normal").expect("theme");
         let pack = test_office();
@@ -5401,11 +5386,8 @@ mod tests {
             let bulbs: Vec<(f32, f32)> = layout
                 .home_desks
                 .iter()
-                .enumerate()
-                .filter_map(|(i, &at)| {
-                    let which = Desk::facing(
-                        layout.desk_facing(pixtuoid_core::state::FloorLocalDeskIndex(i)),
-                    );
+                .filter_map(|&crate::layout::HomeDesk { at, facing }| {
+                    let which = Desk::facing(facing);
                     let span = desk_span(&pack, which, at, scale);
                     let desk = crate::pack::densest_frame(&pack, which.piece(), 0, scale);
                     let cells = drawn_in(&desk, &[crate::pack::DESK_BULB_KEY]);
@@ -5520,11 +5502,13 @@ mod tests {
             let variants: [&FigureEdit; 7] = [
                 &|_, _| {},
                 &|c, a| {
-                    c.glow = crate::sim::CharacterGlow::Tool;
-                    a.state = pixtuoid_core::state::ActivityState::Active {
-                        tool_use_id: None,
-                        detail: None,
-                        kind: pixtuoid_core::state::ToolKind::Read,
+                    c.glow = crate::sim::CharacterGlow::Work;
+                    a.state = pixtuoid_core::state::ActivityState::Running {
+                        item: Some(pixtuoid_core::state::ToolUse {
+                            tool_use_id: None,
+                            detail: None,
+                            kind: pixtuoid_core::state::ToolKind::Read,
+                        }),
                     };
                 },
                 &|_, a| a.model = Some(std::sync::Arc::from("claude-fable-5")),
@@ -5755,7 +5739,7 @@ mod tests {
             crate::effects::flame_crown(top_left, 8, Motion::Full.beat(at(0))),
             crate::effects::sleep_z(top_left, 0, Motion::Full.beat(at(500)))
                 .expect("a z rising at 500 ms"),
-            crate::effects::waiting_mark(top_left),
+            crate::effects::requires_action_mark(top_left),
         ]
     }
 

@@ -673,17 +673,9 @@ struct PackToml {
     characters: CharactersToml,
     #[serde(default)]
     hairstyles: BTreeMap<String, HairstyleToml>,
+    /// Each icon's one-frame art, by name.
     #[serde(default)]
-    icons: BTreeMap<String, IconToml>,
-}
-
-/// One `[icons.<name>]` table: the one-frame art an icon is drawn as in the
-/// office's text (`world`) and on screen (`screen`).
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IconToml {
-    world: Option<String>,
-    screen: Option<String>,
+    icons: BTreeMap<String, String>,
 }
 
 /// One `[buildings.<name>]` table (the base art, with the planes the building
@@ -753,7 +745,7 @@ pub struct Pack {
     city_materials: CityMaterials,
     hairstyles: BTreeMap<String, Hairstyle>,
     character_outline: Rgb,
-    icons: BTreeMap<String, IconArt>,
+    icons: BTreeMap<String, Sprite>,
     /// [`Pack::density_variants`], counted once at load: a painter asks for it
     /// every frame.
     densities: Vec<Density>,
@@ -993,7 +985,7 @@ impl Pack {
     }
 
     /// The icon `name`'s art, from `[icons]`.
-    pub fn icon(&self, name: &str) -> Option<&IconArt> {
+    pub fn icon(&self, name: &str) -> Option<&Sprite> {
         self.icons.get(name)
     }
 
@@ -1216,24 +1208,12 @@ fn build_pack(parsed: PackToml, get_src: &mut dyn FnMut(&str) -> Result<String>)
     }
 
     let mut icons = BTreeMap::new();
-    for (name, icon) in parsed.icons {
-        let mut art = |fname: Option<String>| -> Result<Option<Sprite>> {
-            let Some(fname) = fname else { return Ok(None) };
-            let src = get_src(&fname)?;
-            let Some(frame) = one_frame(decode(&fname, &src, &palette)?) else {
-                return Err(PackError::IconFrames { file: fname });
-            };
-            Ok(Some(Sprite::new(
-                Vec1::new(frame),
-                Arc::clone(&palette),
-                0,
-                None,
-            )))
+    for (name, fname) in parsed.icons {
+        let src = get_src(&fname)?;
+        let Some(frame) = one_frame(decode(&fname, &src, &palette)?) else {
+            return Err(PackError::IconFrames { file: fname });
         };
-        let art = IconArt {
-            world: art(icon.world)?,
-            screen: art(icon.screen)?,
-        };
+        let art = Sprite::new(Vec1::new(frame), Arc::clone(&palette), 0, None);
         icons.insert(name, art);
     }
 
@@ -1323,25 +1303,6 @@ fn build_pieces(
         variants: redrawn,
         strides,
     })
-}
-
-/// An icon's art: the one frame it is drawn as in each place text is.
-#[derive(Debug, Clone)]
-pub struct IconArt {
-    world: Option<Sprite>,
-    screen: Option<Sprite>,
-}
-
-impl IconArt {
-    /// As the office's own text draws it, on the art grid.
-    pub fn world(&self) -> Option<&Sprite> {
-        self.world.as_ref()
-    }
-
-    /// As screen text draws it, in a screen cell.
-    pub fn screen(&self) -> Option<&Sprite> {
-        self.screen.as_ref()
-    }
 }
 
 /// A building's one-frame sprite `fname`, checked to draw only in the
@@ -1441,15 +1402,32 @@ pub(crate) const PACK_MANIFEST: &str = "pack.toml";
 /// # Errors
 ///
 /// If `pack_toml` does not parse, a frame it names is absent from `frames`, or the pack fails validation.
+#[cfg(feature = "pack-toml")]
 pub fn load_pack_from_strings(pack_toml: &str, frames: &[(&str, &str)]) -> Result<Pack> {
     load_from_strings(pack_toml, frames, &mut |_| {})
 }
 
+/// A `Pack` from a manifest a build script transcoded to JSON, and each frame
+/// file it names: what a build without `pack-toml` loads.
+///
+/// # Errors
+///
+/// If `pack_json` does not parse, a frame it names is absent from `frames`, or the pack fails validation.
+pub fn load_pack_from_json(pack_json: &str, frames: &[(&str, &str)]) -> Result<Pack> {
+    let parsed: PackToml =
+        serde_json::from_str(pack_json).map_err(|e| PackError::JsonManifest {
+            message: e.to_string(),
+        })?;
+    build_from_strings(parsed, frames, &mut |_| {})
+}
+
 /// The one-frame sprite [`fill_pack_manifest`] draws every piece it adds in.
+#[cfg(feature = "pack-toml")]
 pub(crate) const FILLER_SPRITE: (&str, &str) = ("filler.sprite", "@frame 0\n~");
 
 /// The palette keys [`fill_pack_manifest`] adds: the filler's, then one per
 /// [`Material`] and the character outline's.
+#[cfg(feature = "pack-toml")]
 const FILLER_KEYS: [char; 9] = ['~', '^', '`', '|', '{', '}', '<', '>', '='];
 
 /// `pack_toml` with every piece it leaves out drawn in [`FILLER_SPRITE`],
@@ -1459,6 +1437,7 @@ const FILLER_KEYS: [char; 9] = ['~', '^', '`', '|', '{', '}', '<', '>', '='];
 /// # Errors
 ///
 /// If `pack_toml` is not TOML.
+#[cfg(feature = "pack-toml")]
 pub(crate) fn fill_pack_manifest(pack_toml: &str) -> Result<String> {
     use toml::{Table, Value};
     let mut manifest: Table = pack_toml
@@ -1512,6 +1491,7 @@ pub(crate) fn fill_pack_manifest(pack_toml: &str) -> Result<String> {
 /// # Errors
 ///
 /// As [`load_pack_from_strings`].
+#[cfg(feature = "pack-toml")]
 #[doc(hidden)]
 pub fn load_filled_pack(pack_toml: &str, frames: &[(&str, &str)]) -> Result<Pack> {
     let frames: Vec<_> = frames.iter().copied().chain([FILLER_SPRITE]).collect();
@@ -1525,6 +1505,7 @@ pub fn load_filled_pack(pack_toml: &str, frames: &[(&str, &str)]) -> Result<Pack
 /// # Errors
 ///
 /// As [`load_pack_from_strings`].
+#[cfg(feature = "pack-toml")]
 #[doc(hidden)]
 pub fn frames_read_by(pack_toml: &str, frames: &[(&str, &str)]) -> Result<Vec<String>> {
     let mut read = Vec::new();
@@ -1532,6 +1513,7 @@ pub fn frames_read_by(pack_toml: &str, frames: &[(&str, &str)]) -> Result<Vec<St
     Ok(read)
 }
 
+#[cfg(feature = "pack-toml")]
 fn load_from_strings(
     pack_toml: &str,
     frames: &[(&str, &str)],
@@ -1539,6 +1521,14 @@ fn load_from_strings(
 ) -> Result<Pack> {
     let parsed: PackToml =
         toml::from_str(pack_toml).map_err(|source| PackError::Manifest { source })?;
+    build_from_strings(parsed, frames, on_read)
+}
+
+fn build_from_strings(
+    parsed: PackToml,
+    frames: &[(&str, &str)],
+    on_read: &mut dyn FnMut(&str),
+) -> Result<Pack> {
     let frame_lookup: HashMap<&str, &str> = frames.iter().copied().collect();
 
     build_pack(parsed, &mut |fname| {
@@ -2101,6 +2091,24 @@ mod validation_floor_tests {
         }
     }
 
+    /// A manifest's JSON transcode loads, and one the parser or the schema
+    /// refuses is a `JsonManifest` error that says why.
+    #[test]
+    fn a_json_manifest_loads_and_a_bad_one_says_why() {
+        let manifest = fill_pack_manifest("[palette]\n").expect("a manifest");
+        let json: serde_json::Value = toml::from_str(&manifest).expect("toml");
+        load_pack_from_json(&json.to_string(), &[FILLER_SPRITE]).expect("the transcode loads");
+        let mut unknown = json.clone();
+        unknown["sprites"] = serde_json::json!({});
+        for (bad, why) in [("{".to_owned(), "EOF"), (unknown.to_string(), "sprites")] {
+            let err = load_pack_from_json(&bad, &[FILLER_SPRITE]).expect_err("refused");
+            assert!(
+                matches!(&err, PackError::JsonManifest { message } if message.contains(why)),
+                "{why}: {err:?}"
+            );
+        }
+    }
+
     /// A walk's frames advance by its stride, so one without it does not load.
     #[test]
     fn a_walk_without_a_stride_does_not_load() {
@@ -2175,21 +2183,19 @@ mod validation_floor_tests {
         }
     }
 
-    /// Pins [`Pack::icon`]: each art an `[icons]` table names loads, at
-    /// whichever of the two places it names.
+    /// Pins [`Pack::icon`]: each art `[icons]` names loads.
     #[test]
     fn an_icon_loads_the_art_it_names() {
-        let pack = pack_with("[icons.star]\nworld=\"f.sprite\"\n");
+        let pack = pack_with("[icons]\nstar=\"f.sprite\"\n");
         let star = pack.icon("star").expect("the star loads");
-        assert_eq!(star.world().map(|s| s.frames().len()), Some(1));
-        assert!(star.screen().is_none());
+        assert_eq!(star.frames().len(), 1);
         assert_eq!(pack.icon_names().collect::<Vec<_>>(), ["star"]);
     }
 
     #[test]
     fn an_icon_of_two_frames_is_refused() {
         let err = refused(
-            "[icons.star]\nscreen=\"two.sprite\"\n",
+            "[icons]\nstar=\"two.sprite\"\n",
             &[("two.sprite", "@frame 0\nA\n@frame 1\nA")],
         );
         assert!(matches!(err, PackError::IconFrames { file } if file == "two.sprite"));

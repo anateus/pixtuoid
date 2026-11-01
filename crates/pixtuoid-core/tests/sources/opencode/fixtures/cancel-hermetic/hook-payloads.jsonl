@@ -1,0 +1,2 @@
+{"type":"session.execution.started","turn":2,"data":{"sessionID":"ses_e6db300afffet9liYaK3e3C08Z","location":{"directory":"/private/tmp/pixtuoid-capture/proj"},"model":{"id":"gpt-5.2"},"id":""},"_pid":6710,"_shim_ts_ms":1793455882151,"_pixtuoid_source":"opencode"}
+{"type":"session.execution.interrupted","turn":2,"data":{"sessionID":"ses_e6db300afffet9liYaK3e3C08Z"},"_pid":6710,"_shim_ts_ms":1793455887593,"_pixtuoid_source":"opencode"}

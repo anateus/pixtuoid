@@ -77,7 +77,7 @@ fn lights_at(w: u16, h: u16, hour: u32) -> (SceneLayout, Lights) {
             seated: &HashMap::new(),
             floor_idx: 0,
             indoor_scale: 1.0,
-            neon: NeonLevels::BUSY,
+            neon: NeonLevels::RUNNING,
             beat: Beat::at_ms(0),
             bulbs: crate::lighting::DeskBulbs::of(&crate::pack::test_office()),
         },
@@ -97,9 +97,9 @@ fn neon_breath_advances_at_wall_clock_scale_and_stays_in_band() {
 }
 
 #[test]
-fn neon_halo_drops_to_its_daylight_floor_and_a_calm_sign_glows_less_than_a_busy_one() {
-    let night = neon_at(NeonLevels::BUSY, 1.0);
-    let day = neon_at(NeonLevels::BUSY, 0.0);
+fn neon_halo_drops_to_its_daylight_floor_and_a_calm_sign_glows_less_than_a_running_one() {
+    let night = neon_at(NeonLevels::RUNNING, 1.0);
+    let day = neon_at(NeonLevels::RUNNING, 0.0);
     assert!(
         (day - night * NEON_DAYLIGHT_MIN).abs() < 1e-6,
         "{day} vs {night}"
@@ -187,7 +187,7 @@ fn a_spills_bounds_hold_every_row_whichever_way_it_leans() {
 fn a_monitor_halo_hangs_over_each_lit_screen_only() {
     let layout =
         SceneLayout::compute(192, 80, Some(crate::layout::TEST_DEFAULT_DESKS)).expect("fits");
-    let facing = |i: usize| layout.desk_facing(FloorLocalDeskIndex(i));
+    let facing = |i: usize| layout.home_desks[i].facing;
     let north: Vec<usize> = (0..layout.home_desks.len())
         .filter(|&i| facing(i) == Facing::North)
         .collect();
@@ -199,10 +199,12 @@ fn a_monitor_halo_hangs_over_each_lit_screen_only() {
     };
     let id = |p: &str| pixtuoid_core::AgentId::from_transcript_path(p);
     // No tool detail: a screen lights for any tool call.
-    let active = pixtuoid_core::state::ActivityState::Active {
-        tool_use_id: None,
-        detail: None,
-        kind: pixtuoid_core::state::ToolKind::Edit,
+    let running = pixtuoid_core::state::ActivityState::Running {
+        item: Some(ToolUse {
+            tool_use_id: None,
+            detail: None,
+            kind: pixtuoid_core::state::ToolKind::Edit,
+        }),
     };
     let at_desk = |path: &str, desk: usize, state: pixtuoid_core::state::ActivityState| {
         let mut a = crate::character::test_support::make_slot(id(path), state);
@@ -210,14 +212,14 @@ fn a_monitor_halo_hangs_over_each_lit_screen_only() {
         a
     };
     let agents = [
-        at_desk("/lit.jsonl", lit, active.clone()),
-        at_desk("/walking.jsonl", walking, active.clone()),
+        at_desk("/lit.jsonl", lit, running.clone()),
+        at_desk("/walking.jsonl", walking, running.clone()),
         at_desk(
             "/idle.jsonl",
             idle,
             pixtuoid_core::state::ActivityState::Idle,
         ),
-        at_desk("/back.jsonl", south, active),
+        at_desk("/back.jsonl", south, running),
     ];
     let seated = HashMap::from([
         (FloorLocalDeskIndex(lit), true),
@@ -234,7 +236,7 @@ fn a_monitor_halo_hangs_over_each_lit_screen_only() {
             seated: &seated,
             floor_idx: 0,
             indoor_scale: 1.0,
-            neon: NeonLevels::BUSY,
+            neon: NeonLevels::RUNNING,
             beat: Beat::at_ms(0),
             bulbs: crate::lighting::DeskBulbs::of(&crate::pack::test_office()),
         },
@@ -242,12 +244,12 @@ fn a_monitor_halo_hangs_over_each_lit_screen_only() {
     let kinds: Vec<_> = lights.monitor_halos.iter().map(|h| h.kind).collect();
     assert_eq!(
         kinds,
-        [EmitterKind::MonitorHalo(
+        [EmitterKind::MonitorHalo(ScreenWork::ToolUse(
             pixtuoid_core::state::ToolKind::Edit
-        )],
+        ))],
         "only the seated, mid-call agent at a screen facing us"
     );
-    let desk = layout.home_desks[lit];
+    let desk = layout.home_desks[lit].at;
     assert_eq!(
         lights.monitor_halos[0].light,
         Light::Patch {
@@ -337,7 +339,7 @@ fn every_shape() -> [Emitter; 4] {
             },
         ),
         lit(
-            EmitterKind::MonitorHalo(ToolKind::Read),
+            EmitterKind::MonitorHalo(ScreenWork::ToolUse(ToolKind::Read)),
             Light::Patch {
                 centre: Point { x: 30, y: 20 },
             },

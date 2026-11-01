@@ -7,16 +7,17 @@ only carries what no gate can.
 
 ## Generated artifacts (edit the source, never the output)
 
-| Rendered output                                                 | Source of truth                                                                                                       | Regen             | Drift gate                                                                                                |
-| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------- |
-| Root `README.md` features table + install block + tools glimpse | `src/features.json` / `src/install.json` / `src/sources.json`                                                         | `just gen-readme` | `just gen-readme-check` (CI `generated drift` job)                                                        |
-| `public/demos/*` stills + clips                                 | `scripts/media.json` → `gen-media.py` (real TuiRenderer; wasm `hero_still` for `hero-wide.png` / `vibing-poster.png`) | `just site-demos` | none: gitignored, rendered per CI build (`.github/actions/gen-demos`)                                     |
-| `src/assets/pix-icons/*.png`                                    | sprite pack palette (`pack.toml`) → `gen-pix-icons.py`                                                                | `just gen-icons`  | `just gen-icons-check` (decode-compared); `config/pix-icons.test.mjs` bridges `features.json` `pix` names |
+| Rendered output                                                          | Source of truth                                                                                                       | Regen             | Drift gate                                                                                                |
+| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------- |
+| Root `README.md` features table + install block + tools glimpse + images | `src/features.json` / `src/install.json` / `src/sources.json`; each image's `caption` in `scripts/media.json`         | `just gen-readme` | `just gen-readme-check` (CI `generated drift` job)                                                        |
+| Graphics protocol names (README features table, the site's roster)       | `src/features.json` `protocols`, filled by `config/feature-text.mjs`                                                  | `just gen-readme` | `gen-readme-check`; Rust `the_site_names_every_image_protocol` holds it to `ImageProtocol`                |
+| `public/demos/*` stills + clips                                          | `scripts/media.json` → `gen-media.py` (real TuiRenderer; wasm `hero_still` for `hero-wide.png` / `vibing-poster.png`) | `just site-demos` | none: gitignored, rendered per CI build (`.github/actions/gen-demos`)                                     |
+| `src/assets/pix-icons/*.png`                                             | sprite pack palette (`pack.toml`) → `gen-pix-icons.py`                                                                | `just gen-icons`  | `just gen-icons-check` (decode-compared); `config/pix-icons.test.mjs` bridges `features.json` `pix` names |
 
 Notes no gate carries:
 
-- The §3 proof media (`demos/proof*`) renders over the committed proof-session
-  fixture — retime the fixture, not the component.
+- The §3 proof media (`demos/proof*`) renders over the session in
+  `crates/pixtuoid/examples/snapshot/proof-session/` — retime it, not the component.
 
 ## Manifest seams (build-guarded)
 
@@ -38,7 +39,7 @@ Notes no gate carries:
 
 - **`OfficeBackdrop`'s reveal roll is FRAME-driven, never clock-driven.**
   Safari can stall the whole main thread ~1.4s in tab-snapshot IPC right as
-  the roll starts; a wall-clock ramp froze mid-roll and SNAPPED. So `paint()`
+  the roll starts; a wall-clock ramp froze mid-roll and SNAPPED. So `revealAt()`
   accumulates `reveal.elapsed` per PAINTED frame (step clamped to
   `REVEAL_MAX_STEP_MS`, DERIVED from `FRAME_MS` — a hardcoded twin silently
   disarms the clamp), holds the start for `REVEAL_READY_FRAMES` on-budget
@@ -70,20 +71,16 @@ Notes no gate carries:
   purpose: a shadow the glyph paints is decoration, not the ground WCAG
   grades against (measured worst case 5.28:1) — don't theme it.
 - **♩ audio**: muted-by-default, gesture-gated (`AudioContext` only on first
-  click); foley prewarms OFF-thread in `public/audio-worker.js` at idle (the
-  click-time chunked warmup its fallback), music streams from `public/music-worker.js`
+  click); the office host synthesizes the foley (when: OfficeBackdrop's
+  `prewarm`), music streams from `public/music-worker.js`
   into `public/music-worklet.js`, silent where either can't run; buffers COPIED out
   of wasm memory (views dangle on `memory.grow`); sound rides the render's
   pause-shifted `nowMs`. **iOS silent-switch bypass is DELIBERATE (#664)**:
   `navigator.audioSession.type = 'playback'` before the context, else the Ring/Silent switch mutes a deliberate ♩ tap.
-- **The VIBING channel is a SECOND live `Office` (#468)**: each office keeps
-  its own weather, and both consumers MUST share ONE `init()` via
-  `public/office-driver.js` (`sharedWasm` / `officeFrameView`, pinned by
-  `config/wasm-init-consts.test.mjs`) — independent `mod.default()` calls
-  racing instantiate two wasm instances that stomp the module-global. The
-  bounded init retry lives INSIDE that one promise; it nulls only a SETTLED
-  rejection (#671). Its rAF loop runs only active + in-view + not paused +
-  not reduced-motion, and joins the `pix:paused` set as a consumer.
+- **Both live offices share ONE office host (`public/office-host.js`)**, which
+  `public/office-driver.js`'s `officeHost` places and memoizes (#671). VIBING's
+  SECOND `Office` (#468) keeps its own weather; its rAF loop runs only active +
+  in-view + not paused + not reduced-motion, and joins the `pix:paused` set.
 - **Scoped `<style>` does not reach `set:html` content** — runtime-injected
   markup carries no Astro scope hash; target it with `:global(...)`. Caught
   only by rendering, never the static gates.

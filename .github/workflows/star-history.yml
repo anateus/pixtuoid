@@ -38,14 +38,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      # Guards the renderer before the live run trusts it; ci-lint's hygiene
-      # job runs the same gate but not on the cron or the watch event.
-      - name: Self-test the renderer
-        run: python3 scripts/star-history.py --selftest
 
       - name: Render the chart
         env:

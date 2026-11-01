@@ -14,8 +14,8 @@ pub(crate) enum EffectKind {
     /// A "z" rising off a sleeper's head; ms into its rise of
     /// [`SLEEP_Z_RISE_MS`].
     SleepZ,
-    /// The waiting-for-you mark over a figure; still.
-    WaitingMark,
+    /// The requires-action mark over a figure; still.
+    RequiresActionMark,
     /// The puff a walker's stride kicks up; the foot it rises under
     /// ([`planted_foot`]).
     WalkingDust,
@@ -25,7 +25,7 @@ pub(crate) enum EffectKind {
     PetHeart,
     /// One puff of coffee steam; ms into its [`STEAM_CYCLE_MS`].
     SteamPuff,
-    /// One bubble over a busy gateway mascot; rows it has risen.
+    /// One bubble over a running gateway mascot; rows it has risen.
     MascotBubble,
 }
 
@@ -64,10 +64,10 @@ pub(crate) fn sleep_z(at: Point, seed: u64, beat: Beat) -> Option<Effect> {
     })
 }
 
-/// The waiting mark over the figure at `at`.
-pub(crate) fn waiting_mark(at: Point) -> Effect {
+/// The requires-action mark over the figure at `at`.
+pub(crate) fn requires_action_mark(at: Point) -> Effect {
     Effect {
-        kind: EffectKind::WaitingMark,
+        kind: EffectKind::RequiresActionMark,
         at,
         phase: 0,
     }
@@ -166,19 +166,19 @@ const MAX_BUBBLES: u32 = 4;
 /// Columns between neighbouring bubbles.
 const BUBBLE_SPACING: u16 = 2;
 
-/// The bubbles over a busy gateway mascot centred at `pos`, its frame
-/// `frame_h` tall, with `runs` in flight: one per run over a baseline of one,
+/// The bubbles over a running gateway mascot centred at `pos`, its frame
+/// `frame_h` tall, with `turns` in flight: one per turn over a baseline of one,
 /// capped, rising from just above its head.
 pub(crate) fn mascot_bubbles(
     pos: Point,
     frame_h: u16,
-    runs: u32,
+    turns: u32,
     beat: Beat,
 ) -> impl Iterator<Item = Effect> {
     let step = beat.ms() / BUBBLE_STEP_MS;
     let top = pos.y.saturating_sub(frame_h / 2 + 1);
     // Below `MAX_BUBBLES`, a u32 that fits a u16.
-    let n = runs.saturating_add(1).min(MAX_BUBBLES) as u16;
+    let n = turns.saturating_add(1).min(MAX_BUBBLES) as u16;
     (0..n).map(move |i| Effect {
         kind: EffectKind::MascotBubble,
         at: Point {
@@ -297,8 +297,8 @@ mod tests {
     }
 
     #[test]
-    fn a_mascot_bubbles_once_per_run_over_one_capped() {
-        let count = |runs| mascot_bubbles(AT, 12, runs, at_ms(0)).count();
+    fn a_mascot_bubbles_once_per_turn_over_one_capped() {
+        let count = |turns| mascot_bubbles(AT, 12, turns, at_ms(0)).count();
         assert_eq!(count(1), 2);
         assert_eq!(count(2), 3);
         assert_eq!(count(u32::MAX), MAX_BUBBLES as usize);

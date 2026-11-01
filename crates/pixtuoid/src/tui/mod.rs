@@ -111,12 +111,10 @@ impl FloorCapacitySweep {
             if let Some(cap) = desk_cap {
                 capacity = capacity.min(cap);
             }
-            if capacity > 0 {
-                // `fetch_max` keeps capacity monotone: a shrink would shift the
-                // cumulative offsets and remap floor-1+ agents onto the wrong
-                // desks (they go invisible).
-                cap_slot.fetch_max(capacity, std::sync::atomic::Ordering::Relaxed);
-            }
+            // `fetch_max` keeps capacity monotone: a shrink would shift the
+            // cumulative offsets and remap floor-1+ agents onto the wrong
+            // desks (they go invisible).
+            cap_slot.fetch_max(capacity, std::sync::atomic::Ordering::Relaxed);
         }
         true
     }
@@ -155,7 +153,6 @@ impl std::fmt::Debug for FrameOut {
         f.debug_struct("FrameOut")
             .field("holding", &held.holding)
             .field("sync", &held.sync)
-            .field("torn", &held.torn)
             .finish_non_exhaustive()
     }
 }
@@ -167,9 +164,6 @@ struct Held {
     holding: bool,
     /// Wrap each frame in `CSI ? 2026 h` / `l`.
     sync: bool,
-    /// The last present failed, perhaps mid-escape or inside its update: the
-    /// next opens with ST, and ends that update.
-    torn: bool,
 }
 
 /// Begin and end synchronized update
@@ -185,7 +179,6 @@ impl FrameOut {
             frame: Vec::new(),
             holding: false,
             sync,
-            torn: false,
         })))
     }
 
@@ -205,12 +198,6 @@ impl FrameOut {
         let mut held = self.held();
         held.holding = true;
         held.frame.clear();
-        if held.torn {
-            held.frame.extend_from_slice(crate::graphics::ST);
-            if held.sync {
-                held.frame.extend_from_slice(END_SYNC);
-            }
-        }
         if held.sync {
             held.frame.extend_from_slice(BEGIN_SYNC);
         }
@@ -225,7 +212,7 @@ impl FrameOut {
     ///
     /// # Errors
     ///
-    /// If the write or the flush fails; the next frame then opens with ST.
+    /// If the write or the flush fails.
     pub(crate) fn present(&self) -> std::io::Result<()> {
         let mut held = self.held();
         held.holding = false;
@@ -234,7 +221,6 @@ impl FrameOut {
         }
         let Held { out, frame, .. } = &mut *held;
         let wrote = out.write_all(frame).and_then(|()| out.flush());
-        held.torn = wrote.is_err();
         held.frame.clear();
         wrote
     }
@@ -379,7 +365,7 @@ pub(crate) struct TuiSession {
     /// the reducer task's reconciler observes (gate + graceful evict).
     pub connected: crate::runtime::ConnectedSources,
     /// Where the warn-floor log lives, for the Sources panel's drift history.
-    pub log: Option<crate::run_log::LogLocation>,
+    pub log: crate::run_log::LogLocation,
     /// The sources this run's decode drift has named, for the footer nudge.
     pub drift: crate::doctor::DriftSeen,
     /// The persisted mute/volume, handed whole to `AudioController::new`.
@@ -518,7 +504,7 @@ pub(crate) async fn run_tui(session: TuiSession) -> Result<Option<QuitSignal>> {
     let term = setup_terminal(out.clone(), &arms)?;
     let quit = arms.signalled();
     tokio::pin!(quit);
-    let mut renderer = TuiRenderer::new(term, theme, pets, Arc::clone(&pack));
+    let mut renderer = TuiRenderer::new(term, theme, pets, pack);
     renderer.set_motion(motion);
     paint_plan(&mut renderer, plan, &out);
     renderer.present_through(out);
@@ -536,7 +522,7 @@ pub(crate) async fn run_tui(session: TuiSession) -> Result<Option<QuitSignal>> {
         connected: &connected.snapshot(),
         terminal_cutaway: matches!(plan, crate::graphics::Plan::Cutaway { .. }),
     });
-    renderer.warm(&scene_rx.borrow().clone(), &pack, ui.now());
+    renderer.warm(&scene_rx.borrow().clone(), ui.now());
     let mut cap_sweep = FloorCapacitySweep::new();
 
     let tick = frame_tick();
@@ -558,7 +544,7 @@ pub(crate) async fn run_tui(session: TuiSession) -> Result<Option<QuitSignal>> {
                     let audio_now = std::time::Instant::now();
                     audio_ctl.tick(audio_now);
                     renderer.set_volume_flash(audio_ctl.volume_flash(audio_now));
-                    renderer.render(&snapshot, &pack, now)?;
+                    renderer.render(&snapshot, now)?;
 
                     if let Some(layout) = renderer.cached_layout() {
                         cap_sweep.publish(layout.buf_w, layout.buf_h, desk_cap, &floor_caps);
@@ -588,9 +574,6 @@ pub(crate) async fn run_tui(session: TuiSession) -> Result<Option<QuitSignal>> {
                             },
                         );
                         if quit {
-                            if ui.theme_picker.is_some() {
-                                renderer.set_theme(theme::ALL_THEMES[ui.saved_theme_idx]);
-                            }
                             break;
                         }
                     }
@@ -653,7 +636,7 @@ mod frame_out_tests {
     use super::{BEGIN_SYNC, END_SYNC, FrameOut};
     use std::io::Write;
 
-    /// A terminal that records each write it gets, and fails while `full`;
+    /// A terminal that records each write it gets, and fails once `gone`;
     /// clones share it.
     #[derive(Clone, Default)]
     struct Tty(std::sync::Arc<std::sync::Mutex<Seen>>);
@@ -663,7 +646,7 @@ mod frame_out_tests {
         writes: Vec<Vec<u8>>,
         /// Every write call, the failed ones too.
         attempts: usize,
-        full: bool,
+        gone: bool,
     }
 
     impl Tty {
@@ -676,8 +659,8 @@ mod frame_out_tests {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             let mut seen = self.seen();
             seen.attempts += 1;
-            if seen.full {
-                return Err(std::io::ErrorKind::WouldBlock.into());
+            if seen.gone {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
             }
             seen.writes.push(buf.to_vec());
             Ok(buf.len())
@@ -707,7 +690,7 @@ mod frame_out_tests {
         )
         .expect("a fixed viewport needs no size query");
         term.hide_cursor().expect("hidden");
-        tty.seen().full = true;
+        tty.seen().gone = true;
 
         assert!(super::teardown_terminal(&mut term, Some(&out)).is_err());
         let attempts = tty.seen().attempts;
@@ -758,27 +741,6 @@ mod frame_out_tests {
                 2,
                 "outside a frame: straight through"
             );
-        }
-    }
-
-    /// A frame the terminal refused leaves the next one opening with ST, so
-    /// an escape it cut short ends before the next frame's bytes, and with
-    /// the end of the update it may have left open.
-    #[test]
-    fn a_refused_frame_opens_the_next_with_st() {
-        for sync in [false, true] {
-            let tty = Tty::default();
-            let mut out = FrameOut::new(tty.clone(), sync);
-            tty.seen().full = true;
-            assert!(frame(&mut out, &[b"\x1b_Ga=T"]).is_err());
-            tty.seen().full = false;
-            frame(&mut out, &[b"next"]).expect("presented");
-            let opening: &[&[u8]] = if sync {
-                &[crate::graphics::ST, END_SYNC, BEGIN_SYNC, b"next", END_SYNC]
-            } else {
-                &[crate::graphics::ST, b"next"]
-            };
-            assert_eq!(tty.seen().writes, vec![opening.concat()], "sync {sync}");
         }
     }
 }
@@ -1055,11 +1017,10 @@ mod route_tests {
             Terminal::new(TestBackend::new(120, 60)).expect("test backend"),
             &theme::NORMAL,
             Vec::new(),
-            std::sync::Arc::clone(&pack),
+            pack,
         );
         r.render(
             &pixtuoid_core::state::SceneState::uniform(16),
-            &pack,
             SystemTime::UNIX_EPOCH,
         )
         .expect("a half-block frame");
@@ -1097,11 +1058,10 @@ mod route_tests {
             Terminal::new(TestBackend::new(120, 60)).expect("test backend"),
             &theme::NORMAL,
             Vec::new(),
-            std::sync::Arc::clone(&pack),
+            pack,
         );
         r.render(
             &pixtuoid_core::state::SceneState::uniform(16),
-            &pack,
             SystemTime::UNIX_EPOCH,
         )
         .expect("a half-block frame");
@@ -1237,12 +1197,12 @@ mod apply_key_action_tests {
     }
 
     impl Harness {
-        /// Onboarding open on `detected`, as a first run shows it.
-        fn onboarding(detected: &[&'static str]) -> Self {
+        /// Onboarding open on `welcome`, as a first run shows it.
+        fn onboarding(welcome: crate::panels::welcome::WelcomeUi) -> Self {
             let mut h = Self::new();
             h.ui = super::ui_state::UiState::new(
                 &theme::NORMAL,
-                crate::panels::welcome::WelcomeUi::from_detected(detected),
+                welcome,
                 h._tmp.path().join("sock"),
                 None,
                 crate::doctor::DriftSeen::default(),
@@ -1253,17 +1213,27 @@ mod apply_key_action_tests {
 
     #[test]
     fn skipping_onboarding_writes_nothing() {
-        let mut h = Harness::onboarding(&["copilot"]);
+        let mut h = Harness::onboarding(crate::panels::welcome::WelcomeUi::from_ids(&["codex"]));
         assert!(h.ui.onboarding_open());
         h.apply(KeyAction::OnboardingSkip);
         assert!(!h.ui.onboarding_open());
         assert!(!h.config_path.exists(), "skip must not touch the config");
-        assert!(!h.connected.is_connected("copilot"));
+        assert!(!h.connected.is_connected("codex"));
     }
 
     #[test]
     fn confirming_onboarding_connects_the_checked_rows_and_opens_their_gate() {
-        let mut h = Harness::onboarding(&["copilot"]);
+        // A flag-only row: connecting a target-bearing source would install into the
+        // real CLI config.
+        let mut h = Harness::onboarding(crate::panels::welcome::WelcomeUi {
+            rows: vec![crate::panels::welcome::WelcomeRow {
+                source_id: "copilot",
+                label_prefix: "cp",
+                display_name: "Copilot".into(),
+                checked: true,
+            }],
+            selected: 0,
+        });
         h.apply(KeyAction::OnboardingConfirm);
         assert!(!h.ui.onboarding_open());
         assert!(h.connected.is_connected("copilot"));
@@ -1276,7 +1246,7 @@ mod apply_key_action_tests {
     #[test]
     fn v_reopens_the_popup_with_the_notices_still_due() {
         let mut h = Harness::new();
-        h.ui = super::ui_state::UiState::upgraded_from("0.19.0", "0.20.0");
+        h.ui = super::ui_state::UiState::upgraded_from("0.19.0", &semver::Version::new(0, 20, 0));
         h.connected = crate::runtime::ConnectedSources::new(HashSet::from(["codex".to_string()]));
         h.installed = || vec!["codex", "reasonix"];
         assert!(!h.apply(KeyAction::OpenVersionPopup));

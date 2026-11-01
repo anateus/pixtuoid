@@ -305,7 +305,7 @@ impl XrgbSurface<'_> {
         let Some((rows, cols)) = self.clip(layer.rect()).filter(|_| bw > 0 && bh > 0) else {
             return;
         };
-        let s = usize::from(layer.scale.max(1));
+        let s = usize::from(layer.scale);
         let (ox, oy) = (layer.origin.0 as isize, layer.origin.1 as isize);
         let src = buf.as_slice();
         for wy in rows {
@@ -716,7 +716,7 @@ mod tests {
         let pack = crate::test_flash::pack_arc();
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let scene = super::super::fixtures::scene_with(
-            vec![super::super::fixtures::active_on("/p/a.jsonl", 0, 0)],
+            vec![super::super::fixtures::running_on("/p/a.jsonl", 0, 0)],
             16,
         );
         for window in [(640u32, 400u32), (1001, 333)] {
@@ -728,10 +728,10 @@ mod tests {
             let mut renderer =
                 super::super::offscreen::OfficeRenderer::new(std::sync::Arc::clone(&pack));
             let office = renderer
-                .render(at, super::super::fixtures::frame(&scene, &pack, theme, now))
+                .render(at, super::super::fixtures::frame(&scene, theme, now))
                 .expect("a frame")
                 .clone();
-            let cell = pixtuoid_scene::cutaway::Face::chrome(at);
+            let cell = pixtuoid_scene::cutaway::chrome_cell(at);
             let footer = renderer.footer(
                 &scene,
                 footer_budget(window.0 as usize, cell),

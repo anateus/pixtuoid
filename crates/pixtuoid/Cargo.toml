@@ -3,14 +3,23 @@ name                   = "pixtuoid"
 description            = "Terminal pixel-art office for AI coding agents"
 version.workspace      = true
 edition.workspace      = true
-rust-version.workspace = true
-# Links pixtuoid-scene's Fusion Pixel faces (OFL-1.1).
+# Links pixtuoid-scene's Fusion Pixel face (OFL-1.1).
 license                = "MIT AND OFL-1.1"
 repository.workspace   = true
 authors.workspace      = true
 homepage.workspace     = true
 keywords.workspace     = true
 categories.workspace   = true
+# The plugins' type-check tooling beside the templates `include_str!` bakes,
+# which no build or packaged test reads; `contract.rs` reads plugin-contract.json.
+exclude                = [
+    "src/install/package.json",
+    "src/install/package-lock.json",
+    "src/install/tsconfig.json",
+    "src/install/.npmrc",
+    "src/install/*.d.ts",
+    "src/install/*.pyi",
+]
 
 [lints]
 workspace = true
@@ -20,8 +29,8 @@ name = "pixtuoid"
 path = "src/main.rs"
 
 [dependencies]
-pixtuoid-core  = { path = "../pixtuoid-core", version = "0.20.0" }
-pixtuoid-scene = { path = "../pixtuoid-scene", version = "0.20.0" }
+pixtuoid-core  = { path = "../pixtuoid-core", version = "0.21.0" }
+pixtuoid-scene = { path = "../pixtuoid-scene", version = "0.21.0" }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "fs", "io-util"] }
 ratatui            = { workspace = true }
 # The base64 of kitty's transmits and of the probe's queries.
@@ -50,7 +59,7 @@ toml               = { workspace = true }
 toml_edit          = { workspace = true }
 # YAML parse+emit for the Hermes install target — the maintained yaml-rust
 # successor, serde_yaml and serde_yml both being abandoned. It data-preserves a
-# user's other config keys on merge but does NOT round-trip comments.
+# user's other config keys on rewrite but does NOT round-trip comments.
 saphyr             = "0.2.1"
 anyhow             = { workspace = true }
 tracing            = { workspace = true }
@@ -155,7 +164,7 @@ windows-sys = { workspace = true, features = [
 [dev-dependencies]
 # `tests/wire_to_pixels.rs` drives real fixture bytes through the shared
 # `pixtuoid_core::harness` pipeline, which is behind core's dev-only feature.
-pixtuoid-core = { path = "../pixtuoid-core", version = "0.20.0", features = ["harness"] }
+pixtuoid-core = { path = "../pixtuoid-core", version = "0.21.0", features = ["harness"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
 # tests/text_coverage.rs parses the source of everything that renders text.
@@ -167,7 +176,7 @@ snapbox  = { workspace = true, features = ["json"] }
 # Emits the SourceStatus JSON Schema — test/gen only, so the `JsonSchema` derive
 # is `cfg_attr(test)` and this stays a dev-dep. See sources.rs + `just gen-contract`.
 schemars = { workspace = true }
-# test-util: paused-clock signal-arm tests in runtime/driver.rs (headless_loop).
+# test-util: paused-clock tests (tui/mod.rs's frame clock).
 tokio    = { workspace = true, features = ["test-util"] }
 image    = { workspace = true, features = ["gif"] }
 # A decoder our SIXEL encoder's tests did not write.

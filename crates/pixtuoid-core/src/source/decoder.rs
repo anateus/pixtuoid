@@ -9,19 +9,19 @@ use serde_json::Value;
 
 use crate::AgentId;
 use crate::id::normalize_path_key;
-use crate::source::{AgentEvent, ToolDetail};
+use crate::source::{AgentEvent, RequestKeys, ToolDetail};
 
 /// The JSONL line-decoder fn pointer: `(transcript_path, source, raw_line) ->
 /// events`. Defined HERE, NOT in the `native`-gated `jsonl` module, so the
 /// registry's `SourceDescriptor` can name it in a `--no-default-features` (wasm)
 /// build.
-pub type LineDecoder = fn(&str, &str, Value) -> DecodeResult<Vec<AgentEvent>>;
+pub type LineDecoder = fn(&str, &str, Value) -> Vec<AgentEvent>;
 
 /// A decoder's answer: its events, or why it refused the input.
 pub type DecodeResult<T> = std::result::Result<T, DecodeError>;
 
-/// Why a decoder refused a hook payload or a transcript line. The caller logs it
-/// and drops the input; every wire-borne string in it is `display_safe`d.
+/// Why a decoder refused a hook payload. The caller logs it and drops the input;
+/// every wire-borne string in it is `display_safe`d.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DecodeError {
@@ -149,13 +149,18 @@ pub(crate) fn checked_pid(raw: i64) -> Option<i32> {
     i32::try_from(raw).ok().filter(|&p| p > 0)
 }
 
+/// The hook-envelope key that carries the agent CLI's pid: a plugin stamps it
+/// from inside the CLI, else the shim from its ancestry (`pixtuoid-hook`'s `cli_pid`).
+/// Pinned by `each_key_the_shim_stamps_is_the_one_core_reads` to the shim's copy.
+#[doc(hidden)]
+pub const PID_STAMP: &str = "_pid";
+
 pub(crate) fn extract_top_level_cwd(v: &Value) -> Option<PathBuf> {
     v.get("cwd").and_then(Value::as_str).map(PathBuf::from)
 }
 
-/// The directory a CC subagent transcript sits under: `<parent>/subagents/
-/// agent-*.jsonl`. Single source of truth for both `is_subagent_path` and the
-/// watcher's `detect_parent_id` so they cannot diverge.
+/// The directory a subagent's transcript nests in under its parent's:
+/// `<parent>/subagents/<child>.jsonl`.
 pub(crate) const SUBAGENTS_DIR: &str = "subagents";
 
 /// Whether a transcript path is a CC subagent transcript. Matched as a whole
@@ -208,10 +213,7 @@ pub(crate) fn first_present_str<'a>(obj: &'a Value, keys: &[&str]) -> Option<&'a
 /// end-marker predicate, never a substring scan (user-controllable content — a
 /// tool result QUOTING the marker — must not drive lifecycle).
 pub(crate) fn parsed_tail_lines(tail: &[u8]) -> impl Iterator<Item = Value> + '_ {
-    tail.split(|b| *b == b'\n').filter_map(|line| {
-        let s = std::str::from_utf8(line).ok()?;
-        serde_json::from_str::<Value>(s).ok()
-    })
+    crate::source::admit::lines(tail).filter_map(|line| serde_json::from_str(line.ok()?).ok())
 }
 
 /// What a transcript tail says about when its SESSION last wrote — the per-source
@@ -230,62 +232,41 @@ pub enum TailActivity {
     Unknown,
 }
 
-/// Minimal RFC3339 → epoch seconds (`YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)`).
-/// Core deliberately carries no date dependency for the handful of wire
-/// timestamps it reads; every caller treats `None` as "no information".
+/// An [RFC 3339](https://www.rfc-editor.org/rfc/rfc3339#section-5.6) stamp →
+/// epoch seconds; every caller treats `None` as "no information".
 pub(crate) fn rfc3339_to_epoch_secs(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' && b[10] != b't' {
-        return None;
-    }
-    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
-        return None;
-    }
-    let mut i = 19;
-    if b.get(i) == Some(&b'.') {
-        i += 1;
-        while b.get(i).is_some_and(u8::is_ascii_digit) {
-            i += 1;
-        }
-    }
-    let offset_secs: i64 = match b.get(i) {
-        Some(b'Z') | Some(b'z') if i + 1 == b.len() => 0,
-        Some(sign @ (b'+' | b'-')) if i + 6 == b.len() && b.get(i + 3) == Some(&b':') => {
-            let oh = num(i + 1..i + 3)?;
-            let om = num(i + 4..i + 6)?;
-            let mag = oh * 3600 + om * 60;
-            if *sign == b'+' { mag } else { -mag }
-        }
-        _ => return None,
-    };
-    // Howard Hinnant's `days_from_civil`:
-    // https://howardhinnant.github.io/date_algorithms.html#days_from_civil
-    let (y_adj, era_m) = if mo <= 2 {
-        (y - 1, mo + 9)
-    } else {
-        (y, mo - 3)
-    };
-    let era = y_adj.div_euclid(400);
-    let yoe = y_adj - era * 400;
-    let doy = (153 * era_m + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    let secs = days * 86_400 + h * 3600 + mi * 60 + sec - offset_secs;
-    u64::try_from(secs).ok()
+    rfc3339_to_epoch(s).map(|d| d.as_secs())
 }
 
+/// [`rfc3339_to_epoch_secs`] with the fraction kept, to the nanosecond, by
+/// [`DateTime::parse_from_rfc3339`](chrono::DateTime::parse_from_rfc3339).
+pub(crate) fn rfc3339_to_epoch(s: &str) -> Option<std::time::Duration> {
+    let t = chrono::DateTime::parse_from_rfc3339(s).ok()?;
+    Some(std::time::Duration::new(
+        u64::try_from(t.timestamp()).ok()?,
+        t.timestamp_subsec_nanos(),
+    ))
+}
+
+/// The key the shim stamps with the CLI whose hook ran it. Pinned by
+/// `each_key_the_shim_stamps_is_the_one_core_reads` to the shim's copy.
+pub const SOURCE_STAMP: &str = "_pixtuoid_source";
+
 /// The CLI a hook envelope belongs to — read ONLY from the shim-owned
-/// `_pixtuoid_source`. CC's public `source` field carries the SessionStart REASON
+/// [`SOURCE_STAMP`]. CC's public `source` field carries the SessionStart REASON
 /// (startup/resume/clear/compact), so reading it would namespace the agent under
 /// "startup" and split it from the claude-code-keyed tool/JSONL/SessionEnd events:
 /// an un-reapable ghost.
 pub(crate) fn hook_source(obj: &serde_json::Map<String, Value>) -> &str {
-    obj.get("_pixtuoid_source")
+    obj.get(SOURCE_STAMP)
         .and_then(|s| s.as_str())
         .unwrap_or(crate::source::claude_code::SOURCE_NAME)
+}
+
+/// A test payload as the object every hook decoder is handed.
+#[cfg(test)]
+pub(crate) fn test_obj(v: &Value) -> &crate::source::registry::HookObject {
+    v.as_object().expect("a test payload is an object")
 }
 
 /// Envelopes that decode to NOTHING, quietly. A DAEMON source's payloads ride the
@@ -308,9 +289,9 @@ fn decodes_to_nothing(
         tracing::trace!(source, "dropping grok cross-fired hook envelope");
         return true;
     }
-    // cursor's own unstamped duplicates, counted in `source/cursor.rs`'s module doc.
-    if cc && obj.contains_key("cursor_version") && !obj.contains_key("_pixtuoid_source") {
-        tracing::trace!("dropping an unstamped cursor hook invocation");
+    // cursor's duplicates through Claude Code's hooks, `source/cursor.rs`'s module doc.
+    if cc && obj.contains_key("cursor_version") {
+        tracing::trace!("dropping a cursor hook envelope on the claude-code channel");
         return true;
     }
     false
@@ -323,28 +304,81 @@ fn decodes_to_nothing(
 /// through to the shared CC-shaped arms; a `ClaimsAll` decoder cannot.
 fn source_owned_arms(
     desc: Option<&'static crate::source::registry::SourceDescriptor>,
-    v: &Value,
+    obj: &crate::source::registry::HookObject,
 ) -> DecodeResult<Option<Vec<AgentEvent>>> {
     use crate::source::registry::HookDecoding;
     match desc.and_then(|d| d.hook()) {
-        Some(HookDecoding::ClaimsAll(decode)) => decode(v).map(Some),
-        Some(HookDecoding::Shared { extend, .. }) => extend(v),
+        Some(HookDecoding::ClaimsAll(decode)) => decode(obj).map(Some),
+        Some(HookDecoding::Shared { extend, .. }) => extend(obj),
         None => Ok(None),
     }
+}
+
+/// `obj`'s string field `key`, `None` when absent or EMPTY: an empty id or
+/// name keys nothing.
+pub(crate) fn non_empty<'a>(obj: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
+    obj.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Whose session a hook speaks for: a subagent names itself in [`SUBAGENT_ID`]
+/// beside its root's `session_id`, a root in `session_id` alone.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HookSubject<'a> {
+    /// The subagent's own id, when a subagent fired it.
+    pub(crate) child: Option<&'a str>,
+    /// The root session's id.
+    pub(crate) root: Option<&'a str>,
+}
+
+impl<'a> HookSubject<'a> {
+    pub(crate) fn of(obj: &'a serde_json::Map<String, Value>) -> Self {
+        Self {
+            child: non_empty(obj, SUBAGENT_ID),
+            root: non_empty(obj, "session_id"),
+        }
+    }
+}
+
+/// A hook's `tool_name`, the key a request binds its pending calls by, so the
+/// pre-use and the prompt derive it alike; its absence is drift.
+pub(crate) fn hook_tool_name(
+    obj: &serde_json::Map<String, Value>,
+    source: &str,
+    event: &str,
+) -> Option<String> {
+    let name = non_empty(obj, "tool_name").map(|n| ellipsize(n, MAX_DECODED_FIELD_CHARS));
+    if name.is_none() {
+        super::drift::missing_field(source, event, "tool_name");
+    }
+    name
+}
+
+/// The per-call id's wire name on `desc`'s hooks: its row's
+/// [`ToolIdKey`](crate::source::registry::ToolIdKey), `tool_use_id` for a row
+/// with no shared arms.
+pub(crate) fn hook_tool_id_key(
+    desc: Option<&'static crate::source::registry::SourceDescriptor>,
+) -> &'static str {
+    match desc.and_then(|d| d.hook()) {
+        Some(crate::source::registry::HookDecoding::Shared { tool_id_key, .. }) => *tool_id_key,
+        _ => crate::source::registry::ToolIdKey::ToolUse,
+    }
+    .wire_name()
 }
 
 /// The payload's `session_id`, rejected when missing or EMPTY: an empty one passes
 /// `as_str` but, for Codex (which keys the AgentId on it), would mint a phantom
 /// agent that never coalesces with any rollout. This and `hook_event_name`
 /// breadcrumb undeduped — the two fields are the whole hook plane's chokepoint.
-fn hook_session_id(
+pub(crate) fn hook_session_id(
     obj: &serde_json::Map<String, Value>,
     source: &str,
     event: &str,
 ) -> DecodeResult<String> {
-    obj.get("session_id")
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.is_empty())
+    HookSubject::of(obj)
+        .root
         .ok_or_else(|| {
             super::drift::missing_field(source, event, "session_id");
             DecodeError::missing_in(source, event, "session_id")
@@ -356,7 +390,7 @@ fn hook_session_id(
 /// event. `cwd` is on the wire for CC tool hooks but absent on e.g. Codex
 /// `PermissionRequest` — absent or empty maps to `None`, so the reducer's cwd-less
 /// registration path (ordinal label, reap-exempt) applies.
-fn hook_identity(
+pub(crate) fn hook_identity(
     agent_id: AgentId,
     source: &str,
     session_id: &str,
@@ -406,15 +440,25 @@ pub const EVENT_STAMP: &str = "_pixtuoid_event";
 ///
 /// If the payload is not an object, a source-owned decoder rejects it, `hook_event_name` or `session_id` is missing or empty, or the event is unsupported.
 pub fn decode_hook_payload(v: Value) -> DecodeResult<Vec<AgentEvent>> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| DecodeError::not_an_object("hook"))?;
+    decode_hook_object(hook_object(&v)?)
+}
+
+/// The one object gate for a hook payload, shared by the listener and [`decode_hook_payload`].
+pub(crate) fn hook_object(v: &Value) -> DecodeResult<&crate::source::registry::HookObject> {
+    v.as_object()
+        .ok_or_else(|| DecodeError::not_an_object("hook"))
+}
+
+/// [`decode_hook_payload`] past its object gate.
+pub(crate) fn decode_hook_object(
+    obj: &crate::source::registry::HookObject,
+) -> DecodeResult<Vec<AgentEvent>> {
     let source = hook_source(obj);
     let desc = crate::source::registry::descriptor_for(source);
     if decodes_to_nothing(source, obj, desc) {
         return Ok(vec![]);
     }
-    if let Some(evs) = source_owned_arms(desc, &v)? {
+    if let Some(evs) = source_owned_arms(desc, obj)? {
         return Ok(evs);
     }
     shared_hook_arms(obj, source, desc)
@@ -439,11 +483,7 @@ pub(crate) fn shared_hook_arms(
         })?;
     let session_id = hook_session_id(obj, source, event)?;
     let agent_id = AgentId::from_parts(source, &session_id);
-    let tool_id_key = match desc.and_then(|d| d.hook()) {
-        Some(crate::source::registry::HookDecoding::Shared { tool_id_key, .. }) => *tool_id_key,
-        _ => crate::source::registry::ToolIdKey::ToolUse,
-    }
-    .wire_name();
+    let tool_id_key = hook_tool_id_key(desc);
 
     match event {
         "SessionStart" => {
@@ -471,36 +511,35 @@ pub(crate) fn shared_hook_arms(
             Ok(evs)
         }
         "PreToolUse" => {
-            let tool_name = obj
-                .get("tool_name")
-                .and_then(|s| s.as_str())
-                .unwrap_or_else(|| {
-                    super::drift::missing_field(source, "PreToolUse", "tool_name");
-                    "?"
-                });
-            let tool_use_id = obj
-                .get(tool_id_key)
-                .and_then(|s| s.as_str())
-                .map(String::from);
-            let mut evs = vec![
-                hook_identity(agent_id, source, &session_id, obj),
-                AgentEvent::ActivityStart {
-                    agent_id,
-                    tool_use_id,
-                    detail: Some(make_tool_detail(source, tool_name, obj.get("tool_input"))),
-                },
-            ];
+            let tool_name = hook_tool_name(obj, source, event);
+            let tool_use_id = non_empty(obj, tool_id_key).map(String::from);
+            // Named ahead of its item: a permission prompt names only the
+            // tool, so the request binds the calls pending under that name.
+            let pending = tool_use_id.clone().map(|call| AgentEvent::ToolUsePending {
+                agent_id,
+                tool_use_id: call,
+                tool_name: tool_name.clone(),
+                turn: None,
+            });
+            let mut evs = vec![hook_identity(agent_id, source, &session_id, obj)];
+            evs.extend(pending);
+            evs.push(AgentEvent::ToolUseStart {
+                agent_id,
+                tool_use_id,
+                detail: Some(make_tool_detail(
+                    source,
+                    tool_name.as_deref().unwrap_or("?"),
+                    obj.get("tool_input"),
+                )),
+            });
             evs.extend(hook_effort(agent_id, obj));
             Ok(evs)
         }
         "PostToolUse" => {
-            let tool_use_id = obj
-                .get(tool_id_key)
-                .and_then(|s| s.as_str())
-                .map(String::from);
+            let tool_use_id = non_empty(obj, tool_id_key).map(String::from);
             let mut evs = vec![
                 hook_identity(agent_id, source, &session_id, obj),
-                AgentEvent::ActivityEnd {
+                AgentEvent::ToolUseEnd {
                     agent_id,
                     tool_use_id,
                 },
@@ -509,27 +548,29 @@ pub(crate) fn shared_hook_arms(
             Ok(evs)
         }
         "Notification" => {
-            let msg = obj
-                .get("message")
-                .and_then(|s| s.as_str())
-                .unwrap_or("waiting");
+            let msg = obj.get("message").and_then(|s| s.as_str());
             Ok(vec![
                 hook_identity(agent_id, source, &session_id, obj),
-                AgentEvent::Waiting {
+                AgentEvent::user_action_request(
                     agent_id,
-                    reason: ellipsize(msg, MAX_DECODED_FIELD_CHARS),
-                    tool_use_id: None,
-                },
+                    msg.map(|m| ellipsize(m, MAX_DECODED_FIELD_CHARS)),
+                    RequestKeys::default(),
+                ),
             ])
         }
-        // Codex's permission prompt is the same "waiting on the human" signal.
+        // The prompt names its tool, and kimi's its call too; an empty name
+        // binds nothing.
         "PermissionRequest" => Ok(vec![
             hook_identity(agent_id, source, &session_id, obj),
-            AgentEvent::Waiting {
+            AgentEvent::user_action_request(
                 agent_id,
-                reason: "permission".into(),
-                tool_use_id: None,
-            },
+                Some("permission".into()),
+                RequestKeys {
+                    tool_use_id: non_empty(obj, tool_id_key).map(String::from),
+                    tool_name: hook_tool_name(obj, source, event),
+                    ..RequestKeys::default()
+                },
+            ),
         ]),
         // The JSONL rollout stays the system of record for Codex tool activity.
         "UserPromptSubmit" => {
@@ -542,12 +583,8 @@ pub(crate) fn shared_hook_arms(
                 parent_id: None,
             }])
         }
-        // Turn end — keep the slot, just settle to idle. Stop must NOT end the
-        // session: turns end many times per session.
-        "Stop" => Ok(vec![AgentEvent::ActivityEnd {
-            agent_id,
-            tool_use_id: None,
-        }]),
+        // Stop must NOT end the session: turns end many times per session.
+        "Stop" => Ok(vec![AgentEvent::turn_end(agent_id)]),
         "SessionEnd" => Ok(vec![AgentEvent::SessionEnd {
             agent_id,
             as_child: false,
@@ -573,19 +610,12 @@ pub(crate) fn subagent_fired(
     source: &str,
     session: fn(&str) -> String,
 ) -> DecodeResult<Option<Vec<AgentEvent>>> {
-    let Some(agent) = obj
-        .get(SUBAGENT_ID)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    else {
+    let subject = HookSubject::of(obj);
+    let Some(agent) = subject.child else {
         return Ok(None);
     };
     let desc = crate::source::registry::descriptor_for(source);
-    let root = obj
-        .get("session_id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(|root| AgentId::from_parts(source, root));
+    let root = subject.root.map(|root| AgentId::from_parts(source, root));
     let mut own = obj.clone();
     own.insert("session_id".into(), Value::from(session(agent)));
     let mut evs = shared_hook_arms(&own, source, desc)?;
@@ -599,7 +629,7 @@ pub(crate) fn subagent_fired(
 
 /// The dispatch tool's current NAME, renamed from `Task` in CC v2.1.63 with no
 /// announcement. `Workflow` (CC's fleet dispatcher) is DELIBERATELY not a second
-/// entry: its children fire no per-agent tool_use, so one months-long `active_tasks`
+/// entry: its children fire no per-agent tool_use, so one months-long `tasks_in_flight`
 /// entry would sweep-EXEMPT every FINISHED fleet subagent until the workflow ends —
 /// worse desk starvation than the gap. Fleet lifecycle rides the Subagent hooks.
 const DISPATCH_TOOL: &str = "Agent";
@@ -608,7 +638,7 @@ const DISPATCH_TOOL: &str = "Agent";
 /// the PRESENCE of a `subagent_type` input field — presence, not value, so a renamed
 /// tool emitting `subagent_type: null` is still caught AND still breadcrumbs the
 /// drift. The reducer keys Delegating and an unnamed child's suppression
-/// (`active_tasks`) and Task-drain completion on `is_task()`, so a missed dispatch
+/// (`tasks_in_flight`) and Task-drain completion on `is_task()`, so a missed dispatch
 /// silently disables them.
 pub(crate) fn make_tool_detail(source: &str, tool_name: &str, input: Option<&Value>) -> ToolDetail {
     let has_subagent_type = input.and_then(|v| v.get("subagent_type")).is_some();
@@ -661,7 +691,7 @@ pub(crate) fn describe_tool_target<'a>(tool: &str, input: Option<&'a Value>) -> 
 /// Generic tool display) — a glanceable fragment, not a full field.
 pub(crate) const MAX_TOOL_TARGET_CHARS: usize = 40;
 
-/// Cap for content-derived strings that become slot state (Waiting reason,
+/// Cap for content-derived strings that become slot state ([`AgentEvent::UserActionRequest`] reason,
 /// Rename label) — generous against every legitimate value, tight against a
 /// crafted ~1 MiB hook/transcript line: every TUI display site is individually
 /// bounded, but the headless summary line is not, and the uncapped value would
@@ -758,15 +788,33 @@ mod tests {
     }
 
     #[test]
-    fn rfc3339_shape_gate_rejects_each_separator_independently() {
+    fn rfc3339_to_epoch_keeps_the_fraction_the_seconds_drop() {
+        use std::time::Duration;
+        assert_eq!(
+            rfc3339_to_epoch("2026-07-16T12:00:05.123456+00:00"),
+            Some(Duration::new(1_784_203_205, 123_456_000))
+        );
+        assert_eq!(
+            rfc3339_to_epoch("2026-07-16T12:00:05.1234567891Z"),
+            Some(Duration::new(1_784_203_205, 123_456_789)),
+            "a digit past the nanosecond is cut"
+        );
+        assert_eq!(
+            rfc3339_to_epoch("2026-07-16T12:00:05Z"),
+            Some(Duration::from_secs(1_784_203_205))
+        );
+    }
+
+    #[test]
+    fn rfc3339_rejects_each_wrong_separator() {
         for bad in [
             "2026x07-16T12:00:05Z",
             "2026-07x16T12:00:05Z",
-            "2026-07-16 12:00:05Z",
+            "2026-07-16x12:00:05Z",
         ] {
             assert_eq!(rfc3339_to_epoch_secs(bad), None, "{bad:?}");
         }
-        // A lower-case `t` is the OTHER accepted separator, and grok's
+        // A lower-case `t` is accepted too, and grok's
         // `normalize_path_key`'d stamps arrive lowercased.
         assert_eq!(
             rfc3339_to_epoch_secs("2026-07-16t12:00:05Z"),
@@ -782,11 +830,22 @@ mod tests {
             ("2026-07-16T12:59:05Z", "2026-07-16T12:60:05Z"),
             // 60 is the LEAP second, still in range; 61 never is.
             ("2026-07-16T12:00:60Z", "2026-07-16T12:00:61Z"),
+            ("2026-07-16T12:00:05+23:00", "2026-07-16T12:00:05+24:00"),
+            ("2026-07-16T12:00:05-00:59", "2026-07-16T12:00:05-00:60"),
         ] {
             assert!(rfc3339_to_epoch_secs(ok).is_some(), "{ok:?} must parse");
             assert_eq!(rfc3339_to_epoch_secs(bad), None, "{bad:?} must not");
         }
-        assert_eq!(rfc3339_to_epoch_secs("2026-07-00T12:00:05Z"), None);
+        for bad in [
+            "2026-07-00T12:00:05Z",
+            "2026-02-31T12:00:05Z",
+            "2026-07-16T12:00:05.Z",
+            "2026-07-16T-1:00:05Z",
+            "2026-07-16T+1:00:05Z",
+            "2026-07-16T12:00:05+-1:00",
+        ] {
+            assert_eq!(rfc3339_to_epoch_secs(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -955,31 +1014,32 @@ mod tests {
     }
 
     #[test]
-    fn codex_session_start_without_transcript_path_uses_session_id() {
-        // Codex sends transcript_path as string|null.
-        let ev = decode_single(json!({
-            "hook_event_name": "SessionStart",
-            "session_id": "codex-sess-1",
-            "_pixtuoid_source": "codex",
-            "cwd": "/Users/me/work/myrepo"
-        }));
-        match ev {
-            AgentEvent::SessionStart {
-                agent_id,
-                source,
-                cwd,
-                ..
-            } => {
-                assert_eq!(source, "codex");
-                assert_eq!(agent_id, AgentId::from_parts("codex", "codex-sess-1"));
-                assert_eq!(cwd, std::path::PathBuf::from("/Users/me/work/myrepo"));
-            }
-            other => panic!("expected SessionStart, got {other:?}"),
+    fn a_permission_request_names_its_tool_and_kimis_its_call() {
+        for (source, extra, call) in [
+            ("claude-code", json!({}), None),
+            ("kimi", json!({"tool_call_id": "call_k"}), Some("call_k")),
+            ("kimi", json!({"tool_call_id": ""}), None),
+        ] {
+            let mut v = json!({
+                "hook_event_name": "PermissionRequest", "session_id": "s",
+                "tool_name": "Bash", "tool_input": {"command": "ls"},
+                "_pixtuoid_source": source,
+            });
+            v.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            let evs = decode_hook_payload(v).expect("decodes");
+            assert!(
+                matches!(&evs[..], [AgentEvent::Identity { .. }, AgentEvent::UserActionRequest {
+                    tool_use_id, tool_name: Some(n), turn: None, .. }]
+                    if tool_use_id.as_deref() == call && n == "Bash"),
+                "{source}: {evs:?}"
+            );
         }
     }
 
     #[test]
-    fn codex_permission_request_maps_to_identity_plus_waiting() {
+    fn codex_permission_request_maps_to_identity_plus_user_action_request() {
         // The captured Codex shape carries no cwd.
         let evs = decode_hook_payload(json!({
             "hook_event_name": "PermissionRequest",
@@ -987,7 +1047,7 @@ mod tests {
             "_pixtuoid_source": "codex"
         }))
         .expect("decodes");
-        assert_eq!(evs.len(), 2, "Identity + Waiting, got {evs:?}");
+        assert_eq!(evs.len(), 2, "Identity + UserActionRequest, got {evs:?}");
         match &evs[0] {
             AgentEvent::Identity {
                 source,
@@ -1001,83 +1061,28 @@ mod tests {
             }
             other => panic!("expected leading Identity, got {other:?}"),
         }
-        assert!(matches!(evs[1], AgentEvent::Waiting { .. }));
+        assert!(matches!(evs[1], AgentEvent::UserActionRequest { .. }));
     }
 
     #[test]
-    fn codex_user_prompt_submit_creates_agent_via_session_start() {
-        let ev = decode_single(json!({
-            "hook_event_name": "UserPromptSubmit",
-            "session_id": "codex-sess",
-            "_pixtuoid_source": "codex",
-            "cwd": "/Users/me/work/myrepo",
-            "transcript_path": "/Users/me/.codex/sessions/x.jsonl"
-        }));
-        match ev {
-            AgentEvent::SessionStart {
-                agent_id,
-                source,
-                cwd,
-                ..
-            } => {
-                assert_eq!(source, "codex");
-                assert_eq!(cwd, std::path::PathBuf::from("/Users/me/work/myrepo"));
-                // Codex keys on session_id, NOT the (here non-null) transcript_path
-                // — keying on the path would produce two sprites for one session.
-                assert_eq!(agent_id, AgentId::from_parts("codex", "codex-sess"));
-            }
-            other => panic!("expected SessionStart, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn codex_stop_maps_to_activity_end_with_no_identity() {
-        let ev = decode_single(json!({
-            "hook_event_name": "Stop",
-            "session_id": "s",
-            "_pixtuoid_source": "codex"
-        }));
-        assert!(matches!(ev, AgentEvent::ActivityEnd { .. }));
-    }
-
-    #[test]
-    fn pre_tool_use_decodes_to_identity_plus_activity_start() {
+    fn a_shared_notification_without_a_message_carries_no_reason() {
         let evs = decode_hook_payload(json!({
-            "hook_event_name": "PreToolUse",
-            "session_id": "ses-abc",
-            "transcript_path": "/p/ses-abc.jsonl",
-            "cwd": "/Users/me/repo",
-            "tool_name": "Bash",
-            "tool_input": {"command": "ls"},
-            "tool_use_id": "t1"
+            "hook_event_name": "Notification",
+            "session_id": "s",
+            "cwd": "/r",
+            "_pixtuoid_source": "kimi"
         }))
         .expect("decodes");
-        assert_eq!(evs.len(), 2, "Identity + ActivityStart, got {evs:?}");
-        match &evs[0] {
-            AgentEvent::Identity {
-                agent_id,
-                source,
-                session_id,
-                cwd,
-                pid: None,
-            } => {
-                assert_eq!(
-                    *agent_id,
-                    AgentId::from_parts(crate::source::claude_code::SOURCE_NAME, "ses-abc"),
-                    "Identity must coalesce with the activity event's id"
-                );
-                assert_eq!(source, crate::source::claude_code::SOURCE_NAME);
-                assert_eq!(session_id, "ses-abc");
-                assert_eq!(cwd.as_deref(), Some(std::path::Path::new("/Users/me/repo")));
-            }
-            other => panic!("expected leading Identity, got {other:?}"),
-        }
-        match &evs[1] {
-            AgentEvent::ActivityStart { tool_use_id, .. } => {
-                assert_eq!(tool_use_id.as_deref(), Some("t1"));
-            }
-            other => panic!("expected ActivityStart, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                evs.as_slice(),
+                [
+                    AgentEvent::Identity { .. },
+                    AgentEvent::UserActionRequest { reason: None, .. }
+                ]
+            ),
+            "{evs:?}"
+        );
     }
 
     #[test]
@@ -1091,7 +1096,7 @@ mod tests {
             "tool_use_id": "t1"
         }))
         .expect("decodes");
-        assert_eq!(evs.len(), 2, "Identity + ActivityEnd, got {evs:?}");
+        assert_eq!(evs.len(), 2, "Identity + ToolUseEnd, got {evs:?}");
         match &evs[0] {
             AgentEvent::Identity {
                 source,
@@ -1105,7 +1110,7 @@ mod tests {
             }
             other => panic!("expected leading Identity, got {other:?}"),
         }
-        assert!(matches!(evs[1], AgentEvent::ActivityEnd { .. }));
+        assert!(matches!(evs[1], AgentEvent::ToolUseEnd { .. }));
     }
 
     #[test]
@@ -1123,57 +1128,6 @@ mod tests {
                 assert_eq!(*cwd, None, "empty cwd must map to None, not Some(\"\")");
             }
             other => panic!("expected leading Identity, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn notification_decodes_to_identity_plus_waiting() {
-        let evs = decode_hook_payload(json!({
-            "hook_event_name": "Notification",
-            "session_id": "ses-abc",
-            "transcript_path": "/p/ses-abc.jsonl",
-            "cwd": "/Users/me/repo",
-            "message": "permission?"
-        }))
-        .expect("decodes");
-        assert_eq!(evs.len(), 2, "Identity + Waiting, got {evs:?}");
-        match &evs[0] {
-            AgentEvent::Identity { cwd, .. } => {
-                assert_eq!(cwd.as_deref(), Some(std::path::Path::new("/Users/me/repo")));
-            }
-            other => panic!("expected leading Identity, got {other:?}"),
-        }
-        assert!(matches!(&evs[1], AgentEvent::Waiting { reason, .. } if reason == "permission?"));
-    }
-
-    #[test]
-    fn session_start_and_session_end_carry_no_identity() {
-        for (payload, name) in [
-            (
-                json!({
-                    "hook_event_name": "SessionStart",
-                    "session_id": "s",
-                    "transcript_path": "/p/s.jsonl",
-                    "cwd": "/repo"
-                }),
-                "SessionStart",
-            ),
-            (
-                json!({
-                    "hook_event_name": "SessionEnd",
-                    "session_id": "s",
-                    "transcript_path": "/p/s.jsonl",
-                    "cwd": "/repo"
-                }),
-                "SessionEnd",
-            ),
-        ] {
-            let evs = decode_hook_payload(payload).expect("decodes");
-            assert_eq!(evs.len(), 1, "{name}: exactly one event, got {evs:?}");
-            assert!(
-                !matches!(evs[0], AgentEvent::Identity { .. }),
-                "{name} must not emit Identity"
-            );
         }
     }
 
@@ -1202,20 +1156,6 @@ mod tests {
     }
 
     #[test]
-    fn pixtuoid_source_private_key_drives_cli_attribution() {
-        let ev = decode_single(json!({
-            "hook_event_name": "Stop",
-            "session_id": "codex-sess",
-            "_pixtuoid_source": "codex"
-        }));
-        assert_eq!(
-            ev.agent_id(),
-            AgentId::from_parts("codex", "codex-sess"),
-            "Codex Stop keys on session_id under the codex namespace"
-        );
-    }
-
-    #[test]
     fn subagent_hooks_from_sources_without_a_custom_decoder_bail() {
         for event in ["SubagentStart", "SubagentStop"] {
             let ev = decode_hook_payload(json!({
@@ -1234,12 +1174,13 @@ mod tests {
         let ev = decode_hook_payload(json!({
             "_pixtuoid_source": "reasonix",
             "event": "PreCompact",
-            "cwd": "/repo"
+            "cwd": "/repo",
+            "sessionId": "s"
         }));
         let msg = ev.expect_err("unknown rx event must bail").to_string();
         assert!(
-            msg.contains("reasonix"),
-            "error must come from the rx decoder (claimed fully), got: {msg}"
+            msg.contains("reasonix") && msg.contains("PreCompact") && !msg.contains("sessionId"),
+            "error must be the rx decoder's unknown-event bail, got: {msg}"
         );
     }
 
@@ -1282,26 +1223,6 @@ mod tests {
         let capped = ellipsize(&over, MAX_DECODED_FIELD_CHARS);
         assert_eq!(capped.chars().count(), MAX_DECODED_FIELD_CHARS + 1);
         assert!(capped.ends_with('…'), "cap must be marked: {capped:?}");
-    }
-
-    #[test]
-    fn notification_reason_is_capped_at_the_decode_boundary() {
-        let long = "メ".repeat(MAX_DECODED_FIELD_CHARS * 100);
-        let evs = decode_hook_payload(json!({
-            "hook_event_name": "Notification",
-            "session_id": "ses-abc",
-            "transcript_path": "/p/ses-abc.jsonl",
-            "cwd": "/repo",
-            "message": long
-        }))
-        .expect("decodes");
-        match &evs[1] {
-            AgentEvent::Waiting { reason, .. } => {
-                assert_eq!(reason.chars().count(), MAX_DECODED_FIELD_CHARS + 1);
-                assert!(reason.ends_with('…'));
-            }
-            other => panic!("expected Waiting, got {other:?}"),
-        }
     }
 
     #[test]
@@ -1464,6 +1385,42 @@ mod tests {
     }
 
     #[test]
+    fn a_permission_request_naming_no_tool_leaves_a_drift_breadcrumb() {
+        use crate::source::drift::{DriftKind, KIND_FIELD, SOURCE_FIELD, TARGET};
+        for (source, extra) in [
+            ("claude-code", json!({})),
+            ("codex", json!({"turn_id": "t"})),
+        ] {
+            for name in [None, Some("Bash")] {
+                let mut v = json!({
+                    "hook_event_name": "PermissionRequest", "session_id": "s",
+                    "_pixtuoid_source": source,
+                });
+                let obj = v.as_object_mut().expect("an object");
+                obj.extend(extra.as_object().expect("an object").clone());
+                if let Some(n) = name {
+                    obj.insert("tool_name".into(), json!(n));
+                }
+                let logs = capture_logs(|| {
+                    decode_hook_payload(v).expect("decodes");
+                });
+                if name.is_some() {
+                    assert!(!logs.contains(TARGET), "{source}: {logs}");
+                    continue;
+                }
+                let line = format!(
+                    "{SOURCE_FIELD}={source} {KIND_FIELD}=\"{}\" event=PermissionRequest field=tool_name",
+                    <&str>::from(DriftKind::MissingField),
+                );
+                assert!(
+                    logs.contains(TARGET) && logs.contains(&line),
+                    "{line:?} in\n{logs}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn generic_tool_name_is_capped_in_the_display() {
         let long = "T".repeat(MAX_DECODED_FIELD_CHARS * 10);
         match make_tool_detail("test", &long, None) {
@@ -1533,7 +1490,6 @@ mod tests {
                         json!({"type":"assistant","message":{"content":[
                             {"type":"tool_use","id":"t1","name":name,"input":{"file_path":tgt}}]}}),
                     )
-                    .expect("cc decodes")
                 }),
             ),
             (
@@ -1544,7 +1500,6 @@ mod tests {
                         "codex",
                         json!({"type":"response_item","payload":{"type":"function_call","name":name}}),
                     )
-                    .expect("codex decodes")
                 }),
             ),
             (
@@ -1556,7 +1511,6 @@ mod tests {
                         json!({"type":"PLANNER_RESPONSE","step_index":0,"tool_calls":[
                             {"name":name,"args":{"CommandLine":tgt}}]}),
                     )
-                    .expect("antigravity decodes")
                 }),
             ),
             (
@@ -1568,7 +1522,6 @@ mod tests {
                         json!({"type":"tool.execution_start","data":{
                             "toolCallId":"tc1","toolName":name,"arguments":{"command":tgt}}}),
                     )
-                    .expect("copilot decodes")
                 }),
             ),
             (
@@ -1580,7 +1533,6 @@ mod tests {
                         json!({"type":"message","message":{"role":"assistant","content":[
                             {"type":"toolCall","id":"t1","name":name,"arguments":{"command":tgt}}]}}),
                     )
-                    .expect("omp decodes")
                 }),
             ),
             (
@@ -1594,61 +1546,62 @@ mod tests {
             (
                 reasonix::SOURCE_NAME,
                 Box::new(|| {
-                    reasonix::decode_rx_hook_payload(&json!({
-                        "event":"PreToolUse","cwd":"/r","toolName":name,"toolArgs":{"command":tgt}}))
+                    reasonix::decode_rx_hook_payload(test_obj(&json!({
+                        "event":"PreToolUse","sessionId":"s","cwd":"/r","toolName":name,"toolArgs":{"command":tgt}})))
                     .expect("reasonix decodes")
                 }),
             ),
             (
                 dsh::SOURCE_NAME,
                 Box::new(|| {
-                    dsh::decode_dsh_payload(&json!({
-                        "type":"tool_call","sessionId":"s1","callId":"c1","toolName":name}))
+                    dsh::decode_dsh_payload(test_obj(&json!({
+                        "type":"tool_call","sessionId":"s1","callId":"c1","toolName":name})))
                     .expect("dsh decodes")
                 }),
             ),
             (
                 codewhale::SOURCE_NAME,
                 Box::new(|| {
-                    codewhale::decode_cw_hook_payload(&json!({
-                        "event":"tool_call_before","cwd":"/r","tool":name,"tool_args":cw_args}))
+                    codewhale::decode_cw_hook_payload(test_obj(&json!({
+                        "event":"tool_call_before","session_id":"s","cwd":"/r","tool":name,
+                        "tool_args":cw_args})))
                     .expect("codewhale decodes")
                 }),
             ),
             (
                 opencode::SOURCE_NAME,
                 Box::new(|| {
-                    opencode::decode_oc_hook_payload(&json!({
+                    opencode::decode_oc_hook_payload(test_obj(&json!({
                         "type":"session.tool.input.started",
-                        "data":{"sessionID":"ses-1","id":"c1","name":name}}))
+                        "data":{"sessionID":"ses-1","id":"c1","name":name}})))
                     .expect("opencode decodes")
                 }),
             ),
             (
                 cursor::SOURCE_NAME,
                 Box::new(|| {
-                    cursor::decode_cursor_hook_payload(&json!({
+                    cursor::decode_cursor_hook_payload(test_obj(&json!({
                         "hook_event_name":"preToolUse","session_id":"s",
-                        "tool_name":name,"tool_input":{"command":tgt}}))
+                        "tool_name":name,"tool_input":{"command":tgt}})))
                     .expect("cursor decodes")
                 }),
             ),
             (
                 hermes::SOURCE_NAME,
                 Box::new(|| {
-                    hermes::decode_hermes_hook_payload(&json!({
+                    hermes::decode_hermes_hook_payload(test_obj(&json!({
                         "hook_event_name":"pre_tool_call","session_id":"s","cwd":"/r",
-                        "tool_name":name,"tool_input":{"command":tgt}}))
+                        "tool_name":name,"args":{"command":tgt}})))
                     .expect("hermes decodes")
                 }),
             ),
             (
                 grok::SOURCE_NAME,
                 Box::new(|| {
-                    grok::decode_grok_hook_payload(&json!({
+                    grok::decode_grok_hook_payload(test_obj(&json!({
                         "hookEventName":"pre_tool_use","sessionId":"s","cwd":"/r",
                         "workspaceRoot":"/r","toolName":name,"toolUseId":"c1",
-                        "toolInput":{"command":tgt},"toolInputTruncated":false}))
+                        "toolInput":{"command":tgt},"toolInputTruncated":false})))
                     .expect("grok decodes")
                 }),
             ),
@@ -1671,12 +1624,12 @@ mod tests {
             let display = evs
                 .iter()
                 .find_map(|e| match e {
-                    AgentEvent::ActivityStart {
+                    AgentEvent::ToolUseStart {
                         detail: Some(d), ..
                     } => Some(d.display().to_string()),
                     _ => None,
                 })
-                .unwrap_or_else(|| panic!("{src}: decoder emitted no ActivityStart with a detail"));
+                .unwrap_or_else(|| panic!("{src}: decoder emitted no ToolUseStart with a detail"));
             assert!(
                 display.chars().count() <= bound,
                 "{src}: tool display {} chars > cap bound {bound} — a chokepoint bypass leaks raw content",
@@ -1701,19 +1654,19 @@ mod tests {
         }
     }
 
-    /// How a source derives its `Waiting.reason` — the axis this gate keys on.
+    /// How a source derives its [`AgentEvent::UserActionRequest`]`.reason` — the axis this gate keys on.
     enum ReasonKind {
         /// Minted from raw wire content: must route through `ellipsize`.
         Wire,
         /// A fixed `&'static str`: the over-cap wire value must NOT leak in, so
         /// a later switch to a wire field cannot slip past uncapped.
         Fixed,
-        /// No Waiting wire today. The row exists so adding one forces a visit.
-        NoWaiting,
+        /// No [`AgentEvent::UserActionRequest`] reason on the wire today. The row exists so adding one forces a visit.
+        NoReason,
     }
 
     #[test]
-    fn every_agent_decoder_caps_its_waiting_reason() {
+    fn every_agent_decoder_caps_its_user_action_request_reason() {
         use crate::source::{
             antigravity, claude_code, codewhale, codex, copilot, cursor, dsh, grok, hermes, jcode,
             kimi, omp, opencode, reasonix, registry,
@@ -1763,7 +1716,6 @@ mod tests {
                         json!({"type":"PLANNER_RESPONSE","step_index":0,"tool_calls":[
                             {"name":"ask_permission","args":{"CommandLine":raw}}]}),
                     )
-                    .expect("antigravity decodes")
                 }),
             ),
             (
@@ -1776,7 +1728,6 @@ mod tests {
                         json!({"type":"permission.requested","data":{
                             "permissionRequest":{"kind":raw}}}),
                     )
-                    .expect("copilot decodes")
                 }),
             ),
             (
@@ -1789,16 +1740,15 @@ mod tests {
                         json!({"type":"message","message":{"role":"assistant","content":[
                             {"type":"toolCall","id":"t1","name":"ask","arguments":{"i":raw}}]}}),
                     )
-                    .expect("omp decodes")
                 }),
             ),
             (
                 reasonix::SOURCE_NAME,
                 ReasonKind::Wire,
                 Box::new(|| {
-                    reasonix::decode_rx_hook_payload(
-                        &json!({"event":"Notification","cwd":"/r","message":raw}),
-                    )
+                    reasonix::decode_rx_hook_payload(test_obj(
+                        &json!({"event":"Notification","sessionId":"s","cwd":"/r","message":raw}),
+                    ))
                     .expect("reasonix decodes")
                 }),
             ),
@@ -1806,8 +1756,8 @@ mod tests {
                 dsh::SOURCE_NAME,
                 ReasonKind::Wire,
                 Box::new(|| {
-                    dsh::decode_dsh_payload(&json!({
-                        "type":"approval_asked","sessionId":"s1","toolName":"bash","reason":raw}))
+                    dsh::decode_dsh_payload(test_obj(&json!({
+                        "type":"approval_asked","sessionId":"s1","toolName":"bash","reason":raw})))
                     .expect("dsh decodes")
                 }),
             ),
@@ -1815,9 +1765,9 @@ mod tests {
                 opencode::SOURCE_NAME,
                 ReasonKind::Wire,
                 Box::new(|| {
-                    opencode::decode_oc_hook_payload(&json!({
+                    opencode::decode_oc_hook_payload(test_obj(&json!({
                         "type":"permission.asked",
-                        "data":{"sessionID":"ses-1","action":raw}}))
+                        "data":{"sessionID":"ses-1","action":raw}})))
                     .expect("opencode decodes")
                 }),
             ),
@@ -1825,22 +1775,19 @@ mod tests {
                 grok::SOURCE_NAME,
                 ReasonKind::Wire,
                 Box::new(|| {
-                    grok::decode_grok_hook_payload(&json!({
+                    grok::decode_grok_hook_payload(test_obj(&json!({
                         "hookEventName":"notification","sessionId":"s","cwd":"/r",
                         "workspaceRoot":"/r","notificationType":"permission_prompt",
-                        "message":raw}))
+                        "message":raw})))
                     .expect("grok decodes")
                 }),
             ),
             (
-                // CodeWhale's ApprovalRequired shows UI + writes the audit log but
-                // fires NO hook — proven upstream, not a scope cut.
                 codewhale::SOURCE_NAME,
-                ReasonKind::NoWaiting,
+                ReasonKind::NoReason,
                 Box::new(|| {
-                    codewhale::decode_cw_hook_payload(&json!({
-                        "event":"tool_call_before","cwd":"/r","tool":"bash",
-                        "tool_args":"{}","message":raw}))
+                    codewhale::decode_cw_hook_payload(test_obj(&json!({
+                        "event":"waiting_for_user","session_id":"s","cwd":"/r","message":raw})))
                     .expect("codewhale decodes")
                 }),
             ),
@@ -1856,23 +1803,23 @@ mod tests {
             ),
             (
                 cursor::SOURCE_NAME,
-                ReasonKind::NoWaiting,
+                ReasonKind::NoReason,
                 Box::new(|| {
-                    cursor::decode_cursor_hook_payload(&json!({
+                    cursor::decode_cursor_hook_payload(test_obj(&json!({
                         "hook_event_name":"preToolUse","session_id":"s",
-                        "tool_name":"Shell","tool_input":{"command":"ls"},"message":raw}))
+                        "tool_name":"Shell","tool_input":{"command":"ls"},"message":raw})))
                     .expect("cursor decodes")
                 }),
             ),
             (
-                // The recorded gate carries its WHY on `extra.description` ("delete
-                // in root path"), so the reason must route through `ellipsize` too.
+                // The recorded gate carries its WHY on `description` ("recursive
+                // delete"), so the reason must route through `ellipsize` too.
                 hermes::SOURCE_NAME,
                 ReasonKind::Wire,
                 Box::new(|| {
-                    hermes::decode_hermes_hook_payload(&json!({
+                    hermes::decode_hermes_hook_payload(test_obj(&json!({
                         "hook_event_name":"pre_approval_request","session_id":"s","cwd":"/r",
-                        "extra":{"description":raw}}))
+                        "description":raw})))
                     .expect("hermes decodes")
                 }),
             ),
@@ -1893,17 +1840,17 @@ mod tests {
         for (src, kind, decode) in &table {
             let evs = decode();
             let reason = evs.iter().find_map(|e| match e {
-                AgentEvent::Waiting { reason, .. } => Some(reason.clone()),
+                AgentEvent::UserActionRequest { reason, .. } => reason.clone(),
                 _ => None,
             });
             match kind {
                 ReasonKind::Wire => {
                     let reason = reason.unwrap_or_else(|| {
-                        panic!("{src}: expected a Waiting, got {evs:?}");
+                        panic!("{src}: expected a reason, got {evs:?}");
                     });
                     assert!(
                         reason.chars().count() <= bound,
-                        "{src}: Waiting reason {} chars > cap bound {bound} — a \
+                        "{src}: UserActionRequest reason {} chars > cap bound {bound} — a \
                          chokepoint bypass leaks raw content into slot state",
                         reason.chars().count()
                     );
@@ -1914,7 +1861,7 @@ mod tests {
                 }
                 ReasonKind::Fixed => {
                     let reason = reason.unwrap_or_else(|| {
-                        panic!("{src}: expected a Waiting, got {evs:?}");
+                        panic!("{src}: expected a reason, got {evs:?}");
                     });
                     assert!(
                         !reason.contains(marker) && reason.chars().count() <= bound,
@@ -1922,9 +1869,9 @@ mod tests {
                          the wire value through `ellipsize` and move this row to Wire"
                     );
                 }
-                ReasonKind::NoWaiting => assert!(
+                ReasonKind::NoReason => assert!(
                     reason.is_none(),
-                    "{src}: grew a Waiting wire ({reason:?}) — classify it in this table"
+                    "{src}: grew a reason ({reason:?}) — classify it in this table"
                 ),
             }
         }
@@ -1935,7 +1882,7 @@ mod tests {
             if !daemon {
                 assert!(
                     covered.contains(s),
-                    "add {s} to the Waiting-reason cap table"
+                    "add {s} to the UserActionRequest-reason cap table"
                 );
             }
         }
@@ -1973,30 +1920,38 @@ mod tests {
     #[test]
     fn grok_tagged_grok_envelope_decodes_via_the_custom_decoder() {
         let evs = decode_hook_payload(grok_envelope("grok")).expect("decodes");
-        assert_eq!(evs.len(), 2, "Identity + ActivityStart");
+        assert_eq!(evs.len(), 2, "Identity + ToolUseStart");
         assert!(
             evs.iter()
                 .all(|e| e.agent_id() == crate::AgentId::from_parts("grok", "0197fa30-sess"))
         );
     }
 
-    /// cursor's UNSTAMPED invocations, which used to reach CC's arms and bail.
+    /// cursor's envelopes on the claude-code channel, which used to reach CC's
+    /// arms and bail.
     #[test]
-    fn an_unstamped_cursor_invocation_is_dropped_quietly() {
+    fn a_cursor_envelope_on_the_claude_code_channel_is_dropped_quietly() {
         let unstamped = json!({
             "hook_event_name": "preToolUse",
             "session_id": "s1",
-            "cursor_version": "2026.08.11-e8db854",
+            "cursor_version": "2026.10.22-27dcf5f",
             "workspace_roots": ["/w"],
             "tool_name": "Read",
             "tool_use_id": "t1",
         });
-        assert!(
-            decode_hook_payload(unstamped.clone())
-                .expect("must not error")
-                .is_empty(),
-            "an unstamped cursor envelope is a duplicate of the stamped one"
-        );
+        let mut cc_stamped = unstamped.clone();
+        cc_stamped["_pixtuoid_source"] = json!(crate::source::claude_code::SOURCE_NAME);
+        for (copy, envelope) in [
+            ("unstamped", &unstamped),
+            ("claude-code-stamped", &cc_stamped),
+        ] {
+            assert!(
+                decode_hook_payload(envelope.clone())
+                    .expect("must not error")
+                    .is_empty(),
+                "a {copy} cursor envelope is a duplicate of the cursor-stamped one"
+            );
+        }
 
         // The STAMPED copy is the one that must survive — dropping both would
         // erase cursor from the office entirely.

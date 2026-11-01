@@ -29,7 +29,7 @@ use crate::install::verify::{SchemaParse, ShimRef};
 /// StopFailure are deliberately ABSENT: the runner re-fires failures to NATIVE
 /// hooks registered under PostToolUse / Stop with the event re-labeled, and ours
 /// are native-format — registering both spellings would double-fire every failed
-/// tool/turn for the same decoded ActivityEnd.
+/// tool/turn for the same decoded end.
 pub(crate) const REASONIX_EVENTS: &[&str] = &[
     "SessionStart",
     "PreToolUse",
@@ -61,7 +61,7 @@ pub(crate) const HOST: HostRegistration = HostRegistration {
     register,
     unregister,
     is_registered,
-    copy: None,
+    pickup: None,
     legacy: Some(LegacyConfig {
         path: settings_path,
         strip: merge::flat_json_uninstall,
@@ -310,7 +310,7 @@ fn unregister(config: &Path) -> Result<Unregistered> {
             YES.as_ref(),
         ])?;
     }
-    host_plugin::remove_if_ours(root, config)?;
+    host_plugin::remove_if_ours(root, config, host_plugin::names_us)?;
     Ok(if installed {
         Unregistered::Removed
     } else {
@@ -550,6 +550,7 @@ mod tests {
         for ev in REASONIX_EVENTS {
             let payload = serde_json::json!({
                 "event": ev,
+                "sessionId": "s",
                 "cwd": "/repo",
                 "_pixtuoid_source": "reasonix",
             });

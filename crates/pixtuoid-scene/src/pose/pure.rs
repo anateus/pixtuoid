@@ -7,7 +7,7 @@ use std::num::NonZeroU16;
 use std::time::{Duration, SystemTime};
 
 use crate::layout::{
-    Bounds, DwellWindow, Point, SceneLayout, WaypointKind, desk_furniture_def,
+    Bounds, DwellWindow, HomeDesk, Point, SceneLayout, WaypointKind, desk_furniture_def,
     desk_walk_anchor_facing, furniture_def,
 };
 use crate::physics::LegProgress;
@@ -15,11 +15,6 @@ use crate::walk::{WanderKind, WanderTarget};
 use pixtuoid_core::AgentId;
 use pixtuoid_core::sprite::Sprite;
 use pixtuoid_core::state::{ActivityState, AgentSlot};
-
-/// How long after the last event an Idle agent stays in the "thinking" pose
-/// (seated, awake, no z's) before entering the wander/sleep cycle — sized to
-/// cover typical CC thinking pauses between tool bursts.
-pub(crate) const THINKING_WINDOW_SECS: u64 = 20;
 
 /// Base of the stale-resume / off-screen-gap sentinel in
 /// `walk::advance_wander` — above on-screen frame cadence, below a
@@ -45,7 +40,7 @@ pub(crate) fn typing_frame(slot: &AgentSlot, beat: crate::anim::Beat, anim: &Spr
     }
     let frames = anim.frames().len();
     let phase = crate::anim::epoch_ms(slot.state_started_at) / u64::from(anim.frame_ms().max(1));
-    let phase = usize::try_from(phase % frames as u64).unwrap_or(0);
+    let phase = (phase % frames as u64) as usize;
     (crate::pack::looping_frame_index(anim, beat) + phase) % frames
 }
 
@@ -155,9 +150,6 @@ pub fn waypoint_index_for_cycle(agent_id: AgentId, cycle_n: u64, num_waypoints: 
 pub(crate) enum Pose {
     /// Seated at the desk, idle.
     SeatedIdle,
-    /// Seated at desk, awake but not typing — the agent recently finished a
-    /// tool call and the LLM is likely thinking.
-    SeatedThinking,
     /// Seated at the desk, typing; the sim steps its frame on the floor's
     /// beat.
     SeatedTyping,
@@ -225,7 +217,7 @@ pub(crate) fn derive(slot: &AgentSlot, now: SystemTime, layout: &SceneLayout) ->
         if since_exit < ENTRY_ANIMATION_MS {
             return Some(linear_walk_pose(
                 since_exit,
-                desk_walk_anchor_facing(desk, layout.desk_facing_at(desk)),
+                desk_walk_anchor_facing(desk.at, desk.facing),
                 target,
             ));
         }
@@ -244,7 +236,7 @@ pub(crate) fn derive(slot: &AgentSlot, now: SystemTime, layout: &SceneLayout) ->
         return Some(linear_walk_pose(
             since_spawn,
             from,
-            desk_walk_anchor_facing(desk, layout.desk_facing_at(desk)),
+            desk_walk_anchor_facing(desk.at, desk.facing),
         ));
     }
 
@@ -267,10 +259,10 @@ fn linear_walk_pose(since_ms: u64, from: Point, to: Point) -> Pose {
 
 /// The state→pose tail shared by `derive` and `derive_state_only`, applied
 /// AFTER each caller's own override guards — one place, so the two entry points
-/// can't drift on the thinking window.
+/// can't drift.
 fn state_driven_pose(
     slot: &AgentSlot,
-    desk: Point,
+    desk: HomeDesk,
     layout: &SceneLayout,
     now: SystemTime,
 ) -> Option<Pose> {
@@ -280,15 +272,9 @@ fn state_driven_pose(
         .as_millis() as u64;
 
     match &slot.state {
-        ActivityState::Active { .. } => Some(Pose::SeatedTyping),
-        ActivityState::Waiting { .. } => Some(Pose::SeatedIdle),
-        ActivityState::Idle => {
-            if in_thinking_window(slot, now) {
-                Some(Pose::SeatedThinking)
-            } else {
-                Some(idle_pose(slot, desk, layout, elapsed))
-            }
-        }
+        ActivityState::Running { .. } => Some(Pose::SeatedTyping),
+        ActivityState::RequiresAction { .. } => Some(Pose::SeatedIdle),
+        ActivityState::Idle => Some(idle_pose(slot, desk, layout, elapsed)),
     }
 }
 
@@ -320,26 +306,27 @@ pub(crate) fn aimless_wander_seed(agent_id: AgentId, cycle_n: u64) -> u64 {
 /// room is a rare drift-in. Falls back to the nearest walkable corridor-midline
 /// cell, then to `home_desk`'s walk anchor — never a cell inside furniture.
 ///
-/// `home_desk` is the same Point on both callers, so the result stays
+/// `home_desk` is the same desk on both callers, so the result stays
 /// deterministic in `(layout, seed)` across them.
-pub(crate) fn pick_aimless_dest(layout: &SceneLayout, seed: u64, home_desk: Point) -> Point {
+pub(crate) fn pick_aimless_dest(layout: &SceneLayout, seed: u64, home_desk: HomeDesk) -> Point {
     let window_strip = Bounds {
         x: layout.cubicle_band.x,
         y: layout.top_margin + 1,
         width: layout.cubicle_band.width,
         height: 10,
     };
-    let corridor_zone = layout.corridor.unwrap_or(layout.cubicle_aisle);
     let zones: [(Bounds, u16); 5] = [
         (window_strip, 30),
         (layout.pantry.map_or(window_strip, |p| p.bounds), 25),
-        (corridor_zone, 20),
+        (layout.corridor, 20),
         (layout.cubicle_band, 15),
         (layout.meeting_room_bounds(0).unwrap_or(window_strip), 10),
     ];
     let total: u16 = zones.iter().map(|(_, w)| *w).sum();
-    let mut roll = ((seed >> 32) as u16) % total.max(1);
-    let zone = zones
+    let mut roll = ((seed >> 32) as u16) % total;
+    // What `roll` has left after every zone but the last lands in the last.
+    let [rest @ .., last] = &zones;
+    let zone = rest
         .iter()
         .find_map(|(b, w)| {
             if roll < *w {
@@ -349,7 +336,7 @@ pub(crate) fn pick_aimless_dest(layout: &SceneLayout, seed: u64, home_desk: Poin
                 None
             }
         })
-        .unwrap_or(&zones[0].0);
+        .unwrap_or(&last.0);
     // ROUTABLE, not merely walkable — the same `reaches` filter every NAMED
     // destination gets via `approach_point`.
     let routable =
@@ -369,7 +356,7 @@ pub(crate) fn pick_aimless_dest(layout: &SceneLayout, seed: u64, home_desk: Poin
     // midline is NOT guaranteed open (the vending / printer footprints sit in
     // the cubicle_aisle band), so scan outward from it for the nearest walkable
     // cell — the contract is "returns a walkable pixel".
-    let c = corridor_zone;
+    let c = layout.corridor;
     let x_jitter = (seed as u16) % c.width.max(1);
     let base_x = c.x + x_jitter;
     let mid_y = c.y + c.height / 2;
@@ -387,34 +374,7 @@ pub(crate) fn pick_aimless_dest(layout: &SceneLayout, seed: u64, home_desk: Poin
     // Whole midline blocked (degenerate layout): the agent's own desk anchor is
     // a destination every consumer already handles — return it rather than hand
     // out a cell inside furniture.
-    desk_walk_anchor_facing(home_desk, layout.desk_facing_at(home_desk))
-}
-
-/// Whether an Idle agent holds `Pose::SeatedThinking`: it recently finished
-/// active work (`last_event_at > created_at` — excludes freshly spawned agents)
-/// and is still within `THINKING_WINDOW_SECS` of that last event. The ONE owner
-/// of the gate — the stateless overlay and the routed render both call it, so a
-/// bool the compiler can't catch can't drift between them.
-pub(crate) fn in_thinking_window(slot: &AgentSlot, now: SystemTime) -> bool {
-    let was_active = slot.last_event_at > slot.created_at;
-    let since_last_event = now
-        .duration_since(slot.last_event_at)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
-    was_active && since_last_event < THINKING_WINDOW_SECS
-}
-
-/// Milliseconds of the current Idle period during which the SeatedThinking gate
-/// held the agent at its desk. 0 when the agent was never active or when the
-/// window expired before this Idle period began.
-fn thinking_hold_ms(slot: &AgentSlot) -> u64 {
-    if slot.last_event_at <= slot.created_at {
-        return 0;
-    }
-    slot.last_event_at
-        .checked_add(Duration::from_secs(THINKING_WINDOW_SECS))
-        .and_then(|release| release.duration_since(slot.state_started_at).ok())
-        .map_or(0, |d| d.as_millis() as u64)
+    desk_walk_anchor_facing(home_desk.at, home_desk.facing)
 }
 
 /// The EXCLUSIVE-spot waypoints already spoken for. An exclusive spot holds
@@ -462,7 +422,7 @@ pub(crate) fn resolve_wander_target(
     id: AgentId,
     cycle_n: u64,
     layout: &SceneLayout,
-    origin: Point,
+    origin: HomeDesk,
     claimed: &SpotClaims,
 ) -> WanderTarget {
     let amble = || WanderTarget {
@@ -488,7 +448,7 @@ pub(crate) fn resolve_wander_target(
     let wp = layout.waypoints[wp_idx];
     // The A*-reachable approach point on an allowed side, NOT the raw blocked
     // `wp.pos` (which made A* detour and the sprite pop).
-    let dest = layout.approach_point(wp.kind.furniture(), wp.pos, origin, wp.facing);
+    let dest = layout.approach_point(wp.kind.furniture(), wp.pos, origin.at, wp.facing);
     if dest == wp.pos {
         return amble();
     }
@@ -505,7 +465,7 @@ pub(crate) fn resolve_wander_target(
     }
 }
 
-fn idle_pose(slot: &AgentSlot, desk: Point, layout: &SceneLayout, elapsed_ms: u64) -> Pose {
+fn idle_pose(slot: &AgentSlot, desk: HomeDesk, layout: &SceneLayout, elapsed_ms: u64) -> Pose {
     let cycle_ms = est_wander_cycle_ms(slot.agent_id);
     let cycle_n = elapsed_ms / cycle_ms;
     let phase_t = elapsed_ms % cycle_ms;
@@ -517,17 +477,6 @@ fn idle_pose(slot: &AgentSlot, desk: Point, layout: &SceneLayout, elapsed_ms: u6
     let seated_end = seated_dwell_ms(slot.agent_id);
     let walk_out_end = seated_end + WANDER_WALK_EST_MS;
     let at_wp_end = walk_out_end + WANDER_DWELL_EST_MS;
-
-    // Thinking-gate continuity: if the SeatedThinking release lands PAST this
-    // cycle's seated phase, the first pose emitted after it is mid-Walking — a
-    // desk→corridor pop in every stateless consumer. Sit out the RELEASE cycle
-    // instead. Deliberately phase-only: shifting `cycle_n` would desync
-    // destination selection from `walk::advance_wander`'s bootstrap, which
-    // must stay in lockstep with this function.
-    let hold = thinking_hold_ms(slot);
-    if cycle_n == hold / cycle_ms && hold % cycle_ms > seated_end {
-        return Pose::SeatedIdle;
-    }
 
     // Seat claims are EMPTY here: this half has no occupancy knowledge (see
     // `resolve_wander_target`), and its job is a cache-stable overlay estimate,
@@ -543,7 +492,7 @@ fn idle_pose(slot: &AgentSlot, desk: Point, layout: &SceneLayout, elapsed_ms: u6
         let span = walk_out_end - seated_end;
         let t = LegProgress::of(phase_t - seated_end, span);
         LegPose {
-            from: desk,
+            from: desk.at,
             to: dest,
             progress: t,
             carrying_coffee: false,
@@ -556,7 +505,7 @@ fn idle_pose(slot: &AgentSlot, desk: Point, layout: &SceneLayout, elapsed_ms: u6
         let t = LegProgress::of(phase_t - at_wp_end, span);
         LegPose {
             from: dest,
-            to: desk,
+            to: desk.at,
             progress: t,
             carrying_coffee: target.kind.carries_coffee(),
         }

@@ -12,10 +12,8 @@
 //! the JSONL arm runs a transcript line decoder, the hook arm a hook decoder
 //! plus the `recent_hook_tool_uses` dedup bookkeeping.
 //!
-//! Lines are synthesized rather than read from `tests/sources/fixtures/`, which
-//! is the conformance harness's scanned population — one transcript per scenario
-//! dir, every dir a registered source — so a bench-shaped fixture there would be
-//! mis-scanned and panic.
+//! Lines are synthesized: every dir under a `tests/sources/<module>/fixtures/` is a
+//! capture `harness::captures` walks, so a bench-shaped one there fails its gates.
 
 use criterion::{Criterion, criterion_main};
 use pixtuoid_core::harness::Drive;
@@ -65,7 +63,7 @@ fn decode_reduce(c: &mut Criterion) {
         .seeded();
     let hook = Drive::hooks();
 
-    // Exact counts, not a floor: a decoder arm that DECLINES (`Ok(vec![])`, the
+    // Exact counts, not a floor: a decoder arm that DECLINES (an empty result, the
     // shape of the documented quiet-drop paths) halves this while leaving
     // `assert_clean` green, and a floor would not notice.
     for (what, driven, want) in [

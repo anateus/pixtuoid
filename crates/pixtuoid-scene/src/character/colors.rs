@@ -354,24 +354,20 @@ pub(crate) fn agent_overrides(
     ]
 }
 
-/// The monitor glow color for an agent's active tool, or `None` when the agent
-/// is not Active.
-pub(crate) fn tool_glow_tint(
+/// The monitor glow color for an agent's work, or `None` when the agent is not
+/// Running.
+pub(crate) fn work_glow_tint(
     agent: &AgentSlot,
     glow: &crate::theme::ToolGlowColors,
 ) -> Option<Rgb> {
-    use pixtuoid_core::state::ActivityState;
-    match &agent.state {
-        ActivityState::Active { kind, .. } => Some(glow.for_kind(*kind)),
-        _ => None,
-    }
+    crate::lighting::screen_work(agent).map(|work| glow.for_work(work))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::character::test_support::{color_of, make_slot, make_slot_cwd, override_of};
-    use pixtuoid_core::state::{ActivityState, ToolKind};
+    use pixtuoid_core::state::{ActivityState, ToolKind, ToolUse};
     use std::sync::Arc;
 
     #[test]
@@ -425,47 +421,19 @@ mod tests {
     }
 
     #[test]
-    fn tool_glow_tint_maps_known_tools() {
-        let id = pixtuoid_core::AgentId::from_transcript_path("/t.jsonl");
-        let edit_slot = make_slot(
-            id,
-            ActivityState::Active {
-                tool_use_id: None,
-                detail: Some(Arc::from("Edit src/main.rs")),
-                kind: ToolKind::Edit,
-            },
-        );
-        let bash_slot = make_slot(
-            id,
-            ActivityState::Active {
-                tool_use_id: None,
-                detail: Some(Arc::from("Bash: ls")),
-                kind: ToolKind::Bash,
-            },
-        );
-        let idle_slot = make_slot(id, ActivityState::Idle);
-        let glow = &crate::theme::NORMAL.tool_glow;
-        let edit_tint = tool_glow_tint(&edit_slot, glow);
-        let bash_tint = tool_glow_tint(&bash_slot, glow);
-        let idle_tint = tool_glow_tint(&idle_slot, glow);
-        assert!(edit_tint.is_some(), "Edit should produce glow");
-        assert!(bash_tint.is_some(), "Bash should produce glow");
-        assert_eq!(idle_tint, None, "Idle should produce no glow");
-        assert_ne!(edit_tint, bash_tint, "Edit and Bash should differ");
-    }
-
-    #[test]
     fn kind_derivation_reproduces_the_string_parse_tint_for_representative_displays() {
         use pixtuoid_core::ToolDetail;
         let id = pixtuoid_core::AgentId::from_transcript_path("/g.jsonl");
         let glow = &crate::theme::NORMAL.tool_glow;
-        let active = |detail: Option<&ToolDetail>| {
+        let running = |detail: Option<&ToolDetail>| {
             make_slot(
                 id,
-                ActivityState::Active {
-                    tool_use_id: None,
-                    detail: detail.map(|d| Arc::from(d.display())),
-                    kind: detail.map_or(ToolKind::Other, ToolKind::from_detail),
+                ActivityState::Running {
+                    item: Some(ToolUse {
+                        tool_use_id: None,
+                        detail: detail.map(|d| Arc::from(d.display())),
+                        kind: detail.map_or(ToolKind::Other, ToolKind::from_detail),
+                    }),
                 },
             )
         };
@@ -486,7 +454,7 @@ mod tests {
         ];
         for (detail, expected) in table {
             assert_eq!(
-                tool_glow_tint(&active(detail.as_ref()), glow),
+                work_glow_tint(&running(detail.as_ref()), glow),
                 Some(*expected),
                 "display {:?} must keep its pre-ToolKind tint",
                 detail.as_ref().map(ToolDetail::display),
@@ -496,26 +464,40 @@ mod tests {
         // impossible from production decoders, which type every dispatch as
         // ToolDetail::Task upstream.
         assert_eq!(
-            tool_glow_tint(&active(Some(&generic("Delegating imposter"))), glow),
+            work_glow_tint(&running(Some(&generic("Delegating imposter"))), glow),
             Some(glow.default)
         );
     }
 
     #[test]
-    fn tool_glow_tint_is_none_unless_active() {
+    fn work_glow_tint_is_none_unless_running() {
         let glow = &crate::theme::NORMAL.tool_glow;
         let id = pixtuoid_core::AgentId::from_transcript_path("/g.jsonl");
         let edit = make_slot(
             id,
-            ActivityState::Active {
-                tool_use_id: None,
-                detail: None,
-                kind: ToolKind::Edit,
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: None,
+                    detail: None,
+                    kind: ToolKind::Edit,
+                }),
             },
         );
-        assert_eq!(tool_glow_tint(&edit, glow), Some(glow.edit));
+        assert_eq!(work_glow_tint(&edit, glow), Some(glow.edit));
         assert_eq!(
-            tool_glow_tint(&make_slot(id, ActivityState::Idle), glow),
+            work_glow_tint(&make_slot(id, ActivityState::Running { item: None }), glow),
+            Some(glow.default),
+            "an open turn between items glows untinted"
+        );
+        assert_eq!(
+            work_glow_tint(&make_slot(id, ActivityState::Idle), glow),
+            None
+        );
+        assert_eq!(
+            work_glow_tint(
+                &make_slot(id, ActivityState::RequiresAction { reason: None }),
+                glow
+            ),
             None
         );
     }

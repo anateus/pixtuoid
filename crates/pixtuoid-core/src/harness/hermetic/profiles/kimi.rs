@@ -10,7 +10,7 @@ const TUI: tui::Tui = tui::Tui {
     args: &[],
     composer: tui::Composer {
         marker: " │ >",
-        above: tui::Above::Rule {
+        border: tui::Border::Rule {
             glyph: '─',
             corners: Some(('╭', '╮')),
         },
@@ -19,16 +19,18 @@ const TUI: tui::Tui = tui::Tui {
         shows: "Run this command?",
         // Esc rejects the call outright
         // (`apps/kimi-code/src/tui/components/dialogs/approval-panel.ts:262-268`).
-        deny: &[tui::Key::Esc],
+        keys: &[tui::Key::Esc],
         dwell: std::time::Duration::ZERO,
     }],
+    cancel: &[],
     quit: &[tui::Key::Text("/exit"), tui::Key::Enter],
-    renders_under_conpty: true,
+    conpty: tui::ConPty::Renders,
 };
 
 pub(crate) const PROFILE: Profile = Profile {
-    source: "kimi",
+    source: crate::source::kimi::SOURCE_NAME,
     package: Package::Npm("@moonshot-ai/kimi-code"),
+    plugin_types: &[],
     invocation: &["kimi", "-p", Placeholder::Prompt.as_str()],
     second_turn: None,
     // `KIMI_MODEL_NAME` builds a provider from the environment
@@ -64,16 +66,12 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::ToolRun,
             surface: Surface::Headless,
             expects: &["SessionStart", "PreToolUse", "PostToolUse", "Stop"],
-            fixture: "fixtures/kimi/tool-run-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
             name: "permission",
             shape: Shape::Permission,
-            surface: Surface::Tui {
-                row: &TUI,
-                answer: tui::Answer::Deny,
-            },
+            surface: Surface::Tui { row: &TUI },
             expects: &[
                 "SessionStart",
                 "PreToolUse",
@@ -82,7 +80,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "Stop",
                 "SessionEnd",
             ],
-            fixture: "fixtures/kimi/permission-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -90,7 +87,6 @@ pub(crate) const PROFILE: Profile = Profile {
             shape: Shape::ModelError,
             surface: Surface::Headless,
             expects: &["SessionStart", "StopFailure"],
-            fixture: "fixtures/kimi/model-error-hermetic",
             turn: Turn::PROFILE,
         },
     ],
@@ -103,4 +99,6 @@ pub(crate) const PROFILE: Profile = Profile {
     result_unseen: false,
     live: None,
     daemon: None,
+    server_stop: None,
+    turn_exits: &[],
 };

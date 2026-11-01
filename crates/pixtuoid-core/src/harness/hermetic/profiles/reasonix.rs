@@ -1,13 +1,10 @@
 //! reasonix's cites are `esengine/DeepSeek-Reasonix` at `v2.44.0`.
 
-use crate::harness::plan::Placeholder;
-use std::borrow::Cow;
-
-use serde_json::Value;
-
+use super::event_field;
 use crate::harness::hermetic::{
     ConfigFile, Package, PerOs, Profile, Scenario, Shape, Surface, Turn, tui,
 };
+use crate::harness::plan::Placeholder;
 
 /// reasonix's TUI. A named mode skips the folder-trust question, whose yes
 /// would run commands unasked
@@ -16,7 +13,7 @@ const TUI: tui::Tui = tui::Tui {
     args: &["--permission-mode", "ask"],
     composer: tui::Composer {
         marker: " ❯",
-        above: tui::Above::Rule {
+        border: tui::Border::Rule {
             glyph: '─',
             corners: None,
         },
@@ -24,21 +21,19 @@ const TUI: tui::Tui = tui::Tui {
     gates: &[tui::Gate {
         shows: "Permission required",
         // "n/Esc deny" (`internal/base/i18n/messages_en.go:164`).
-        deny: &[tui::Key::Esc],
+        keys: &[tui::Key::Esc],
         dwell: std::time::Duration::ZERO,
     }],
+    cancel: &[],
     // `/exit` is its alias (`internal/frontend/cli/slash_registry.go:69`).
     quit: &[tui::Key::Text("/quit"), tui::Key::Enter],
-    renders_under_conpty: true,
+    conpty: tui::ConPty::Renders,
 };
 
-fn event_field(v: &Value) -> Option<Cow<'_, str>> {
-    v.get("event")?.as_str().map(Cow::Borrowed)
-}
-
 pub(crate) const PROFILE: Profile = Profile {
-    source: "reasonix",
+    source: crate::source::reasonix::SOURCE_NAME,
     package: Package::Npm("reasonix"),
+    plugin_types: &[],
     // A non-read-only tool is denied headless; this allows the ones the
     // spawns need (`docs/CLI.md:502-503`, `:517-519`).
     invocation: &[
@@ -108,7 +103,6 @@ model = "guardian-model"
                 "Stop",
                 "SessionEnd",
             ],
-            fixture: "fixtures/reasonix/tool-run-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -125,7 +119,6 @@ model = "guardian-model"
                 "Stop",
                 "SessionEnd",
             ],
-            fixture: "reasonix/fixtures/subagent-hermetic",
             turn: Turn::PROFILE,
         },
         // A skill tool's child fires no SubagentStart or SubagentStop.
@@ -141,7 +134,6 @@ model = "guardian-model"
                 "Stop",
                 "SessionEnd",
             ],
-            fixture: "reasonix/fixtures/explore-hermetic",
             turn: Turn::PROFILE,
         },
         // The marker routes the turn through the planner
@@ -158,11 +150,9 @@ model = "guardian-model"
                 "Stop",
                 "SessionEnd",
             ],
-            fixture: "fixtures/reasonix/planner-hermetic",
             turn: Turn {
-                args: &[],
                 prompt: Some("[Reasonix: plan-first] Read NOTE.txt."),
-                second: None,
+                ..Turn::PROFILE
             },
         },
         Scenario {
@@ -177,16 +167,12 @@ model = "guardian-model"
                 "Stop",
                 "SessionEnd",
             ],
-            fixture: "fixtures/reasonix/bash-run-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
             name: "permission",
             shape: Shape::Permission,
-            surface: Surface::Tui {
-                row: &TUI,
-                answer: tui::Answer::Deny,
-            },
+            surface: Surface::Tui { row: &TUI },
             expects: &[
                 "SessionStart",
                 "UserPromptSubmit",
@@ -198,7 +184,6 @@ model = "guardian-model"
                 "Stop",
                 "SessionEnd",
             ],
-            fixture: "fixtures/reasonix/permission-hermetic",
             turn: Turn::PROFILE,
         },
     ],
@@ -211,4 +196,6 @@ model = "guardian-model"
     result_unseen: false,
     live: None,
     daemon: None,
+    server_stop: None,
+    turn_exits: &[],
 };

@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::AgentId;
-use crate::source::Transport;
+use crate::source::{DEFAULT_POLL_INTERVAL, Transport};
+use crate::state::requests::ActionRequests;
+use crate::state::turns::TurnLedger;
 
 /// Window in which a Hook event suppresses a later Jsonl event with the same
 /// tool_use_id. The suppression is asymmetric by event kind — see
@@ -22,27 +24,30 @@ pub const HOOK_WINS_WINDOW: Duration = Duration::from_millis(500);
 /// How long the trailing events of a life a hook ended, or of a child's
 /// [`ChildEnd::Reported`] end, are refused (#242, either transport), and how long a top-level life a hook
 /// ended revives only on a hook start. Hook connections are per-connection
-/// spawned tasks, so a session's SessionEnd and a trailing Stop/ActivityEnd can
+/// spawned tasks, so a session's SessionEnd and a trailing TurnEnd/ToolUseEnd can
 /// be DELIVERED reordered, and the straggler would otherwise synthesize a blank
 /// Idle ghost with NO SessionEnd left to remove it. 5s covers same-machine
 /// scheduling jitter while never visibly delaying a genuine revival.
 #[doc(hidden)]
 pub const STRAGGLER_TTL: Duration = Duration::from_secs(5);
 
+/// The slack a window sized past the watcher's polls adds to them.
+const HALF_A_POLL: Duration = Duration::from_secs(DEFAULT_POLL_INTERVAL.as_secs() / 2);
+
 /// How long a child's end keeps refusing a transcript re-registration of that
-/// child (#244). Sized past the watcher's poll backstop (`DEFAULT_POLL_INTERVAL`),
-/// the worst case for a late transcript first-sight, the dead child's echo; a
-/// hook past the straggler window is a new life, which
+/// child (#244). Sized past the watcher's poll backstop, the worst case for a
+/// late transcript first-sight, the dead child's echo; a hook past the
+/// straggler window is a new life, which
 /// [`authorizes`](crate::state::reducer::Reducer::authorizes) readmits under a
 /// live parent.
 #[doc(hidden)]
-pub const CHILD_END_GATE_TTL: Duration = Duration::from_secs(90);
+pub const CHILD_END_GATE_TTL: Duration = DEFAULT_POLL_INTERVAL.saturating_add(HALF_A_POLL);
 
 /// How long a child's [`Lifecycle`] is RETAINED after it ended — the
 /// `parent_id` memory the #246 parentless-revival re-link reads.
 ///
 /// Deliberately LONGER than [`CHILD_END_GATE_TTL`]: the GATE is bounded by
-/// the watcher's poll backstop (`DEFAULT_POLL_INTERVAL`), while the MEMORY must span a TURN gap,
+/// the watcher's poll backstop, while the MEMORY must span a TURN gap,
 /// which is unbounded. Sharing one clock meant a child idle past
 /// [`CHILD_END_GATE_TTL`] came back an ORPHAN, the exact phantom #246 exists
 /// to eliminate. The gate is
@@ -54,20 +59,22 @@ pub const CHILD_END_RELINK_TTL: Duration = Duration::from_secs(300);
 /// How long a drained Task `tool_use_id` is remembered so a lagged JSONL
 /// replay of its Start cannot re-fire `enter_delegating`. After the drain the
 /// transcript's batched Start+End pair replays into an EMPTY set, so the
-/// first-insert gate reads it as a fresh dispatch and would clobber a Waiting
-/// the parent raised in the gap. Sized past the `scan_root` poll backstop
-/// (`DEFAULT_POLL_INTERVAL`);
-/// a `tool_use_id` is never legitimately re-dispatched, so generosity costs
-/// only the tombstone's map entry.
-pub(crate) const DRAINED_TASK_TOMBSTONE_TTL: Duration = Duration::from_secs(90);
+/// first-insert gate reads it as a fresh dispatch and would clobber a RequiresAction
+/// the parent raised in the gap. Sized past the `scan_root` poll backstop; a
+/// `tool_use_id` is never legitimately re-dispatched, so generosity costs only
+/// the tombstone's map entry.
+pub(crate) const DRAINED_TASK_TOMBSTONE_TTL: Duration =
+    DEFAULT_POLL_INTERVAL.saturating_add(HALF_A_POLL);
 
 /// How long an [`AgentEvent::ProofOfLife`](crate::AgentEvent::ProofOfLife) vouch exempts its slot from the
 /// staleness sweeps (#220). The probe is ground truth that the OWNING PROCESS
 /// is alive, while every `stale_threshold` window only models event silence — so a
-/// vouched slot must not be swept on silence alone. Sized 2.5× the watcher's
-/// poll cadence (`DEFAULT_POLL_INTERVAL`): two missed polls plus slack.
+/// vouched slot must not be swept on silence alone: two missed polls plus
+/// slack.
 #[doc(hidden)]
-pub const PROOF_OF_LIFE_TTL: Duration = Duration::from_secs(150);
+pub const PROOF_OF_LIFE_TTL: Duration = DEFAULT_POLL_INTERVAL
+    .saturating_mul(2)
+    .saturating_add(HALF_A_POLL);
 
 /// The ends and parent link that decide what may create or revive an id.
 #[derive(Debug, Default, Clone, Copy)]
@@ -108,10 +115,10 @@ impl ChildEnd {
 
 /// Kind half of a hook-wins dedup record, driving the asymmetric drop matrix
 /// (#150): an End record suppresses BOTH JSONL kinds — the tool is over, so a
-/// lagged JSONL Start replay would falsely re-Activate and cancel the armed
-/// idle debounce — while a Start record suppresses only Starts. A JSONL End
+/// lagged JSONL Start replay would falsely re-Activate a settled slot — while
+/// a Start record suppresses only Starts. A JSONL End
 /// must never be eaten by its own tool's dispatch record: when the best-effort
-/// PostToolUse hook drops, an eaten Task self-End leaks `active_tasks` for the
+/// PostToolUse hook drops, an eaten Task self-End leaks `tasks_in_flight` for the
 /// rest of the session. Don't "simplify" this to exact-kind matching — it
 /// would orphan the lagged-pair case (pinned by
 /// `late_batched_jsonl_pair_after_delivered_hook_end_is_fully_dropped`).
@@ -137,34 +144,28 @@ pub(super) struct Correlation {
     /// Per-agent set of Task tool_use_ids currently in flight: the parent
     /// stays Delegating while one is, an unnamed child's hook activity is
     /// dropped, and the set's drain may arm b1.
-    pub(super) active_tasks: HashMap<AgentId, HashSet<String>>,
+    pub(super) tasks_in_flight: HashMap<AgentId, HashSet<String>>,
     /// Tombstones for Task tool_use_ids whose drain already completed: a
     /// lagged JSONL pair-replay after the drain re-inserts the tuid as a
     /// FRESH first insert (set empty, dedup record GC'd), so the tracker's
     /// first-insert gate alone can't stop `enter_delegating` from clobbering
-    /// a Waiting raised since.
+    /// a [`AgentEvent::UserActionRequest`](crate::AgentEvent::UserActionRequest) raised since.
     pub(super) recent_task_drains: HashMap<(AgentId, String), SystemTime>,
     /// Sweep-exemption timestamps from [`AgentEvent::ProofOfLife`](crate::AgentEvent::ProofOfLife) (#220):
     /// a slot vouched for within [`PROOF_OF_LIFE_TTL`] is skipped by
     /// `sweep_stale`'s candidate collection.
     pub(super) recent_proof_of_life: HashMap<AgentId, SystemTime>,
-    /// The tool calls an agent's `Waiting` is gated on. Singly populated by
-    /// inference — the `tool_use_id` that was Active immediately before the
-    /// Waiting (a CC permission `Notification` fires mid-tool) — or pushed
-    /// explicitly by a `Waiting` that NAMES its gated call (omp
-    /// `tool_approval_requested`, which can queue several, #951). When a
-    /// member's `ActivityEnd` arrives the permission has been resolved, so
-    /// the Waiting resolves instead of lingering until the agent's next tool;
-    /// a *parallel* tool ending carries a non-member id and cannot
-    /// false-clear a still-pending permission. Codex never populates this —
-    /// its tool events carry no `tool_use_id`.
-    pub(super) gated_before_waiting: HashMap<AgentId, Vec<Arc<str>>>,
+    pub(super) action_requests: ActionRequests,
+    pub(super) turns: TurnLedger,
+    /// The transport whose start set the call each slot shows: a transcript's
+    /// turn end naming no turn can lag its hooks' next call (grok).
+    pub(super) item_started_on: HashMap<AgentId, Transport>,
     /// Tool calls already counted into `tool_call_count`, so the SAME logical
     /// call re-observed on the other transport counts once (#951). Not
     /// [`HOOK_WINS_WINDOW`]'s job: omp's transcript writes the call BEFORE the
     /// approval request goes out, so the two Starts are separated by HUMAN
     /// approval latency and no dedup window can span them. The backstop TTL is
-    /// [`STALE_WAITING_TIMEOUT`](crate::state::reducer::STALE_WAITING_TIMEOUT) because that bounds how long they can straddle; past
+    /// [`STALE_BLOCKED_TIMEOUT`](crate::state::reducer::STALE_BLOCKED_TIMEOUT) because that bounds how long they can straddle; past
     /// it the cost is one HUD re-count. Nested (not `(AgentId, String)`-keyed)
     /// so the per-Start membership probe borrows `&str` without allocating and
     /// a life's eviction is one `remove`; swept in [`Self::gc_slow`], never the
@@ -186,7 +187,7 @@ const COUNTED_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// `Err` when `ts` is in the future, which folds to NOT-fresh. The ONE
 /// spelling of the `elapsed < ttl` policy every correlation map and predicate
 /// routes through, so the strict-`<` boundary can't drift across the sites.
-fn is_fresh(now: SystemTime, ts: SystemTime, ttl: Duration) -> bool {
+pub(super) fn is_fresh(now: SystemTime, ts: SystemTime, ttl: Duration) -> bool {
     now.duration_since(ts).is_ok_and(|d| d < ttl)
 }
 
@@ -206,15 +207,13 @@ pub(super) fn elapsed_past(now: SystemTime, ts: SystemTime, ttl: Duration) -> bo
 }
 
 impl Correlation {
-    /// An arbitrary in-flight Task tuid for `id`, as the `Arc<str>` the FSM
-    /// takes. The CHOICE among several is deliberately unspecified —
-    /// `fsm::enter_delegating` only needs proof that *some* delegation is live,
-    /// and `active_tasks` is a `HashSet` with no ordering to promise.
-    pub(super) fn any_active_task(&self, id: &AgentId) -> Option<Arc<str>> {
-        self.active_tasks
-            .get(id)
-            .and_then(|s| s.iter().next())
-            .map(|t| Arc::<str>::from(t.as_str()))
+    /// An arbitrary Task of `id`'s in flight. The CHOICE among several is
+    /// deliberately unspecified — a Delegating slot only needs proof that
+    /// *some* delegation is live, and the set is a `HashSet` with no ordering
+    /// to promise.
+    pub(super) fn any_task_in_flight(&self, id: &AgentId) -> Option<Arc<str>> {
+        let tasks = self.tasks_in_flight.get(id)?;
+        tasks.iter().next().map(|t| Arc::<str>::from(t.as_str()))
     }
 
     /// Whether a child end of `id` landed after `since`, however old.
@@ -322,6 +321,7 @@ impl Correlation {
             .retain(|_, ts| is_fresh(now, *ts, PROOF_OF_LIFE_TTL));
         self.recent_task_drains
             .retain(|_, ts| is_fresh(now, *ts, DRAINED_TASK_TOMBSTONE_TTL));
+        self.turns.gc(now);
         self.lifecycles.retain(|_, l| {
             let child = match l.child_end {
                 None => l.parent_id.is_some(),
@@ -334,7 +334,7 @@ impl Correlation {
     }
 
     /// The sweeps too costly for the per-event [`Self::gc`]: `counted_calls`
-    /// keeps entries for up to [`STALE_WAITING_TIMEOUT`](crate::state::reducer::STALE_WAITING_TIMEOUT), so its retain scans real
+    /// keeps entries for up to [`STALE_BLOCKED_TIMEOUT`](crate::state::reducer::STALE_BLOCKED_TIMEOUT), so its retain scans real
     /// state. Self-amortized to [`COUNTED_SWEEP_INTERVAL`] — callers may run
     /// this as often as they like.
     pub(super) fn gc_slow(&mut self, now: SystemTime) {
@@ -346,24 +346,9 @@ impl Correlation {
         }
         self.counted_swept_at = Some(now);
         self.counted_calls.retain(|_, calls| {
-            calls.retain(|_, ts| is_fresh(now, *ts, super::reducer::STALE_WAITING_TIMEOUT));
+            calls.retain(|_, ts| is_fresh(now, *ts, super::reducer::STALE_BLOCKED_TIMEOUT));
             !calls.is_empty()
         });
-    }
-
-    /// Whether `tuid` is a live gate member for `id` — THE membership
-    /// predicate, so the member-vs-whole-set decisions can't drift per site.
-    pub(super) fn gate_matches(&self, id: &AgentId, tuid: &str) -> bool {
-        self.gated_before_waiting
-            .get(id)
-            .is_some_and(|g| g.iter().any(|m| &**m == tuid))
-    }
-
-    /// Remove ONE gate member; a parallel approval keeps its own.
-    pub(super) fn remove_gate_member(&mut self, id: &AgentId, tuid: &str) {
-        if let Some(g) = self.gated_before_waiting.get_mut(id) {
-            g.retain(|m| &**m != tuid);
-        }
     }
 
     /// Whether `id` holds a FRESH probe vouch. The single freshness predicate
@@ -531,7 +516,7 @@ mod tests {
             .entry(young)
             .or_default()
             .insert("t2".into(), t0() + step);
-        corr.gc_slow(t0() + crate::state::reducer::STALE_WAITING_TIMEOUT);
+        corr.gc_slow(t0() + crate::state::reducer::STALE_BLOCKED_TIMEOUT);
         assert!(
             !corr.counted_calls.contains_key(&old),
             "the swept life's emptied submap is dropped with it"

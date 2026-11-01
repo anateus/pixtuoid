@@ -25,14 +25,14 @@ pub(super) fn cutaway(size: Size) -> PixelFit {
     )
 }
 
-/// Local twin of the TUI harness's `active_on` — `tui` and `floating` are sibling
+/// Local twin of the TUI harness's `running_on` — `tui` and `floating` are sibling
 /// painters that don't share code, test helpers included.
-pub(super) fn active_on(
+pub(super) fn running_on(
     path: &str,
     floor_idx: usize,
     desk: usize,
 ) -> pixtuoid_core::state::AgentSlot {
-    use pixtuoid_core::state::{ActivityState, AgentSlot, GlobalDeskIndex, ToolKind};
+    use pixtuoid_core::state::{ActivityState, AgentSlot, GlobalDeskIndex, ToolKind, ToolUse};
     use std::sync::Arc;
     let started = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     AgentSlot {
@@ -41,20 +41,21 @@ pub(super) fn active_on(
         session_id: Arc::from("s"),
         cwd: Arc::from(std::path::Path::new("/repo")),
         label: "a".into(),
-        state: ActivityState::Active {
-            tool_use_id: Some(Arc::from("t")),
-            detail: Some(Arc::from("Edit")),
-            kind: ToolKind::from_display("Edit"),
+        state: ActivityState::Running {
+            item: Some(ToolUse {
+                tool_use_id: Some(Arc::from("t")),
+                detail: Some(Arc::from("Edit")),
+                kind: ToolKind::from_display("Edit"),
+            }),
         },
         state_started_at: started,
         created_at: started,
         last_event_at: started,
         exiting_at: None,
-        pending_idle_at: None,
         desk_index: GlobalDeskIndex(desk),
         floor_idx,
         tool_call_count: 0,
-        active_ms: 0,
+        running_ms: 0,
         unknown_cwd: false,
         parent_id: None,
         pid: None,
@@ -77,14 +78,12 @@ pub(super) fn scene_with(agents: Vec<pixtuoid_core::state::AgentSlot>, cap: usiz
 /// floor with no pet.
 pub(super) fn frame<'a>(
     scene: &'a SceneState,
-    pack: &'a pixtuoid_scene::pack::OfficeArt,
     theme: &'static pixtuoid_scene::theme::Theme,
     now: std::time::SystemTime,
 ) -> super::offscreen::WindowFrame<'a> {
     super::offscreen::WindowFrame {
         world: pixtuoid_scene::floor::FloorInputs {
             scene,
-            pack,
             now,
             floor: pixtuoid_scene::floor::FloorMeta::ground(),
             pets: pixtuoid_scene::floor::PetInputs::default(),

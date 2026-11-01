@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_main};
 use pixtuoid_core::id::AgentId;
 use pixtuoid_core::sprite::RgbBuffer;
-use pixtuoid_core::state::{ActivityState, GlobalDeskIndex, ToolKind};
+use pixtuoid_core::state::{ActivityState, GlobalDeskIndex, ToolKind, ToolUse};
 use pixtuoid_core::{AgentSlot, SceneState};
 use pixtuoid_scene::cutaway::canvas::CutawayCanvas;
 use pixtuoid_scene::cutaway::paint::render_cutaway;
@@ -86,19 +86,21 @@ fn office_scene(n: usize, max_desks: usize, base: SystemTime, busy: bool) -> Sce
     // deep-idle poses a real overnight office shows.
     let idle_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     // At n=12 this is exactly the 6/2/4 split the size cases have measured since #900.
-    let active = n / 2;
-    let waiting = active + n / 6;
+    let n_running = n / 2;
+    let requires_action_end = n_running + n / 6;
     for i in 0..n {
         let id = AgentId::from_transcript_path(&format!("/p/{i}.jsonl"));
         let state = match i {
-            _ if !busy || i >= waiting => ActivityState::Idle,
-            _ if i < active => ActivityState::Active {
-                tool_use_id: Some(Arc::from(format!("t{i}").as_str())),
-                detail: Some(Arc::from("cargo test")),
-                kind: kinds[i % kinds.len()],
+            _ if !busy || i >= requires_action_end => ActivityState::Idle,
+            _ if i < n_running => ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some(Arc::from(format!("t{i}").as_str())),
+                    detail: Some(Arc::from("cargo test")),
+                    kind: kinds[i % kinds.len()],
+                }),
             },
-            _ => ActivityState::Waiting {
-                reason: Arc::from("permission"),
+            _ => ActivityState::RequiresAction {
+                reason: Some(Arc::from("permission")),
             },
         };
         let stamp = if busy {
@@ -120,11 +122,10 @@ fn office_scene(n: usize, max_desks: usize, base: SystemTime, busy: bool) -> Sce
                 created_at: stamp,
                 last_event_at: stamp,
                 exiting_at: None,
-                pending_idle_at: None,
                 desk_index: GlobalDeskIndex(i),
                 floor_idx,
                 tool_call_count: if busy { i as u32 * 7 } else { 0 },
-                active_ms: 0,
+                running_ms: 0,
                 unknown_cwd: false,
                 parent_id: None,
                 pid: None,
@@ -165,7 +166,6 @@ fn floor_frames<'a>(
             RenderInputs {
                 world: FloorInputs {
                     scene,
-                    pack,
                     now,
                     floor: FloorMeta::ground(),
                     pets: PetInputs::default(),
@@ -285,7 +285,6 @@ fn render_cutaway_frame(c: &mut Criterion) {
                     .step(
                         pixtuoid_scene::floor::FloorInputs {
                             scene: &scene,
-                            pack: &pack,
                             now,
                             floor: meta,
                             pets: pixtuoid_scene::floor::PetInputs::default(),

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pixtuoid_core::AgentId;
-use pixtuoid_core::source::{AgentEvent, ToolDetail, Transport};
+use pixtuoid_core::source::{AgentEvent, RequestKeys, ToolDetail, Transport};
 use pixtuoid_core::state::SceneState;
 use pixtuoid_core::state::reducer::Reducer;
 
@@ -27,7 +27,7 @@ fn full_scene_serialization_is_stable() {
     let idle = AgentId::from_transcript_path("/idle/sess.jsonl");
     let winding = AgentId::from_transcript_path("/wind/sess.jsonl");
 
-    // The five agents cover all three ActivityState variants (Active in both
+    // The five agents cover all three ActivityState variants (Running in both
     // ToolDetail shapes) plus a populated Option<SystemTime>, across two sources.
     r.apply(
         &mut scene,
@@ -43,7 +43,7 @@ fn full_scene_serialization_is_stable() {
     );
     r.apply(
         &mut scene,
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id: parent,
             tool_use_id: Some("task-1".into()),
             detail: Some(ToolDetail::Task),
@@ -65,7 +65,7 @@ fn full_scene_serialization_is_stable() {
     );
     r.apply(
         &mut scene,
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id: child,
             tool_use_id: Some("tool-9".into()),
             detail: Some(ToolDetail::Generic {
@@ -89,11 +89,11 @@ fn full_scene_serialization_is_stable() {
     );
     r.apply(
         &mut scene,
-        AgentEvent::Waiting {
-            agent_id: solo,
-            reason: "permission: Bash".into(),
-            tool_use_id: None,
-        },
+        AgentEvent::user_action_request(
+            solo,
+            Some("permission: Bash".into()),
+            RequestKeys::default(),
+        ),
         at(4),
         Transport::Hook,
     );
@@ -109,8 +109,6 @@ fn full_scene_serialization_is_stable() {
         at(5),
         Transport::Hook,
     );
-    // Active→Idle debounce: the trailing ActivityEnd arms pending_idle_at but
-    // keeps Active.
     r.apply(
         &mut scene,
         AgentEvent::SessionStart {
@@ -125,7 +123,7 @@ fn full_scene_serialization_is_stable() {
     );
     r.apply(
         &mut scene,
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             agent_id: winding,
             tool_use_id: Some("w-1".into()),
             detail: Some(ToolDetail::Generic {
@@ -137,11 +135,21 @@ fn full_scene_serialization_is_stable() {
     );
     r.apply(
         &mut scene,
-        AgentEvent::ActivityEnd {
+        AgentEvent::ToolUseEnd {
             agent_id: winding,
             tool_use_id: Some("w-1".into()),
         },
         at(7),
+        Transport::Hook,
+    );
+    // Populates `exiting_at`: the snapshot's one non-null Option<SystemTime>.
+    r.apply(
+        &mut scene,
+        AgentEvent::SessionEnd {
+            agent_id: winding,
+            as_child: false,
+        },
+        at(8),
         Transport::Hook,
     );
 

@@ -5,7 +5,7 @@
 //! Box-drawing lines and block elements are [`ruled`], and every character
 //! Fusion Pixel 8px draws as a terminal's cells comes from it
 //! (`scripts/gen-fonts.py`); a symbol is an icon, not a glyph
-//! ([`paint_icon`]). It is [`grid`](super::grid)'s world face.
+//! ([`paint_icon`]). [`grid`](super::grid) paints screen text in it too.
 
 use pixtuoid_core::sprite::{Rgb, RgbBuffer};
 
@@ -20,9 +20,9 @@ pub(crate) const LEFTMOST_PIXEL: u8 = 1 << (u8::BITS - 1);
 
 /// Fusion Pixel 8px, written by `scripts/gen-fonts.py` (its format);
 /// license and sources in `fonts/`.
-#[cfg(feature = "cutaway-assets")]
-static FUSION: &[u8] = include_bytes!("../../fonts/world.bin");
-#[cfg(not(feature = "cutaway-assets"))]
+#[cfg(feature = "pixel-font")]
+static FUSION: &[u8] = include_bytes!("../../fonts/fusion-pixel-8px.bin");
+#[cfg(not(feature = "pixel-font"))]
 static FUSION: &[u8] = &[];
 
 /// Fusion Pixel's code points, ascending, and their glyphs; `None` when it
@@ -50,25 +50,39 @@ fn fusion(c: char) -> Option<Rows> {
 
 /// `c`'s glyph, `None` when the face lacks it.
 pub(crate) fn glyph(c: char) -> Option<Rows> {
-    ruled(c).or_else(|| fusion(c))
+    ruled(c).or_else(|| fusion(c)).or_else(|| by_hand(c))
+}
+
+/// `c`'s glyph where Fusion Pixel 8px has none that fits its cell: the narrow
+/// glyph it reads as where [`GLYPH_W`] columns can't tell them apart (`“`→`"`,
+/// `—`→`-`), else one drawn here.
+fn by_hand(c: char) -> Option<Rows> {
+    match c {
+        '\u{201c}' | '\u{201d}' | '\u{2033}' => return fusion('"'),
+        '\u{2010}' | '\u{2011}' | '\u{2014}' | '\u{2015}' => return fusion('-'),
+        '\u{2022}' => return fusion('\u{b7}'),
+        _ => {}
+    }
+    // A glyph's columns, leftmost the high bit, from the line's top row.
+    let art: [u8; LINE_H as usize] = match c {
+        // The font's `’` turned over.
+        '\u{2018}' => [0, 0b010, 0b100, 0b110, 0, 0, 0, 0],
+        // Three dots take five columns: two keep the glyph's gap.
+        '\u{2026}' => [0, 0, 0, 0, 0, 0, 0b101, 0],
+        '\u{3a3}' => [0, 0b111, 0b100, 0b010, 0b010, 0b100, 0b111, 0],
+        '\u{d8}' => [0, 0b011, 0b101, 0b101, 0b101, 0b101, 0b110, 0],
+        '\u{e6}' => [0, 0, 0, 0b011, 0b111, 0b110, 0b011, 0],
+        '\u{f8}' => [0, 0, 0, 0b011, 0b101, 0b101, 0b110, 0],
+        _ => return None,
+    };
+    Some(art.map(|ink| ink << (u8::BITS - u32::from(GLYPH_W))))
 }
 
 /// What `cluster`'s `n` cells show, each glyph with the cells it takes. When
 /// its characters' own cells add up to `n`, each draws in its own: a letter
 /// under a combining accent, or a letter and a halfwidth sound mark. Otherwise,
 /// as with a VS16 heart or a ZWJ sequence, it is one box `n` cells wide.
-fn glyphs(cluster: &str, n: u16) -> impl Iterator<Item = (Rows, u16)> + '_ {
-    glyphs_by(cluster, n, glyph, tofu)
-}
-
-/// [`glyphs`] in any face: its `glyph` for a character, else its `tofu` box
-/// as wide as the cells given.
-pub(crate) fn glyphs_by<'a, G: 'a>(
-    cluster: &'a str,
-    n: u16,
-    glyph: impl Fn(char) -> Option<G> + Copy + 'a,
-    tofu: impl Fn(u16) -> G + Copy + 'a,
-) -> impl Iterator<Item = (G, u16)> + 'a {
+pub(crate) fn glyphs(cluster: &str, n: u16) -> impl Iterator<Item = (Rows, u16)> + '_ {
     let own = |c: char| cells(c.encode_utf8(&mut [0; 4]));
     let fits = cluster.chars().map(own).sum::<u16>() == n;
     let each = cluster
@@ -161,9 +175,6 @@ pub(crate) fn ruled(c: char) -> Option<Rows> {
                 ink(col, RULE_ROW..LINE_H, solid);
             }
         }
-        // An em dash, which Fusion Pixel draws only full-width, as a rule
-        // that keeps its cell's gap: it ends a run as often as it joins one.
-        '\u{2014}' => ink(0..GLYPH_W, RULE_ROW..RULE_ROW + 1, solid),
         '\u{2580}' => ink(FULL, 0..half_h, solid),
         // Lower one to eight eighths.
         '\u{2581}'..='\u{2588}' => {
@@ -238,9 +249,8 @@ pub(crate) fn paint(pen: Pen, buf: &mut RgbBuffer, (x, y): (ArtPx, ArtPx), text:
     }
 }
 
-/// `icon`'s world art from `pack` in the cell whose top-left is `(x, y)`, its
-/// [`ICON_INK_KEY`](crate::pack::ICON_INK_KEY) pixels in `ink`; nothing where
-/// the icon has no world face.
+/// `icon`'s art from `pack` in the cell whose top-left is `(x, y)`, its
+/// [`ICON_INK_KEY`](crate::pack::ICON_INK_KEY) pixels in `ink`.
 pub(crate) fn paint_icon(
     pen: Pen,
     buf: &mut RgbBuffer,
@@ -248,10 +258,8 @@ pub(crate) fn paint_icon(
     (pack, icon): (&crate::pack::OfficeArt, crate::display::Icon),
     ink: Rgb,
 ) {
-    let Some(world) = pack.icon(icon).world() else {
-        return;
-    };
-    let frame = world
+    let frame = pack
+        .icon(icon)
         .recolorable_at(0)
         .recolored(&[(crate::pack::ICON_INK_KEY, Some(ink))]);
     for dy in 0..frame.height() {
@@ -277,7 +285,7 @@ mod tests {
 
     /// Every character the wall board and the floor indicator write as text:
     /// each mood over two flap cycles, each gateway state, many floors.
-    #[cfg(feature = "cutaway-assets")]
+    #[cfg(feature = "pixel-font")]
     fn signs() -> std::collections::BTreeSet<char> {
         use crate::anim::Motion;
         use crate::neon_sign::build_board;
@@ -300,23 +308,23 @@ mod tests {
                 ..StateCounts::default()
             },
             StateCounts {
-                active: 1,
+                running: 1,
                 total: 1,
                 ..StateCounts::default()
             },
             StateCounts {
-                active: 3,
+                running: 3,
                 total: 3,
                 ..StateCounts::default()
             },
             StateCounts {
-                waiting: 1,
+                requires_action: 1,
                 total: 1,
                 ..StateCounts::default()
             },
             StateCounts {
-                waiting: 2,
-                active: 3,
+                requires_action: 2,
+                running: 3,
                 idle: 4,
                 total: 9,
                 ..StateCounts::default()
@@ -325,7 +333,7 @@ mod tests {
         let gateways = [
             None,
             Some(DaemonState::Idle),
-            Some(DaemonState::Busy),
+            Some(DaemonState::Running),
             Some(DaemonState::Degraded),
             Some(DaemonState::Down),
         ];
@@ -346,7 +354,7 @@ mod tests {
     }
 
     /// The font draws everything the signs write: no sign shows a tofu box.
-    #[cfg(feature = "cutaway-assets")]
+    #[cfg(feature = "pixel-font")]
     #[test]
     fn the_font_draws_every_character_the_signs_write() {
         let missing: Vec<char> = signs()
@@ -389,7 +397,8 @@ mod tests {
             );
         }
         let ruled_chars = ('\u{2500}'..='\u{259f}').filter(|&c| ruled(c).is_some());
-        for c in ruled_chars.chain(['I', '\u{25cf}']) {
+        let by_hand = "\u{2018}\u{201c}\u{2014}\u{2022}\u{2026}\u{3a3}\u{d8}\u{e6}\u{f8}".chars();
+        for c in ruled_chars.chain(['I', '\u{25cf}']).chain(by_hand) {
             let text = c.to_string();
             let reach = ink(&text).iter().map(|&(x, _)| x + 1).max().unwrap_or(0);
             assert!(reach <= width(&text).0, "{c:?} inks to {reach}");
@@ -399,6 +408,42 @@ mod tests {
             columns(2),
             "a rule ends at its cell's edge"
         );
+    }
+
+    /// The first and last rows `c`'s glyph inks.
+    #[cfg(feature = "pixel-font")]
+    fn ink_rows(c: char) -> (Option<usize>, Option<usize>) {
+        let inked: Vec<usize> = (0..)
+            .zip(glyph(c).expect("drawn"))
+            .filter(|&(_, ink)| ink != 0)
+            .map(|(row, _)| row)
+            .collect();
+        (inked.first().copied(), inked.last().copied())
+    }
+
+    /// [`ACCENT_ROWS`] and [`CAP_H`] are Fusion Pixel's own: its capitals
+    /// span the rows they name.
+    #[cfg(feature = "pixel-font")]
+    #[test]
+    fn the_capitals_span_the_rows_the_metrics_name() {
+        let top = usize::from(ACCENT_ROWS);
+        let capitals = (Some(top), Some(top + usize::from(CAP_H) - 1));
+        for c in "EHIT".chars() {
+            assert_eq!(ink_rows(c), capitals, "{c:?}");
+        }
+    }
+
+    /// A glyph drawn by hand stands on Fusion Pixel's own rows: a capital
+    /// spans its `E`'s, a lowercase letter its `o`'s.
+    #[cfg(feature = "pixel-font")]
+    #[test]
+    fn hand_drawn_glyphs_stand_on_the_fonts_rows() {
+        for c in ['\u{3a3}', '\u{d8}'] {
+            assert_eq!(ink_rows(c), ink_rows('E'), "{c:?}");
+        }
+        for c in ['\u{e6}', '\u{f8}'] {
+            assert_eq!(ink_rows(c), ink_rows('o'), "{c:?}");
+        }
     }
 
     /// Block elements fill their share of the whole cell: a full block every
@@ -465,7 +510,7 @@ mod tests {
 
     /// Project names in CJK and accented Latin draw real glyphs,
     /// each as wide as its [`cells`](crate::display::text::cells).
-    #[cfg(feature = "cutaway-assets")]
+    #[cfg(feature = "pixel-font")]
     #[test]
     fn names_beyond_ascii_draw_glyphs_as_wide_as_their_cells() {
         for (name, n) in [
@@ -551,15 +596,15 @@ mod tests {
         }
     }
 
-    /// Without `cutaway-assets` a character only Fusion Pixel draws is the
+    /// Without `pixel-font` a character only Fusion Pixel draws is the
     /// box.
     #[test]
-    fn fusion_pixel_ships_with_cutaway_assets() {
-        assert_eq!(fusion('e').is_some(), cfg!(feature = "cutaway-assets"));
+    fn fusion_pixel_ships_with_pixel_font() {
+        assert_eq!(fusion('e').is_some(), cfg!(feature = "pixel-font"));
     }
 
     /// Fusion Pixel's CJK reaches the descender row its Latin does.
-    #[cfg(feature = "cutaway-assets")]
+    #[cfg(feature = "pixel-font")]
     #[test]
     fn cjk_reaches_the_descender_row() {
         let bottom = |c| glyph(c).and_then(|g| g.iter().rposition(|&row| row != 0));
@@ -572,7 +617,7 @@ mod tests {
 
     /// Fusion Pixel's glyphs are well formed, and every one fits the cells its
     /// character takes.
-    #[cfg(feature = "cutaway-assets")]
+    #[cfg(feature = "pixel-font")]
     #[test]
     fn every_fusion_glyph_fits_its_characters_cells() {
         let (points, glyphs) = fusion_font().expect("the header matches LINE_H");

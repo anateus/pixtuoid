@@ -53,14 +53,12 @@ impl<'a> DrawCtx<'a> {
         office: OfficeStores<'a>,
         theme: &'static pixtuoid_scene::theme::Theme,
         scene: &'a SceneState,
-        pack: &'a pixtuoid_scene::pack::OfficeArt,
         now: SystemTime,
         meta: pixtuoid_scene::floor::FloorMeta,
     ) -> Self {
         Self {
             world: FloorInputs {
                 scene,
-                pack,
                 now,
                 floor: meta,
                 pets: Default::default(),
@@ -93,7 +91,7 @@ pub fn scene_buf_size(cols: u16, rows: u16) -> (u16, u16) {
 }
 
 /// Paint the footer-only frame shown when the terminal is too small to render the
-/// office — the SHARED body of BOTH too-small gates, so a hit paints one clean
+/// office — the SHARED body of every too-small gate, so a hit paints one clean
 /// footer-only frame instead of leaving a stale, clipped, footer-less one frozen.
 ///
 /// It paints the modal overlays too: every modal's key handler stays live at any
@@ -288,6 +286,62 @@ pub fn draw_scene<B: Backend<Error: Send + Sync + 'static>>(
     Ok(Some(picture.hits.clone()))
 }
 
+/// A cutaway frame's cells, in the one order every painter of it draws them:
+/// the footer, `under` (the image's cells placed, then the text the host sets
+/// over them), the panels, and what `carve` makes of the image's cells after.
+pub(crate) fn paint_over_image<C>(
+    f: &mut ratatui::Frame<'_>,
+    footer: &FooterInputs<'_>,
+    overlays: &crate::panels::OverlayFrame<'_>,
+    theme: &pixtuoid_scene::theme::Theme,
+    now: SystemTime,
+    under: impl FnOnce(&mut ratatui::Frame<'_>, Rect),
+    carve: impl FnOnce(&mut ratatui::buffer::Buffer, Rect) -> C,
+) -> C {
+    let full = f.area();
+    let scene = scene_rect(full);
+    paint_footer(f, footer, full, theme);
+    under(f, scene);
+    crate::panels::paint_overlays(f, overlays, now, full, theme);
+    carve(f.buffer_mut(), scene)
+}
+
+/// [`draw_scene`]'s frame over an image of the office: [`paint_over_image`]
+/// with every scene cell the image's, and what of them stays image.
+///
+/// # Errors
+///
+/// If querying the terminal size or drawing the frame to the backend fails.
+#[doc(hidden)]
+pub fn draw_over_image<B: Backend<Error: Send + Sync + 'static>>(
+    term: &mut Terminal<B>,
+    ctx: &DrawCtx<'_>,
+) -> Result<crate::tui::cutaway::ImageCells> {
+    use crate::tui::cutaway::ImageCells;
+    let theme = ctx.theme;
+    let FloorInputs { scene, now, .. } = ctx.world;
+    let footer = FooterInputs::new(scene, ctx.footer);
+    let overlays = ctx.overlays;
+    let size = term.size()?;
+    if scene_too_small(scene_rect(Rect::new(0, 0, size.width, size.height))) {
+        draw_footer_only_frame(term, &footer, theme, &overlays, now)?;
+        return Ok(ImageCells::none());
+    }
+    let mut image = ImageCells::none();
+    term.draw(|f| {
+        image = paint_over_image(
+            f,
+            &footer,
+            &overlays,
+            theme,
+            now,
+            |f, scene| ImageCells::place(f.buffer_mut(), scene),
+            |buf, scene| ImageCells::carve(buf, scene, overlays.onboarding.dim),
+        );
+    })?;
+    Ok(image)
+}
+
 /// Where the half-blocks lie under the cells of a terminal `size` big.
 pub(crate) fn classic_geometry(size: ratatui::layout::Size) -> SceneGeometry {
     SceneGeometry::half_block(scene_rect(Rect::new(0, 0, size.width, size.height)))
@@ -424,19 +478,19 @@ mod tests {
                 active_sessions: 0,
                 last_seen: t0,
                 entered_at: t0,
-                in_flight_runs: Default::default(),
+                in_flight_turns: Default::default(),
                 current_pid: Some(1),
             },
         );
-        let pack = Arc::new(pixtuoid_scene::pack::load_bundled_pack().expect("pack"));
-        let mut floor = pixtuoid_scene::floor::PerFloor::new(Arc::clone(&pack));
+        let mut floor = pixtuoid_scene::floor::PerFloor::new(Arc::new(
+            pixtuoid_scene::pack::load_bundled_pack().expect("pack"),
+        ));
         let mut office = pixtuoid_scene::floor::PerOffice::new();
         let ctx = DrawCtx::offscreen(
             &mut floor,
             office.stores(),
             &pixtuoid_scene::theme::NORMAL,
             &scene,
-            &pack,
             t0,
             pixtuoid_scene::floor::FloorMeta::ground(),
         );

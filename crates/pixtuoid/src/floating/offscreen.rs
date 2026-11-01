@@ -29,7 +29,7 @@ pub struct OfficeRenderer {
 }
 
 impl OfficeRenderer {
-    /// A renderer drawing with `pack`, which every frame's `world.pack` must be.
+    /// A renderer drawing with `pack`.
     pub fn new(pack: std::sync::Arc<pixtuoid_scene::pack::OfficeArt>) -> Self {
         Self {
             session: OfficeSession::new(pack),
@@ -176,9 +176,7 @@ impl OfficeRenderer {
         let unit = unit_at(cursor, at);
         // The slop in this window's units, at least one.
         let slop_px = DRAG_SLOP_DIP * pressing.scale_factor;
-        let units = (slop_px / f64::from(at.scale().get().max(1)))
-            .ceil()
-            .max(1.0) as u16;
+        let units = (slop_px / f64::from(at.scale().get())).ceil().max(1.0) as u16;
         let slop = pixtuoid_scene::interact::Slop { x: units, y: units };
         let down = self
             .pointer
@@ -407,7 +405,7 @@ pub(super) fn unit_in(cursor: (f64, f64), at: PixelFit) -> Option<pixtuoid_scene
 /// The layout unit a frame drawn at `at` shows at `cursor` (physical px).
 fn unit_at(cursor: (f64, f64), at: PixelFit) -> pixtuoid_scene::layout::Point {
     let unit = |px: f64| {
-        (px.max(0.0) as u32 / u32::from(at.scale().get().max(1))).min(u32::from(u16::MAX)) as u16
+        (px.max(0.0) as u32 / u32::from(at.scale().get())).min(u32::from(u16::MAX)) as u16
     };
     pixtuoid_scene::layout::Point {
         x: unit(cursor.0),
@@ -441,12 +439,12 @@ pub struct WindowFrame<'a> {
 mod tests {
     use std::time::SystemTime;
 
-    use super::super::fixtures::{active_on, cutaway, density, frame, scene_with};
+    use super::super::fixtures::{cutaway, density, frame, running_on, scene_with};
     use super::super::geometry::{Zoom, window_geometry};
     use super::super::overlays::footer_budget;
     use super::*;
     use pixtuoid_core::sprite::Rgb;
-    use pixtuoid_scene::cutaway::Face;
+    use pixtuoid_scene::cutaway::glyph_cell;
     use pixtuoid_scene::floor::{FloorMeta, PetInputs};
     use winit::dpi::PhysicalSize;
 
@@ -461,14 +459,13 @@ mod tests {
         );
         let theme = pixtuoid_scene::theme::theme_by_name("normal").expect("normal theme exists");
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let mut renderer = OfficeRenderer::new(std::sync::Arc::clone(&pack));
+        let mut renderer = OfficeRenderer::new(pack);
         let buf = renderer
             .render(
                 cutaway(Size { w: 160, h: 96 }),
                 WindowFrame {
                     world: FloorInputs {
                         scene: &scene,
-                        pack: &pack,
                         now,
                         floor: FloorMeta::ground(),
                         pets: PetInputs::default(),
@@ -506,7 +503,7 @@ mod tests {
         let mut lit = |dim| -> u64 {
             let at = WindowFrame {
                 dim,
-                ..frame(&scene, crate::test_flash::pack(), theme, now)
+                ..frame(&scene, theme, now)
             };
             renderer
                 .render(cutaway(Size { w: 160, h: 96 }), at)
@@ -558,7 +555,7 @@ mod tests {
         fn with_a_floor_above(weather: pixtuoid_scene::sky::WeatherPolicy) -> Self {
             let cap = 8;
             Self {
-                scene: scene_with(vec![active_on("/p/upstairs.jsonl", 1, cap)], cap),
+                scene: scene_with(vec![running_on("/p/upstairs.jsonl", 1, cap)], cap),
                 ..Self::new(weather)
             }
         }
@@ -573,7 +570,6 @@ mod tests {
                 WindowFrame {
                     world: FloorInputs {
                         scene: &self.scene,
-                        pack: crate::test_flash::pack(),
                         now,
                         floor: self.floor,
                         pets: PetInputs::default(),
@@ -628,7 +624,7 @@ mod tests {
         let strike = storm_strike();
         let [dark, late, held, _] = held_frames(&strike);
         let mut window = Window::new(strike.weather);
-        let agent = active_on("/p/a.jsonl", 0, 0);
+        let agent = running_on("/p/a.jsonl", 0, 0);
         let id = agent.agent_id;
         window.scene = scene_with(vec![agent], 16);
         window.present(dark);
@@ -1095,10 +1091,10 @@ mod tests {
         let cap = 16;
         let scene = scene_with(
             vec![
-                active_on("/a/f0.jsonl", 0, 0),
-                active_on("/a/f1a.jsonl", 1, cap),
-                active_on("/a/f1b.jsonl", 1, cap + 1),
-                active_on("/a/f1c.jsonl", 1, cap + 2),
+                running_on("/a/f0.jsonl", 0, 0),
+                running_on("/a/f1a.jsonl", 1, cap),
+                running_on("/a/f1b.jsonl", 1, cap + 1),
+                running_on("/a/f1c.jsonl", 1, cap + 2),
             ],
             cap,
         );
@@ -1107,13 +1103,12 @@ mod tests {
         );
         let theme = pixtuoid_scene::theme::theme_by_name("normal").expect("normal theme exists");
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let mut renderer = OfficeRenderer::new(std::sync::Arc::clone(&pack));
+        let mut renderer = OfficeRenderer::new(pack);
         renderer.render(
             cutaway(Size { w: 160, h: 96 }),
             WindowFrame {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: FloorMeta::ground(),
                     pets: PetInputs::default(),
@@ -1137,10 +1132,10 @@ mod tests {
         let cap = 16;
         let scene = scene_with(
             vec![
-                active_on("/a/f0.jsonl", 0, 0),
-                active_on("/a/f1a.jsonl", 1, cap),
-                active_on("/a/f1b.jsonl", 1, cap + 1),
-                active_on("/a/f1c.jsonl", 1, cap + 2),
+                running_on("/a/f0.jsonl", 0, 0),
+                running_on("/a/f1a.jsonl", 1, cap),
+                running_on("/a/f1b.jsonl", 1, cap + 1),
+                running_on("/a/f1c.jsonl", 1, cap + 2),
             ],
             cap,
         );
@@ -1149,7 +1144,7 @@ mod tests {
         );
         let theme = pixtuoid_scene::theme::theme_by_name("normal").expect("normal theme exists");
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let mut renderer = OfficeRenderer::new(std::sync::Arc::clone(&pack));
+        let mut renderer = OfficeRenderer::new(pack);
         let (handle, rx) = crate::audio::AudioHandle::test_pair();
         renderer.set_audio(handle);
         renderer.render(
@@ -1157,7 +1152,6 @@ mod tests {
             WindowFrame {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: FloorMeta::ground(),
                     pets: PetInputs::default(),
@@ -1172,8 +1166,8 @@ mod tests {
         let stems = frames.last().unwrap().stems;
         let moderate = pixtuoid_scene::audio::stem_levels(
             &pixtuoid_scene::tally::StateCounts {
-                active: 1,
-                waiting: 0,
+                running: 1,
+                requires_action: 0,
                 idle: 0,
                 exiting: 0,
                 total: 1,
@@ -1182,7 +1176,7 @@ mod tests {
         );
         assert_eq!(
             stems.typing, moderate.typing,
-            "typing level must reflect the RENDERED floor's 1 active, not all 4"
+            "typing level must reflect the RENDERED floor's 1 running, not all 4"
         );
     }
 
@@ -1192,10 +1186,10 @@ mod tests {
     fn the_footer_shows_the_shared_warning_in_place_of_the_stats() {
         let renderer = OfficeRenderer::new(crate::test_flash::pack_arc());
         let mut scene = SceneState::new([8; pixtuoid_core::state::MAX_FLOORS]);
-        let slot = active_on("/p/a.jsonl", 0, 0);
+        let slot = running_on("/p/a.jsonl", 0, 0);
         scene.agents.insert(slot.agent_id, slot);
         let warning = crate::doctor::footer_warning(&[], &["cc"]);
-        let budget = footer_budget(960, Face::Screen.cell(1));
+        let budget = footer_budget(960, glyph_cell(2));
         let calm = renderer.footer(&scene, budget, true, None, None).text();
         let warned = renderer
             .footer(&scene, budget, true, None, warning.as_deref())
@@ -1214,10 +1208,10 @@ mod tests {
         );
         let theme = pixtuoid_scene::theme::theme_by_name("normal").expect("normal theme exists");
         let now0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let mut idle = active_on("/w/wanderer.jsonl", 0, 0);
+        let mut idle = running_on("/w/wanderer.jsonl", 0, 0);
         idle.state = pixtuoid_core::state::ActivityState::Idle;
         let scene = scene_with(vec![idle], 16);
-        let mut renderer = OfficeRenderer::new(std::sync::Arc::clone(&pack));
+        let mut renderer = OfficeRenderer::new(pack);
         let (handle, rx) = crate::audio::AudioHandle::test_pair();
         renderer.set_audio(handle);
         let mut heard = Vec::new();
@@ -1231,7 +1225,6 @@ mod tests {
                 WindowFrame {
                     world: FloorInputs {
                         scene: &scene,
-                        pack: &pack,
                         now,
                         floor: FloorMeta::ground(),
                         pets: PetInputs::default(),
@@ -1269,18 +1262,17 @@ mod tests {
         );
         let theme = pixtuoid_scene::theme::theme_by_name("normal").expect("normal theme exists");
         let mut now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let mut renderer = OfficeRenderer::new(std::sync::Arc::clone(&pack));
+        let mut renderer = OfficeRenderer::new(pack);
         let (handle, rx) = crate::audio::AudioHandle::test_pair();
         renderer.set_audio(handle);
 
-        let mut agents = vec![active_on("/d/f0.jsonl", 0, 0)];
+        let mut agents = vec![running_on("/d/f0.jsonl", 0, 0)];
         let scene = scene_with(agents.clone(), cap);
         renderer.render(
             cutaway(Size { w: 160, h: 96 }),
             WindowFrame {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: FloorMeta::ground(),
                     pets: PetInputs::default(),
@@ -1292,7 +1284,7 @@ mod tests {
         );
         crate::audio::drain_frames(&rx); // discard the priming frames
 
-        agents.push(active_on("/d/f1-new.jsonl", 1, cap));
+        agents.push(running_on("/d/f1-new.jsonl", 1, cap));
         let scene = scene_with(agents.clone(), cap);
         now += std::time::Duration::from_millis(pixtuoid_scene::anim::PAINT_FRAME_MS);
         renderer.render(
@@ -1300,7 +1292,6 @@ mod tests {
             WindowFrame {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: FloorMeta::ground(),
                     pets: PetInputs::default(),
@@ -1319,7 +1310,7 @@ mod tests {
             "a floor-1 walk-in must not chime the ground-floor window: {off_floor:?}"
         );
 
-        agents.push(active_on("/d/f0-new.jsonl", 0, 1));
+        agents.push(running_on("/d/f0-new.jsonl", 0, 1));
         let scene = scene_with(agents, cap);
         now += std::time::Duration::from_millis(pixtuoid_scene::anim::PAINT_FRAME_MS);
         renderer.render(
@@ -1327,7 +1318,6 @@ mod tests {
             WindowFrame {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: FloorMeta::ground(),
                     pets: PetInputs::default(),
@@ -1431,13 +1421,9 @@ mod tests {
         let (rendered, at, size, now, _) = one_agent_office();
         let fresh = OfficeRenderer::new(crate::test_flash::pack_arc());
         let mut unpresented = OfficeRenderer::new(crate::test_flash::pack_arc());
-        let scene = scene_with(vec![active_on("/p/a.jsonl", 0, 0)], 16);
+        let scene = scene_with(vec![running_on("/p/a.jsonl", 0, 0)], 16);
         let theme = pixtuoid_scene::theme::theme_by_name("normal").expect("normal theme");
-        assert!(unpresented.render_live(
-            at,
-            frame(&scene, crate::test_flash::pack(), theme, now),
-            size
-        ));
+        assert!(unpresented.render_live(at, frame(&scene, theme, now), size));
         let on_agent = agent_point(&rendered, at, now);
         let corner = (f64::from(size.0) - 1.0, f64::from(size.1) - 1.0);
         for mut renderer in [fresh, unpresented] {
@@ -1501,7 +1487,7 @@ mod tests {
         let pack = std::sync::Arc::new(
             pixtuoid_scene::pack::load_bundled_pack().expect("bundled pack loads"),
         );
-        let agent = active_on("/p/a.jsonl", 0, 0);
+        let agent = running_on("/p/a.jsonl", 0, 0);
         let id = agent.agent_id;
         let scene = scene_with(vec![agent], 16);
         let theme = pixtuoid_scene::theme::theme_by_name("normal").expect("normal theme exists");
@@ -1515,7 +1501,6 @@ mod tests {
             WindowFrame {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: FloorMeta::ground(),
                     pets: PetInputs::default(),

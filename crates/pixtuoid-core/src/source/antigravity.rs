@@ -3,8 +3,14 @@ use serde_json::Value;
 use std::path::Path;
 
 use crate::AgentId;
-use crate::source::AgentEvent;
-use crate::source::decoder::{DecodeError, EVENT_STAMP, first_present_str, generic_tool_display};
+use crate::source::decoder::{
+    DecodeError, EVENT_STAMP, extract_top_level_cwd, first_present_str, generic_tool_display,
+};
+use crate::source::registry::{
+    ChildEndInference, Corroboration, FocusChannel, HookDecoding, HookObject, Hyphen, SourceCaps,
+    SourceDescriptor, SourceKind, Transcript,
+};
+use crate::source::{AgentEvent, RequestKeys};
 
 #[cfg(feature = "native")]
 mod native;
@@ -13,6 +19,42 @@ pub use native::AntigravitySource;
 
 /// The Antigravity CLI source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "antigravity";
+
+pub(crate) const DESCRIPTOR: SourceDescriptor = SourceDescriptor {
+    name: SOURCE_NAME,
+    label_prefix: "ag",
+    verified_version: "1.4.12",
+    version_probe: Some(&["agy", "--version"]),
+    version_hyphen: Hyphen::Prerelease,
+    home_env: None,
+    kind: SourceKind::Agent {
+        transcript: Some(Transcript {
+            line_decoder: decode_ag_line,
+            id_from_path: ag_id_from_path,
+            path_filter: admits_transcript,
+            // AG step lines carry no cwd field at all; the cwd rides the
+            // `SessionStart` hook.
+            cwd_extractor: extract_top_level_cwd,
+            parent_extractor: None,
+        }),
+        hook: Some(HookDecoding::ClaimsAll(decode_ag_hook_payload)),
+        // Both false is VERIFIED: no end marker (`status` is per-step, always DONE)
+        // and no end hook, and no prompt-time hook re-registers a swept session.
+        // Flipping `resurrects_on_prompt` for the 5-min reaper strands a live idle
+        // session. An exit rides the shim-stamped pid.
+        caps: SourceCaps {
+            has_exit_signal: false,
+            resurrects_on_prompt: false,
+            delegations_are_hook_silent: false,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
+            brackets_turns: false,
+        },
+        focus: FocusChannel::ShimStamp(Corroboration::Twice),
+    },
+    #[cfg(feature = "native")]
+    native: native::NATIVE,
+};
 
 /// The CLI's app data dir, under [`gemini_dir`]: NOT `antigravity`, the App's,
 /// which shares the global hooks file but is not this source.
@@ -56,25 +98,21 @@ fn step_tool_id(step: i64) -> String {
 }
 
 /// Decode one Antigravity CLI transcript line into `AgentEvent`s (the step_index / tool_calls JSONL schema).
-///
-/// # Errors
-///
-/// Never: the `Result` is the [`LineDecoder`](crate::source::decoder::LineDecoder) signature, and a malformed line decodes to `vec![]`.
-pub fn decode_ag_line(transcript_path: &str, source: &str, v: Value) -> Result<Vec<AgentEvent>> {
+pub fn decode_ag_line(transcript_path: &str, source: &str, v: Value) -> Vec<AgentEvent> {
     let agent_id = AgentId::from_parts(source, &ag_id_from_path(Path::new(transcript_path)));
     let Some(obj) = v.as_object() else {
-        return Ok(vec![]);
+        return vec![];
     };
 
     // A present-but-non-integer OR negative `step_index` must skip the line: a
     // negative would mint an id no result step can end, leaving the slot stuck
-    // Active until the reducer's stale-sweep.
+    // Running until the reducer's stale-sweep.
     let Some(step_index) = obj
         .get("step_index")
         .and_then(|v| v.as_i64())
         .filter(|&s| s >= 0)
     else {
-        return Ok(vec![]);
+        return vec![];
     };
     let step_type = obj.get("type").and_then(|s| s.as_str()).unwrap_or("");
 
@@ -118,18 +156,18 @@ pub fn decode_ag_line(transcript_path: &str, source: &str, v: Value) -> Result<V
             crate::source::drift::unknown_event(SOURCE_NAME, step_type);
         }
         if step_type != "USER_INPUT" && step_type != "CONVERSATION_HISTORY" && step_index > 0 {
-            out.push(AgentEvent::ActivityEnd {
+            out.push(AgentEvent::ToolUseEnd {
                 agent_id,
                 tool_use_id: Some(step_tool_id(step_index)),
             });
         }
     }
 
-    Ok(out)
+    out
 }
 
 /// Decode one tool call, from either transport: a permission/question prompt
-/// becomes `Waiting`, anything else an `ActivityStart`, each keyed `tool_use_id`.
+/// becomes [`AgentEvent::UserActionRequest`], anything else a `ToolUseStart`, each keyed `tool_use_id`.
 fn decode_ag_tool_call(
     agent_id: AgentId,
     name: &str,
@@ -138,14 +176,17 @@ fn decode_ag_tool_call(
 ) -> AgentEvent {
     // The tools that wait on the human (hooks.md, "Supported tools").
     if name == "ask_permission" || name == "ask_question" {
-        return AgentEvent::Waiting {
+        return AgentEvent::user_action_request(
             agent_id,
-            reason: "asking permission".to_string(),
-            tool_use_id,
-        };
+            Some("asking permission".to_string()),
+            RequestKeys {
+                tool_use_id,
+                ..RequestKeys::default()
+            },
+        );
     }
     let target = ag_tool_target(args);
-    AgentEvent::ActivityStart {
+    AgentEvent::ToolUseStart {
         agent_id,
         tool_use_id,
         detail: Some(generic_tool_display(name, target.as_deref())),
@@ -157,12 +198,9 @@ fn decode_ag_tool_call(
 ///
 /// # Errors
 ///
-/// If the payload is not an object, lacks the event stamp or `conversationId`,
+/// If the payload lacks the event stamp or `conversationId`,
 /// or fires an event the installer never registers.
-pub(crate) fn decode_ag_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| DecodeError::not_an_object(SOURCE_NAME))?;
+pub(crate) fn decode_ag_hook_payload(obj: &HookObject) -> Result<Vec<AgentEvent>> {
     let event = obj
         .get(EVENT_STAMP)
         .and_then(Value::as_str)
@@ -245,16 +283,13 @@ pub(crate) fn decode_ag_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
         }
         "PostToolUse" => Ok(vec![
             identity(),
-            AgentEvent::ActivityEnd {
+            AgentEvent::ToolUseEnd {
                 agent_id,
                 tool_use_id: call().0,
             },
         ]),
         // Turn end: the session lives on to the next prompt.
-        "Stop" => Ok(vec![AgentEvent::ActivityEnd {
-            agent_id,
-            tool_use_id: None,
-        }]),
+        "Stop" => Ok(vec![AgentEvent::turn_end(agent_id)]),
         other => {
             crate::source::drift::unknown_event(SOURCE_NAME, other);
             Err(DecodeError::unsupported(SOURCE_NAME, other))
@@ -265,11 +300,11 @@ pub(crate) fn decode_ag_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
 /// The first present path/command field of an Antigravity tool call's `args`,
 /// quote-stripped — the `: target` half of the Generic display.
 fn ag_tool_target(args: Option<&Value>) -> Option<String> {
-    // Priority order, each an argument hooks.md documents ("Supported tools").
+    // Priority order. `Path` is `read_file`'s, `write_file`'s and `edit_file`'s
+    // in 1.4.8's tool declarations, as its request to the model lists them.
     const KEYS: &[&str] = &[
         "DirectoryPath",
-        "AbsolutePath",
-        "TargetFile",
+        "Path",
         "CommandLine",
         "SearchPath",
         "query",
@@ -285,6 +320,7 @@ fn ag_tool_target(args: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::decoder::test_obj;
 
     #[test]
     fn negative_step_index_is_skipped_not_minted() {
@@ -293,7 +329,7 @@ mod tests {
             "step_index": -1,
             "tool_calls": [ { "name": "read_file", "args": {} } ],
         });
-        let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, v).unwrap();
+        let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, v);
         assert!(
             out.is_empty(),
             "negative step_index must emit nothing: {out:?}"
@@ -304,7 +340,7 @@ mod tests {
             "step_index": 0,
             "tool_calls": [ { "name": "read_file", "args": {} } ],
         });
-        let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, v).unwrap();
+        let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, v);
         assert_eq!(out.len(), 1, "step_index 0 still emits: {out:?}");
     }
 
@@ -316,20 +352,20 @@ mod tests {
             ("EXECUTION_RESULT", 0),
         ] {
             let v = serde_json::json!({ "type": ty, "step_index": idx });
-            let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, v).unwrap();
+            let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, v);
             assert!(
                 out.is_empty(),
                 "{ty} at step {idx} must not end anything: {out:?}"
             );
         }
         let v = serde_json::json!({ "type": "EXECUTION_RESULT", "step_index": 2 });
-        let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, v).unwrap();
+        let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, v);
         assert_eq!(out.len(), 1);
         match &out[0] {
-            AgentEvent::ActivityEnd { tool_use_id, .. } => {
+            AgentEvent::ToolUseEnd { tool_use_id, .. } => {
                 assert_eq!(tool_use_id.as_deref(), Some("ag-2"));
             }
-            other => panic!("expected ActivityEnd, got {other:?}"),
+            other => panic!("expected ToolUseEnd, got {other:?}"),
         }
     }
 
@@ -339,16 +375,15 @@ mod tests {
             "type": "PLANNER_RESPONSE",
             "step_index": 1,
             "tool_calls": [
-                { "name": "view_file", "args": {} },
-                { "name": "view_file", "args": {} },
+                { "name": "read_file", "args": {} },
+                { "name": "read_file", "args": {} },
             ],
         });
         let ids: Vec<_> = decode_ag_line("/x/t.jsonl", SOURCE_NAME, v)
-            .unwrap()
             .into_iter()
             .map(|e| match e {
-                AgentEvent::ActivityStart { tool_use_id, .. } => tool_use_id,
-                other => panic!("expected ActivityStart, got {other:?}"),
+                AgentEvent::ToolUseStart { tool_use_id, .. } => tool_use_id,
+                other => panic!("expected ToolUseStart, got {other:?}"),
             })
             .collect();
         assert_eq!(ids, [Some("ag-2".to_string()), Some("ag-3".to_string())]);
@@ -362,13 +397,13 @@ mod tests {
             "tool_calls": [ { "name": "read_file", "args": {} } ],
         });
         let logs = crate::test_capture::capture_logs(|| {
-            let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, renamed).unwrap();
+            let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, renamed);
             assert_eq!(out.len(), 1, "renamed step must mint no start: {out:?}");
             match &out[0] {
-                AgentEvent::ActivityEnd { tool_use_id, .. } => {
+                AgentEvent::ToolUseEnd { tool_use_id, .. } => {
                     assert_eq!(tool_use_id.as_deref(), Some("ag-2"));
                 }
-                other => panic!("expected ActivityEnd only, got {other:?}"),
+                other => panic!("expected ToolUseEnd only, got {other:?}"),
             }
         });
         assert!(
@@ -378,7 +413,7 @@ mod tests {
 
         let result_step = serde_json::json!({ "type": "TOOL_RESULT", "step_index": 2 });
         let quiet = crate::test_capture::capture_logs(|| {
-            decode_ag_line("/x/t.jsonl", SOURCE_NAME, result_step).unwrap();
+            decode_ag_line("/x/t.jsonl", SOURCE_NAME, result_step);
         });
         assert!(
             !quiet.contains("unknown_event"),
@@ -395,29 +430,29 @@ mod tests {
             "tool_calls": [
                 { "name": "run_command", "args": { "CommandLine": "\"git status\"" } },
                 { "name": "grep_search", "args": { "SearchPath": "/repo", "query": "TODO" } },
-                { "name": "view_file", "args": {} },
+                { "name": "read_file", "args": {} },
             ],
         });
-        let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, v).unwrap();
+        let out = decode_ag_line("/x/t.jsonl", SOURCE_NAME, v);
         let displays: Vec<&str> = out
             .iter()
             .map(|e| match e {
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     detail: Some(ToolDetail::Generic { display }),
                     ..
                 } => display.as_str(),
-                other => panic!("expected Generic ActivityStart, got {other:?}"),
+                other => panic!("expected Generic ToolUseStart, got {other:?}"),
             })
             .collect();
         assert_eq!(
             displays,
-            ["run_command: git status", "grep_search: /repo", "view_file",]
+            ["run_command: git status", "grep_search: /repo", "read_file",]
         );
     }
 
     #[test]
     fn ag_tool_target_falls_through_a_present_non_string_key() {
-        let args = serde_json::json!({ "DirectoryPath": 42, "AbsolutePath": "/repo/x" });
+        let args = serde_json::json!({ "DirectoryPath": 42, "Path": "/repo/x" });
         assert_eq!(ag_tool_target(Some(&args)).as_deref(), Some("/repo/x"));
     }
 
@@ -437,7 +472,8 @@ mod tests {
 
     #[test]
     fn a_hook_keys_on_the_conversation_whose_transcript_the_watcher_walks() {
-        let out = decode_ag_hook_payload(&hook("SessionStart", serde_json::json!({}))).unwrap();
+        let out =
+            decode_ag_hook_payload(test_obj(&hook("SessionStart", serde_json::json!({})))).unwrap();
         let key = ag_id_from_path(&Path::new(LOGS).join(TRANSCRIPT));
         assert_eq!(key, "c1");
         match out.as_slice() {
@@ -462,30 +498,24 @@ mod tests {
     fn a_hook_tool_call_pairs_on_its_step() {
         let call = serde_json::json!({
             "stepIdx": 2,
-            "toolCall": { "name": "view_file", "args": { "AbsolutePath": "/repo/NOTE.txt" } },
+            "toolCall": { "name": "read_file", "args": { "Path": "/repo/NOTE.txt" } },
         });
-        let start = decode_ag_hook_payload(&hook("PreToolUse", call.clone())).unwrap();
+        let start = decode_ag_hook_payload(test_obj(&hook("PreToolUse", call.clone()))).unwrap();
         assert!(
             start.iter().any(|e| matches!(e,
-                AgentEvent::ActivityStart { tool_use_id: Some(t), detail: Some(d), .. }
-                    if t == "ag-2" && d.display() == "view_file: /repo/NOTE.txt")),
+                AgentEvent::ToolUseStart { tool_use_id: Some(t), detail: Some(d), .. }
+                    if t == "ag-2" && d.display() == "read_file: /repo/NOTE.txt")),
             "{start:?}"
         );
-        let end = decode_ag_hook_payload(&hook("PostToolUse", call)).unwrap();
+        let end = decode_ag_hook_payload(test_obj(&hook("PostToolUse", call))).unwrap();
         assert!(
             end.iter().any(|e| matches!(e,
-                AgentEvent::ActivityEnd { tool_use_id: Some(t), .. } if t == "ag-2")),
+                AgentEvent::ToolUseEnd { tool_use_id: Some(t), .. } if t == "ag-2")),
             "{end:?}"
         );
-        let stop = decode_ag_hook_payload(&hook("Stop", serde_json::json!({}))).unwrap();
+        let stop = decode_ag_hook_payload(test_obj(&hook("Stop", serde_json::json!({})))).unwrap();
         assert!(
-            matches!(
-                stop.as_slice(),
-                [AgentEvent::ActivityEnd {
-                    tool_use_id: None,
-                    ..
-                }]
-            ),
+            matches!(stop.as_slice(), [AgentEvent::TurnEnd { .. }]),
             "{stop:?}"
         );
     }
@@ -496,10 +526,10 @@ mod tests {
             "stepIdx": 4,
             "toolCall": { "name": "ask_question", "args": {} },
         });
-        let out = decode_ag_hook_payload(&hook("PreToolUse", ask)).unwrap();
+        let out = decode_ag_hook_payload(test_obj(&hook("PreToolUse", ask))).unwrap();
         assert!(
             out.iter().any(|e| matches!(e,
-                AgentEvent::Waiting { tool_use_id: Some(t), .. } if t == "ag-4")),
+                AgentEvent::UserActionRequest { tool_use_id: Some(t), .. } if t == "ag-4")),
             "{out:?}"
         );
     }
@@ -517,18 +547,22 @@ mod tests {
         };
         for app in ["antigravity", "antigravity-ide"] {
             assert!(
-                decode_ag_hook_payload(&at(app)).unwrap().is_empty(),
+                decode_ag_hook_payload(test_obj(&at(app)))
+                    .unwrap()
+                    .is_empty(),
                 "{app}"
             );
         }
         assert!(
-            !decode_ag_hook_payload(&at(CLI_APP_DATA_DIR))
+            !decode_ag_hook_payload(test_obj(&at(CLI_APP_DATA_DIR)))
                 .unwrap()
                 .is_empty()
         );
         let blanked = hook("SessionStart", serde_json::json!({ "transcriptPath": "" }));
         assert!(
-            !decode_ag_hook_payload(&blanked).unwrap().is_empty(),
+            !decode_ag_hook_payload(test_obj(&blanked))
+                .unwrap()
+                .is_empty(),
             "a recording blanks the unread path, and still decodes"
         );
     }
@@ -536,7 +570,10 @@ mod tests {
     #[test]
     fn an_unregistered_hook_event_is_a_breadcrumbed_error() {
         let logs = crate::test_capture::capture_logs(|| {
-            assert!(decode_ag_hook_payload(&hook("PreInvocation", serde_json::json!({}))).is_err());
+            assert!(
+                decode_ag_hook_payload(test_obj(&hook("PreInvocation", serde_json::json!({}))))
+                    .is_err()
+            );
         });
         assert!(
             logs.contains("unknown_event") && logs.contains("PreInvocation"),

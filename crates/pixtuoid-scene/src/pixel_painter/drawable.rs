@@ -149,8 +149,7 @@ pub(super) enum DrawableKind<'a> {
         kind: crate::layout::WallDecor,
         pos: Point,
     },
-    /// A corridor appliance: its pack art ([`crate::pack::appliance_piece`]), centred at
-    /// `pos`.
+    /// A corridor appliance: its pack art, centred at `pos`.
     Appliance {
         pos: Point,
         sprite: Piece,
@@ -983,7 +982,7 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH;
         let layout = crate::layout::SceneLayout::compute(160, 120, None).expect("fits");
         let first = pixtuoid_core::state::FloorLocalDeskIndex(0);
-        let desk = layout.home_desks[first.0];
+        let desk = layout.home_desks[first.0].at;
         let cabinet = layout
             .fixtures()
             .find(|f| f.kind == crate::layout::FixtureKind::FilingCabinet(first))

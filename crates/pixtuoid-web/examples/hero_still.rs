@@ -13,7 +13,6 @@
 
 use std::process::ExitCode;
 
-use chrono::TimeZone;
 use pixtuoid_web::Office;
 
 const USAGE: &str = "usage: hero_still <out.png> [--width W] [--height H] \
@@ -47,7 +46,7 @@ fn positional_out(args: &[String]) -> Option<&str> {
     None
 }
 
-// The wasm hero's canvas buffer for a 16:9 viewport.
+// The wasm hero's layout extent for a 16:9 viewport; the PNG is `Office::scale` times it.
 const DEFAULT_WIDTH: u32 = 231;
 const DEFAULT_HEIGHT: u32 = 130;
 // Far enough into the loop that the cast has walked in and seated, rather than
@@ -73,10 +72,9 @@ fn arg<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
 /// the same hour because the gen pipeline pins the process to `TZ=UTC`.
 fn hour_to_t0_ms(hour: u32) -> Option<f64> {
     let (y, m, d) = T0_REFERENCE_YMD;
-    chrono::Utc
-        .with_ymd_and_hms(y, m, d, hour, 0, 0)
-        .single()
-        .map(|dt| dt.timestamp_millis() as f64)
+    chrono::NaiveDate::from_ymd_opt(y, m, d)?
+        .and_hms_opt(hour, 0, 0)
+        .map(|dt| dt.and_utc().timestamp_millis() as f64)
 }
 
 fn main() -> ExitCode {
@@ -122,11 +120,26 @@ fn main() -> ExitCode {
     office.step(t0_ms + advance_ms as f64, width, height);
 
     let px = office.frame().to_vec();
+    let (width, height) = office.frame_size(width, height);
+    let (width, height) = (u32::from(width), u32::from(height));
     let Some(img) = image::RgbaImage::from_raw(width, height, px) else {
         eprintln!("frame length didn't match {width}x{height}*4");
         return ExitCode::FAILURE;
     };
-    if let Err(e) = img.save(out) {
+    // A poster's bytes are load time: the frame is opaque (RGB), and its flat
+    // pixel-art runs deflate best unfiltered, against the Paeth that
+    // https://www.w3.org/TR/png-3/#12Filter-selection expects for truecolor.
+    let rgb = image::DynamicImage::ImageRgba8(img).into_rgb8();
+    let written = std::fs::File::create(out)
+        .map_err(image::ImageError::IoError)
+        .and_then(|f| {
+            rgb.write_with_encoder(image::codecs::png::PngEncoder::new_with_quality(
+                std::io::BufWriter::new(f),
+                image::codecs::png::CompressionType::Best,
+                image::codecs::png::FilterType::NoFilter,
+            ))
+        });
+    if let Err(e) = written {
         eprintln!("write {out}: {e}");
         return ExitCode::FAILURE;
     }

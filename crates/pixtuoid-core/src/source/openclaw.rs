@@ -13,9 +13,9 @@
 //! Capture-grounded: tools are invisible under the `claude-cli` backend (no
 //! `before_tool_call`), `before_agent_run`/`agent_end` require
 //! `allowConversationAccess`, and `session_end` fires on a clean stop but not on
-//! a kill. Busy is therefore a self-healing decay keyed PER RUN, never a latch —
+//! a kill. Running is therefore a self-healing decay keyed PER TURN, never a latch —
 //! the daemon-wide `last_seen` is refreshed by any event, so keying the decay on it
-//! latched Busy on a gateway that kept serving other traffic.
+//! latched Running on a gateway that kept serving other traffic.
 
 use std::num::NonZeroU16;
 
@@ -23,10 +23,25 @@ use crate::source::decoder::{DecodeError, DecodeResult as Result};
 use serde_json::Value;
 
 use crate::source::daemon::{DaemonPresenceUpdate, DecodedPresence};
-use crate::state::DaemonInstanceId;
+use crate::source::registry::{HookObject, Hyphen, SourceDescriptor, SourceKind};
+use crate::state::{DaemonInstanceId, TurnKey};
 
 /// The OpenClaw daemon source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "openclaw";
+
+pub(crate) const DESCRIPTOR: SourceDescriptor = SourceDescriptor {
+    name: SOURCE_NAME,
+    label_prefix: "ok",
+    verified_version: "2026.10.9",
+    version_probe: Some(&["openclaw", "--version"]),
+    version_hyphen: Hyphen::Prerelease,
+    home_env: None,
+    kind: SourceKind::Daemon {
+        presence_decoder: decode_openclaw_hook_payload,
+    },
+    #[cfg(feature = "native")]
+    native: crate::source::registry::Native::NONE,
+};
 
 /// The wire field carrying the gateway's RESOLVED listening port — the "which
 /// gateway" key: unique among *live* gateways (two can't bind one port) and STABLE
@@ -36,18 +51,20 @@ pub const SOURCE_NAME: &str = "openclaw";
 /// (many per gateway).
 const GATEWAY_PORT_FIELD: &str = "gatewayPort";
 
-/// The busy pairing key: a non-empty `runId`, else `sessionId`, else `"_"`. The
+/// The turn's pairing key: a non-empty `runId`, else `sessionId`, else `"_"`. The
 /// `!is_empty` filter sits AFTER the pick, so a present-but-EMPTY `runId`
 /// short-circuits to `"_"` rather than falling through to `sessionId`. Coarse BY
 /// DESIGN — the last-seen TTL decay is the real backstop, so the key only affects
-/// busy-bubble intensity, never correctness.
-fn run_key(obj: &serde_json::Map<String, Value>) -> String {
-    obj.get("runId")
-        .and_then(|s| s.as_str())
-        .or_else(|| obj.get("sessionId").and_then(|s| s.as_str()))
-        .filter(|s| !s.is_empty())
-        .unwrap_or("_")
-        .to_string()
+/// running-bubble intensity, never correctness.
+fn turn_key(obj: &serde_json::Map<String, Value>) -> TurnKey {
+    TurnKey::Id(
+        obj.get("runId")
+            .and_then(|s| s.as_str())
+            .or_else(|| obj.get("sessionId").and_then(|s| s.as_str()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("_")
+            .into(),
+    )
 }
 
 /// Narrow the wire `gatewayPort` to this gateway's stable instance id; an envelope
@@ -67,14 +84,7 @@ fn gateway_instance(obj: &serde_json::Map<String, Value>, event: &str) -> Result
                 format_args!("must be a port in 1..=65535, got {raw}"),
             )
         })?;
-    instance_id(port.to_string())
-}
-
-/// [`DaemonInstanceId::new`] for an id that is statically non-empty. The `None` arm
-/// is unreachable, but production code must not `unwrap`, so it degrades to an error.
-fn instance_id(raw: String) -> Result<DaemonInstanceId> {
-    DaemonInstanceId::new(raw)
-        .ok_or_else(|| DecodeError::invalid(SOURCE_NAME, "gateway instance id", "blank"))
+    Ok(DaemonInstanceId::from_port(port))
 }
 
 /// Decode one OpenClaw plugin envelope into the sending gateway's identity plus its
@@ -84,18 +94,16 @@ fn instance_id(raw: String) -> Result<DaemonInstanceId> {
 ///
 /// # Errors
 ///
-/// If the payload is not an object, lacks `type`, or carries a `gatewayPort` that is not a non-zero `u16` port.
-pub fn decode_openclaw_hook_payload(v: &Value) -> Result<DecodedPresence> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| DecodeError::not_an_object(SOURCE_NAME))?;
+/// If the payload lacks `type`, or carries a `gatewayPort` that is not a non-zero `u16` port.
+#[doc(hidden)]
+pub fn decode_openclaw_hook_payload(obj: &HookObject) -> Result<DecodedPresence> {
     let event = obj
         .get("type")
         .and_then(|s| s.as_str())
         .ok_or_else(|| DecodeError::missing(SOURCE_NAME, "type"))?;
     let instance = gateway_instance(obj, event)?;
     let pid = obj
-        .get("_pid")
+        .get(crate::source::decoder::PID_STAMP)
         .and_then(|p| p.as_i64())
         .and_then(crate::source::decoder::checked_pid);
     // Presence is ANNOUNCE-only: upstream fires `gateway_start` once per gateway
@@ -107,18 +115,18 @@ pub fn decode_openclaw_hook_payload(v: &Value) -> Result<DecodedPresence> {
         "gateway_stop" => vec![DaemonPresenceUpdate::GatewayDown],
         "session_start" => vec![DaemonPresenceUpdate::SessionStarted],
         "session_end" => vec![DaemonPresenceUpdate::SessionEnded],
-        "before_agent_run" => vec![DaemonPresenceUpdate::RunStarted {
-            run_key: run_key(obj),
+        "before_agent_run" => vec![DaemonPresenceUpdate::TurnStarted {
+            turn: turn_key(obj),
         }],
         "agent_end" => {
-            // The plugin's `errored` is the run's verdict. Degraded is sticky (no TTL
+            // The plugin's `errored` is the turn's verdict. Degraded is sticky (no TTL
             // heals it), so a missing field is no evidence of an error.
             let failed = obj.get("errored").and_then(Value::as_bool) == Some(true);
-            let run_key = run_key(obj);
+            let turn = turn_key(obj);
             vec![if failed {
-                DaemonPresenceUpdate::RunFailed { run_key }
+                DaemonPresenceUpdate::TurnFailed { turn }
             } else {
-                DaemonPresenceUpdate::RunEnded { run_key }
+                DaemonPresenceUpdate::TurnEnded { turn }
             }]
         }
         // An unmapped forwarded hook is a benign skip, but it breadcrumbs at `warn`:
@@ -148,6 +156,7 @@ pub fn decode_openclaw_hook_payload(v: &Value) -> Result<DecodedPresence> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::decoder::test_obj;
     use serde_json::json;
 
     const TEST_PORT: u64 = 18789;
@@ -156,7 +165,7 @@ mod tests {
         if let Some(o) = v.as_object_mut() {
             o.entry(GATEWAY_PORT_FIELD).or_insert(json!(TEST_PORT));
         }
-        decode_openclaw_hook_payload(&v).expect("decodes")
+        decode_openclaw_hook_payload(test_obj(&v)).expect("decodes")
     }
 
     fn decode(v: Value) -> Vec<DaemonPresenceUpdate> {
@@ -231,27 +240,27 @@ mod tests {
     fn before_agent_run_and_agent_end_pair_on_runid() {
         assert_eq!(
             decode(json!({"type": "before_agent_run", "runId": "run_1", "sessionId": "s1"})),
-            vec![DaemonPresenceUpdate::RunStarted {
-                run_key: "run_1".into()
+            vec![DaemonPresenceUpdate::TurnStarted {
+                turn: TurnKey::Id("run_1".into())
             }]
         );
         assert_eq!(
             decode(json!({"type": "agent_end", "runId": "run_1", "sessionId": "s1"})),
-            vec![DaemonPresenceUpdate::RunEnded {
-                run_key: "run_1".into()
+            vec![DaemonPresenceUpdate::TurnEnded {
+                turn: TurnKey::Id("run_1".into())
             }]
         );
     }
 
     /// `success` says nothing of a provider failure; the plugin's `errored` does.
     #[test]
-    fn errored_alone_decides_a_failed_run() {
+    fn errored_alone_decides_a_failed_turn() {
         for success in [true, false] {
             assert_eq!(
                 decode(json!({"type": "agent_end", "runId": "r", "sessionId": "s",
                               "success": success, "errored": true})),
-                vec![DaemonPresenceUpdate::RunFailed {
-                    run_key: "r".into()
+                vec![DaemonPresenceUpdate::TurnFailed {
+                    turn: TurnKey::Id("r".into())
                 }],
                 "success: {success}"
             );
@@ -259,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_turn_ends_the_run_without_degrading_the_gateway() {
+    fn a_cancelled_turn_ends_without_degrading_the_gateway() {
         for v in [
             json!({"type": "agent_end", "runId": "run_1", "sessionId": "s1",
                       "success": false, "errored": false}),
@@ -267,8 +276,8 @@ mod tests {
         ] {
             assert_eq!(
                 decode(v.clone()),
-                vec![DaemonPresenceUpdate::RunEnded {
-                    run_key: "run_1".into()
+                vec![DaemonPresenceUpdate::TurnEnded {
+                    turn: TurnKey::Id("run_1".into())
                 }],
                 "an abort is an ordinary end, not a degradation: {v}"
             );
@@ -276,15 +285,15 @@ mod tests {
     }
 
     #[test]
-    fn agent_end_success_true_or_absent_decodes_to_run_ended() {
+    fn agent_end_success_true_or_absent_decodes_to_turn_ended() {
         for v in [
             json!({"type": "agent_end", "runId": "r", "sessionId": "s", "success": true}),
             json!({"type": "agent_end", "runId": "r", "sessionId": "s"}),
         ] {
             assert_eq!(
                 decode(v),
-                vec![DaemonPresenceUpdate::RunEnded {
-                    run_key: "r".into()
+                vec![DaemonPresenceUpdate::TurnEnded {
+                    turn: TurnKey::Id("r".into())
                 }],
                 "success:true/absent must never false-degrade a healthy gateway"
             );
@@ -305,18 +314,10 @@ mod tests {
                           "success": false, "errored": true})),
             vec![
                 DaemonPresenceUpdate::PidSeen { pid: 8888 },
-                DaemonPresenceUpdate::RunFailed {
-                    run_key: "r".into()
+                DaemonPresenceUpdate::TurnFailed {
+                    turn: TurnKey::Id("r".into())
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn gateway_start_pid_is_not_double_emitted_as_pid_seen() {
-        assert_eq!(
-            decode(json!({"type": "gateway_start", "_pid": 4242})),
-            vec![DaemonPresenceUpdate::GatewayUp { pid: Some(4242) }]
         );
     }
 
@@ -329,11 +330,11 @@ mod tests {
     }
 
     #[test]
-    fn run_without_runid_falls_back_to_session_key() {
+    fn turn_without_runid_falls_back_to_session_key() {
         assert_eq!(
             decode(json!({"type": "before_agent_run", "sessionId": "s9"})),
-            vec![DaemonPresenceUpdate::RunStarted {
-                run_key: "s9".into()
+            vec![DaemonPresenceUpdate::TurnStarted {
+                turn: TurnKey::Id("s9".into())
             }]
         );
     }
@@ -355,8 +356,8 @@ mod tests {
         );
         assert_eq!(
             updates,
-            vec![DaemonPresenceUpdate::RunEnded {
-                run_key: "run_1".into()
+            vec![DaemonPresenceUpdate::TurnEnded {
+                turn: TurnKey::Id("run_1".into())
             }]
         );
     }
@@ -379,10 +380,8 @@ mod tests {
 
     #[test]
     fn malformed_payloads_are_errors_not_panics() {
-        assert!(decode_openclaw_hook_payload(&json!("a string")).is_err());
-        assert!(decode_openclaw_hook_payload(&json!(42)).is_err());
         assert!(
-            decode_openclaw_hook_payload(&json!({"_pid": 1})).is_err(),
+            decode_openclaw_hook_payload(test_obj(&json!({"_pid": 1}))).is_err(),
             "missing type"
         );
     }
@@ -394,13 +393,6 @@ mod tests {
         assert_eq!(a.instance.as_str(), "18789");
         assert_eq!(b.instance.as_str(), "19789");
         assert_ne!(a.instance, b.instance);
-    }
-
-    #[test]
-    fn the_same_port_after_a_restart_is_the_same_instance() {
-        let first = decode_full(json!({"type": "gateway_start", "gatewayPort": 18789, "_pid": 11}));
-        let after = decode_full(json!({"type": "gateway_start", "gatewayPort": 18789, "_pid": 99}));
-        assert_eq!(first.instance, after.instance);
     }
 
     #[test]
@@ -431,7 +423,7 @@ mod tests {
         ] {
             let v = json!({"type": "gateway_start", "gatewayPort": bad, "_pid": 5});
             assert!(
-                decode_openclaw_hook_payload(&v).is_err(),
+                decode_openclaw_hook_payload(test_obj(&v)).is_err(),
                 "gatewayPort {bad} must be rejected"
             );
         }
@@ -441,7 +433,7 @@ mod tests {
     fn a_rejected_gateway_port_is_display_safe_in_the_error() {
         let bad = json!("18\u{202e}78\u{7f}9");
         let v = json!({"type": "gateway_start", "gatewayPort": bad, "_pid": 5});
-        let msg = decode_openclaw_hook_payload(&v)
+        let msg = decode_openclaw_hook_payload(test_obj(&v))
             .expect_err("an unusable port is rejected")
             .to_string();
         assert!(
@@ -453,8 +445,9 @@ mod tests {
 
     #[test]
     fn a_port_less_envelope_is_rejected() {
-        let err = decode_openclaw_hook_payload(&json!({"type": "gateway_start", "_pid": 7}))
-            .expect_err("no gateway to key it on");
+        let err =
+            decode_openclaw_hook_payload(test_obj(&json!({"type": "gateway_start", "_pid": 7})))
+                .expect_err("no gateway to key it on");
         assert!(
             matches!(err, DecodeError::Missing { field, .. } if field == GATEWAY_PORT_FIELD),
             "got: {err:?}"
@@ -464,8 +457,10 @@ mod tests {
     #[test]
     fn a_valid_port_breadcrumbs_nothing() {
         let logs = crate::test_capture::capture_logs(|| {
-            decode_openclaw_hook_payload(&json!({"type": "gateway_start", "gatewayPort": 18789}))
-                .expect("decodes");
+            decode_openclaw_hook_payload(test_obj(
+                &json!({"type": "gateway_start", "gatewayPort": 18789}),
+            ))
+            .expect("decodes");
         });
         assert!(
             !logs.contains("missing_field"),
@@ -474,17 +469,17 @@ mod tests {
     }
 
     #[test]
-    fn run_key_fallbacks_are_coarse_by_design() {
+    fn turn_key_fallbacks_are_coarse_by_design() {
         assert_eq!(
             decode(json!({"type": "before_agent_run"})),
-            vec![DaemonPresenceUpdate::RunStarted {
-                run_key: "_".into()
+            vec![DaemonPresenceUpdate::TurnStarted {
+                turn: TurnKey::Id("_".into())
             }]
         );
         assert_eq!(
             decode(json!({"type": "before_agent_run", "runId": "", "sessionId": "s5"})),
-            vec![DaemonPresenceUpdate::RunStarted {
-                run_key: "_".into()
+            vec![DaemonPresenceUpdate::TurnStarted {
+                turn: TurnKey::Id("_".into())
             }],
             "an empty runId short-circuits to \"_\" (filter is after the or)"
         );

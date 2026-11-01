@@ -19,9 +19,9 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, anyhow};
 use image::{Rgb as ImgRgb, RgbImage};
 use pixtuoid::dev::{OfficeRenderer, WindowFrame, XrgbSurface, window_geometry};
-use pixtuoid_core::state::{ActivityState, SceneState, ToolKind};
+use pixtuoid_core::state::{ActivityState, SceneState, ToolKind, ToolUse};
 use pixtuoid_core::{AgentId, AgentSlot, GlobalDeskIndex};
-use pixtuoid_scene::cutaway::Face;
+use pixtuoid_scene::cutaway::chrome_cell;
 use pixtuoid_scene::floor::{FloorInputs, FloorMeta, PetInputs};
 use pixtuoid_scene::theme::theme_by_name;
 
@@ -31,34 +31,40 @@ fn populate_demo_agents(scene: &mut SceneState, now: SystemTime, n: usize) {
     let archetypes: [(&str, ActivityState); 6] = [
         (
             "claude-code",
-            ActivityState::Active {
-                tool_use_id: Some("tu_a".into()),
-                detail: Some("Write: src/foo.rs".into()),
-                kind: ToolKind::Edit,
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some("tu_a".into()),
+                    detail: Some("Write: src/foo.rs".into()),
+                    kind: ToolKind::Edit,
+                }),
             },
         ),
         ("codex", ActivityState::Idle),
         (
             "cc",
-            ActivityState::Waiting {
-                reason: "permission?".into(),
+            ActivityState::RequiresAction {
+                reason: Some("permission?".into()),
             },
         ),
         (
             "cc",
-            ActivityState::Active {
-                tool_use_id: Some("tu_d".into()),
-                detail: Some("Bash: cargo test".into()),
-                kind: ToolKind::Bash,
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some("tu_d".into()),
+                    detail: Some("Bash: cargo test".into()),
+                    kind: ToolKind::Bash,
+                }),
             },
         ),
         ("reasonix", ActivityState::Idle),
         (
             "opencode",
-            ActivityState::Active {
-                tool_use_id: Some("tu_e".into()),
-                detail: Some("Grep: TODO".into()),
-                kind: ToolKind::Search,
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some("tu_e".into()),
+                    detail: Some("Grep: TODO".into()),
+                    kind: ToolKind::Search,
+                }),
             },
         ),
     ];
@@ -84,11 +90,10 @@ fn populate_demo_agents(scene: &mut SceneState, now: SystemTime, n: usize) {
                 created_at: seated_since,
                 last_event_at: recent,
                 exiting_at: None,
-                pending_idle_at: None,
                 desk_index: GlobalDeskIndex(i),
                 floor_idx: scene.floor_of(GlobalDeskIndex(i)),
                 tool_call_count: 0,
-                active_ms: 0,
+                running_ms: 0,
                 unknown_cwd: false,
                 parent_id: None,
                 pid: None,
@@ -239,7 +244,6 @@ fn main() -> Result<()> {
             WindowFrame {
                 world: FloorInputs {
                     scene: &scene,
-                    pack: &pack,
                     now,
                     floor: FloorMeta::ground(),
                     pets: PetInputs::default(),
@@ -290,10 +294,9 @@ fn main() -> Result<()> {
     }
     let buf = renderer.buf().context("a frame")?;
     let (bw, bh) = (buf.width(), buf.height());
-    let cell = Face::chrome(at);
+    let cell = chrome_cell(at);
     let world = FloorInputs {
         scene: &scene,
-        pack: &pack,
         now,
         floor: FloorMeta::ground(),
         pets: PetInputs::default(),

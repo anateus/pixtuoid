@@ -11,6 +11,8 @@
 // delete — disconnecting opencode in pixtuoid's Sources panel replaces this
 // with a removed-marker stub.
 import { spawn } from "node:child_process"
+import type { Plugin } from "@opencode/plugin"
+import type { Fields } from "./plugin-types.js"
 
 const HOOK_PATH: string = "{{HOOK_PATH_JSON}}"
 
@@ -24,23 +26,40 @@ const DRAIN_MS = 2000
 // published reaches the loop well within it.
 const QUIET_MS = 50
 
-// Only forward what pixtuoid maps; the decoder (`source/opencode.rs`) ignores
-// anything else anyway.
-const FORWARD = new Set<string>([
-  "session.created",
-  "session.deleted",
-  "session.execution.started",
+type Event = Plugin.Context["event"]["subscribe"] extends (
+  ...args: never[]
+) => AsyncIterable<infer E>
+  ? E
+  : never
+
+const SETTLED = [
   "session.execution.succeeded",
   "session.execution.failed",
   "session.execution.interrupted",
+] as const satisfies readonly Event["type"][]
+const SETTLES = new Set<string>(SETTLED)
+
+// Only forward what pixtuoid maps; the decoder (`source/opencode.rs`) ignores
+// anything else anyway.
+const FORWARDED = [
+  "session.deleted",
+  "session.execution.started",
+  ...SETTLED,
   "session.tool.input.started",
   "session.tool.success",
   "session.tool.failed",
   "permission.asked",
-])
+] as const satisfies readonly Event["type"][]
+const FORWARD = new Set<string>(FORWARDED)
+type Forwarded = Extract<Event, { type: (typeof FORWARDED)[number] }>
+const forwarded = (event: Event): event is Forwarded => FORWARD.has(event.type)
+
+type SessionRecord = Awaited<ReturnType<Plugin.Context["session"]["get"]>>
+// A forwarded event's data, or the record a turn's start merges in.
+type Data = Fields<Forwarded["data"] | SessionRecord>
 
 // Copied field by field, so no prompt, tool input or output leaves opencode.
-const allowlisted = (data: any) => ({
+const allowlisted = (data: Data | undefined) => ({
   sessionID: data?.sessionID,
   parentID: data?.parentID,
   location: data?.location && { directory: data.location.directory },
@@ -77,7 +96,7 @@ const send = (payload: string) =>
 // fork's row keeps its source in `fork_session_id` with `parent_id` null
 // (`packages/core/src/session/projector.ts:160-161`), read back as `fork`, not
 // `parentID` (`packages/core/src/session/info.ts:21-28`), so a fork stays a root.
-const record = async (ctx: any, sessionID: unknown) => {
+const record = async (ctx: Plugin.Context, sessionID: SessionRecord["id"]): Promise<Partial<SessionRecord>> => {
   try {
     return (await ctx.session.get({ sessionID })) ?? {}
   } catch {
@@ -87,28 +106,53 @@ const record = async (ctx: any, sessionID: unknown) => {
 
 export default {
   id: "pixtuoid",
-  setup(ctx: any) {
+  setup(ctx) {
     const controller = new AbortController()
     let inFlight = 0
     let lastActivity = 0
+    // Each session's open execution, by its start's durable seq. A settle
+    // carries its own seq, so it is stamped with its start's: the turn it
+    // ends. One execution runs per session at a time
+    // (`packages/core/src/session/run-coordinator.ts:6` at v2.2.0), and the
+    // bus delivers in order, so a session's next settle is its start's. A
+    // settle whose start this process never saw goes unstamped.
+    const openTurns = new Map<Forwarded["data"]["sessionID"], number>()
+    const turnOf = (event: Forwarded): number | undefined => {
+      const session = event.data?.sessionID
+      if (event.type === "session.execution.started") {
+        const seq = event.durable?.seq
+        if (typeof seq !== "number") {
+          openTurns.delete(session)
+          return undefined
+        }
+        openTurns.set(session, seq)
+        return seq
+      }
+      if (!SETTLES.has(event.type)) return undefined
+      const seq = openTurns.get(session)
+      openTurns.delete(session)
+      return seq
+    }
     // Not awaited: setup returns at once, and the loop's own awaits only pace
     // this subscription, whose queue is unbounded.
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          if (!FORWARD.has(event?.type)) continue
+          if (!forwarded(event)) continue
           inFlight++
           try {
+            const turn = turnOf(event)
             // A turn's start carries only `sessionID`; the session's record adds
-            // what `session.created` did, for a session swept since.
-            const data =
+            // the location, parent and model it registers with.
+            const data: Data =
               event.type === "session.execution.started"
-                ? { ...(await record(ctx, event.data?.sessionID)), ...event.data }
+                ? { ...(await record(ctx, event.data.sessionID)), ...event.data }
                 : event.data
             await send(
               JSON.stringify({
                 type: event.type,
                 location: event.location && { directory: event.location.directory },
+                turn,
                 data: allowlisted(data),
                 // The opencode server's pid; the daemon's HookPidWatch ends every
                 // sprite bound to it when it dies.
@@ -135,4 +179,4 @@ export default {
       controller.abort()
     }
   },
-}
+} satisfies Plugin.Plugin

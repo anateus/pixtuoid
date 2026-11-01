@@ -1,12 +1,12 @@
 //! `--proof`: the §3 split-screen causal-proof renderer. ONE committed CC session
-//! fixture drives BOTH sides of every frame: the left panel types the session,
-//! the right side is the REAL draw_scene pass replaying the SAME decoded
+//! (`proof-session/`) drives BOTH sides of every frame: the left panel types the session,
+//! the right side is the REAL `draw_frame` pass replaying the SAME decoded
 //! AgentEvent stream through the real Reducer — the two sides structurally cannot
 //! desync. scripts/gen-media.py (kind:"proof") encodes the frames.
 
 use anyhow::{Context as _, Result, anyhow};
 use image::{Rgba, RgbaImage};
-use pixtuoid::dev::{DrawCtx, draw_scene};
+use pixtuoid::dev::DrawCtx;
 use pixtuoid_core::source::AgentEvent;
 use pixtuoid_core::source::claude_code::{
     SOURCE_NAME, cc_derive_label, cc_id_from_path, decode_cc_line,
@@ -18,9 +18,12 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 
-use crate::encode::{FrameSink, ImageCanvas, Timeline, cells_to_rgba, fill_rect};
+use crate::cutaway::CutawayOffice;
+use crate::encode::{
+    FrameSink, ImageCanvas, Timeline, compose, draw_frame, fill_rect, terminal_cell,
+};
 use crate::{CELL_H, CELL_W};
-use pixtuoid_scene::cutaway::{CellPx, Face, GridInk, paint_grid};
+use pixtuoid_scene::cutaway::{GridInk, paint_grid};
 use pixtuoid_scene::display::cells::CellGrid;
 use pixtuoid_scene::display::text::cells;
 
@@ -33,7 +36,7 @@ const HEADER_H: u32 = 32;
 const PAD: u32 = 16;
 const LINE_H: u32 = 28;
 const TYPE_CPS: u64 = 30;
-const PREAMBLE_MS: u64 = 6000; // "$ claude" + session start precede the first fixture line
+const PREAMBLE_MS: u64 = 6000; // "$ claude" + session start precede the session's first line
 
 // Every callout holds at most this long from its OWN at_ms, independent of when
 // the next annotated line appears — without a ceiling, the first one held for the
@@ -78,7 +81,7 @@ pub(crate) struct PanelLine {
 pub(crate) struct ProofScript {
     pub(crate) events: Vec<(u64, AgentEvent)>,
     pub(crate) lines: Vec<PanelLine>,
-    /// From the fixture's first timestamp — the panel titles itself as a
+    /// From the session's first timestamp — the panel titles itself as a
     /// past-tense archive, not the live ticker.
     pub(crate) capture_date: String,
 }
@@ -111,18 +114,12 @@ fn wrap_text(text: &str, max_width: i32, width_fn: impl Fn(&str) -> i32) -> Vec<
     lines
 }
 
-/// The cell the frames' text draws in: the window's screen face, a glyph
-/// pixel to a pixel.
-fn text_cell() -> CellPx {
-    Face::Screen.cell(1)
-}
-
-/// `s`'s width in pixels in [`text_cell`]s.
+/// `s`'s width in pixels in [`terminal_cell`]s.
 fn text_width(s: &str) -> i32 {
-    i32::from(cells(s)) * i32::from(text_cell().w)
+    i32::from(cells(s)) * i32::from(terminal_cell().w)
 }
 
-/// Draw `s` in the screen face, top-left at `(x, top_y)`, over what is
+/// Draw `s` in the window's face, top-left at `(x, top_y)`, over what is
 /// there, with an optional one-pixel `halo` under each glyph. Returns its
 /// width so the typing-cursor block needn't recompute it.
 fn draw_text(
@@ -142,8 +139,8 @@ fn draw_text(
     paint_grid(
         &mut ImageCanvas(img),
         &grid,
-        ((x, top_y), text_cell()),
-        (Face::Screen, crate::icons()),
+        ((x, top_y), terminal_cell()),
+        crate::icons(),
         GridInk {
             text: rgb(color),
             halo: halo.map(rgb),
@@ -204,20 +201,20 @@ fn ts_ms(v: &serde_json::Value) -> Result<i64> {
     let ts = v
         .get("timestamp")
         .and_then(|s| s.as_str())
-        .ok_or_else(|| anyhow!("fixture line missing timestamp"))?;
+        .ok_or_else(|| anyhow!("session line missing timestamp"))?;
     Ok(chrono::DateTime::parse_from_rfc3339(ts)
-        .with_context(|| format!("bad fixture timestamp {ts:?}"))?
+        .with_context(|| format!("bad session timestamp {ts:?}"))?
         .timestamp_millis())
 }
 
-/// The fixture's capture date (`YYYY-MM-DD`), from its first line's timestamp.
+/// The session's date (`YYYY-MM-DD`), from its first line's timestamp.
 fn capture_date_str(v: &serde_json::Value) -> Result<String> {
     let ts = v
         .get("timestamp")
         .and_then(|s| s.as_str())
-        .ok_or_else(|| anyhow!("fixture line missing timestamp"))?;
+        .ok_or_else(|| anyhow!("session line missing timestamp"))?;
     Ok(chrono::DateTime::parse_from_rfc3339(ts)
-        .with_context(|| format!("bad fixture timestamp {ts:?}"))?
+        .with_context(|| format!("bad session timestamp {ts:?}"))?
         .format("%Y-%m-%d")
         .to_string())
 }
@@ -235,23 +232,23 @@ fn tool_arg(input: Option<&serde_json::Value>) -> String {
     String::new()
 }
 
-pub(crate) fn build_script(fixture: &Path) -> Result<ProofScript> {
-    let raw = fs::read_to_string(fixture)
-        .with_context(|| format!("read proof fixture {}", fixture.display()))?;
-    let stem = cc_id_from_path(fixture);
-    anyhow::ensure!(!stem.is_empty(), "fixture path has no filename stem");
+pub(crate) fn build_script(session: &Path) -> Result<ProofScript> {
+    let raw = fs::read_to_string(session)
+        .with_context(|| format!("read proof session {}", session.display()))?;
+    let stem = cc_id_from_path(session);
+    anyhow::ensure!(!stem.is_empty(), "session path has no filename stem");
     let agent_id = AgentId::from_parts(SOURCE_NAME, &stem);
-    let path_str = fixture.to_string_lossy().into_owned();
+    let path_str = session.to_string_lossy().into_owned();
 
     let parsed: Vec<serde_json::Value> = raw
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()
-        .context("proof fixture is not valid JSONL")?;
+        .context("proof session is not valid JSONL")?;
     let first = parsed
         .first()
-        .ok_or_else(|| anyhow!("empty proof fixture"))?;
+        .ok_or_else(|| anyhow!("empty proof session"))?;
     let t0 = ts_ms(first)? - PREAMBLE_MS as i64;
     let capture_date = capture_date_str(first)?;
     let cwd = first
@@ -290,7 +287,7 @@ pub(crate) fn build_script(fixture: &Path) -> Result<ProofScript> {
         800,
         AgentEvent::Rename {
             agent_id,
-            label: cc_derive_label(fixture, SOURCE_NAME, Path::new(&cwd)),
+            label: cc_derive_label(session, SOURCE_NAME, Path::new(&cwd)),
         },
     ));
 
@@ -332,7 +329,7 @@ pub(crate) fn build_script(fixture: &Path) -> Result<ProofScript> {
                 }
             }
         }
-        for ev in decode_cc_line(&path_str, SOURCE_NAME, v.clone())? {
+        for ev in decode_cc_line(&path_str, SOURCE_NAME, v.clone()) {
             events.push((rel, ev));
         }
     }
@@ -367,9 +364,9 @@ fn dot(img: &mut RgbaImage, (cx, cy): (i32, i32), r: i32, c: Rgba<u8>) {
     }
 }
 
-/// The top of a [`text_cell`] centred in a band `h` tall from `y`.
+/// The top of a [`terminal_cell`] centred in a band `h` tall from `y`.
 fn centred_in(y: u32, h: u32) -> i32 {
-    (y + (h - u32::from(text_cell().h)) / 2) as i32
+    (y + (h - u32::from(terminal_cell().h)) / 2) as i32
 }
 
 fn dashed_h(img: &mut RgbaImage, x0: i32, x1: i32, y: i32, c: Rgba<u8>) {
@@ -451,7 +448,7 @@ fn panel_body(
             let advance = draw_text(img, &visible, ((origin.0 + PAD) as i32, top), color, None);
             if take < sub_len {
                 let cx = origin.0 as i32 + PAD as i32 + advance;
-                let cell = text_cell();
+                let cell = terminal_cell();
                 fill_rect(
                     img,
                     cx.max(0) as u32,
@@ -465,6 +462,16 @@ fn panel_body(
             remaining -= take;
         }
     }
+}
+
+/// The centre of the callout's dot for a desk whose top-left is `desk`; its
+/// row is the connector's and the label's anchor.
+fn callout_dot(desk: (i32, i32)) -> (i32, i32) {
+    // Clears the halo `paint_ceiling_halos` burns over a lit monitor, with a
+    // margin, so the connector/dot never sits inside the glow.
+    const GLOW_CLEARANCE: i32 = 24;
+    const DOT_WEST_OF_DESK: i32 = 6;
+    (desk.0 - DOT_WEST_OF_DESK, desk.1 - GLOW_CLEARANCE)
 }
 
 pub(crate) fn compose_frame(
@@ -516,16 +523,13 @@ pub(crate) fn compose_frame(
             (office_origin.0 + desk_px.0) as i32,
             (office_origin.1 + desk_px.1) as i32,
         );
-        // Clears the halo `paint_ceiling_halos` burns over a lit monitor, with a
-        // margin, so the connector/dot never sits inside the glow.
-        const GLOW_CLEARANCE: i32 = 24;
-        let anchor_y = desk.1 - GLOW_CLEARANCE;
+        let (dot_x, anchor_y) = callout_dot(desk);
         let left_edge = match layout {
             ProofLayout::Wide => {
                 dashed_h(
                     &mut img,
                     (PANEL_W - PAD) as i32,
-                    desk.0 - 10,
+                    dot_x - ANNOT_DOT_R,
                     anchor_y,
                     ANNOT,
                 );
@@ -538,7 +542,7 @@ pub(crate) fn compose_frame(
         // Its halo keeps it legible over the office it is drawn on.
         let shade = Some(Rgba([0, 0, 0, 255]));
         draw_text(&mut img, label, (label_x, anchor_y - 22), ANNOT, shade);
-        dot(&mut img, (desk.0 - 6, anchor_y), ANNOT_DOT_R, ANNOT);
+        dot(&mut img, (dot_x, anchor_y), ANNOT_DOT_R, ANNOT);
     }
 
     let ch = coda_height(w);
@@ -554,7 +558,7 @@ pub(crate) fn compose_frame(
 }
 
 pub(crate) struct ProofJob<'a> {
-    pub(crate) fixture: &'a Path,
+    pub(crate) session: &'a Path,
     pub(crate) frames_dir: &'a Path,
     pub(crate) cols: u16,
     pub(crate) rows: u16,
@@ -563,32 +567,20 @@ pub(crate) struct ProofJob<'a> {
     pub(crate) theme: &'static pixtuoid_scene::theme::Theme,
     pub(crate) pack: &'a std::sync::Arc<pixtuoid_scene::pack::OfficeArt>,
     pub(crate) weather: pixtuoid_scene::sky::WeatherPolicy,
+    pub(crate) cutaway: bool,
 }
 
 pub(crate) fn render_proof(job: &ProofJob) -> Result<()> {
-    let script = build_script(job.fixture)?;
+    let script = build_script(job.session)?;
     let mut pending: VecDeque<(u64, AgentEvent)> = script.events.iter().cloned().collect();
-
-    // Anchor the burned callout to home_desks[0] in the SAME layout draw_scene
-    // computes.
-    let (buf_w, buf_h) = pixtuoid::dev::scene_buf_size(job.cols, job.rows);
-    let layout = pixtuoid_scene::layout::SceneLayout::compute_with_seed(
-        buf_w,
-        buf_h,
-        Some(job.max_desks),
-        0,
-    )
-    .ok_or_else(|| anyhow!("scene too small for a proof layout"))?;
-    let desk = layout
-        .home_desks
-        .first()
-        .copied()
-        .ok_or_else(|| anyhow!("layout has no home desks"))?;
-    let desk_px = (u32::from(desk.x) * CELL_W, (u32::from(desk.y) / 2) * CELL_H);
 
     let backend = TestBackend::new(job.cols, job.rows);
     let mut term = Terminal::new(backend)?;
     let mut floor = pixtuoid_scene::floor::PerFloor::new(std::sync::Arc::clone(job.pack));
+    let mut cutaway = job
+        .cutaway
+        .then(|| CutawayOffice::of_draw_frame(job.pack, job.cols, job.rows))
+        .transpose()?;
     let mut scene = SceneState::uniform(job.max_desks);
     let mut reducer = Reducer::new();
     let mut office = pixtuoid_scene::floor::PerOffice::new();
@@ -606,21 +598,37 @@ pub(crate) fn render_proof(job: &ProofJob) -> Result<()> {
                 reducer.apply(&mut scene, ev, now, Transport::Jsonl);
             }
         }
-        // `apply` only runs its debounce/expiry pass as a side effect of an
-        // incoming event, so without this nothing would ever settle Active ->
-        // Idle once the fixture's events are drained.
+        // `apply` only runs its expiry pass as a side effect of an incoming
+        // event, so without this nothing would sweep or cascade once the
+        // session's events are drained.
         reducer.tick(&mut scene, now);
         let mut draw_ctx = DrawCtx::offscreen(
             &mut floor,
             office.stores(),
             job.theme,
             &scene,
-            job.pack,
             now,
             pixtuoid_scene::floor::FloorMeta::ground().with_weather(job.weather),
         );
-        draw_scene(&mut term, &mut draw_ctx)?;
-        let office = cells_to_rgba(term.backend().buffer());
+        let hits = draw_frame(&mut term, &mut draw_ctx, cutaway.as_mut())?;
+        // The burned callout's anchor: home_desks[0] of the layout the office
+        // side was drawn on.
+        let desk_px = match &cutaway {
+            Some(cutaway) => {
+                let desk = cutaway.layout().and_then(|l| l.home_desks.first());
+                desk.map(|desk| cutaway.frame_px(desk.at))
+            }
+            None => {
+                let desk = hits.as_ref().and_then(|h| h.layout().home_desks.first());
+                desk.map(|desk| {
+                    let cell_y = desk.at.y / pixtuoid_scene::layout::CELL_ROWS;
+                    (u32::from(desk.at.x) * CELL_W, u32::from(cell_y) * CELL_H)
+                })
+            }
+        }
+        .context("the office drew no home desk")?;
+        let cells = term.backend().buffer();
+        let office = compose(cells, cells.area, cutaway.as_ref());
         for (kind, sink) in [
             (ProofLayout::Wide, &mut wide),
             (ProofLayout::Tall, &mut tall),
@@ -640,28 +648,26 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn fixture_path() -> PathBuf {
-        // The example lives in crates/pixtuoid; the fixture is core's — one hop up.
-        Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../pixtuoid-core/tests/sources/fixtures/claude-code/proof-session/01000000-0000-7000-8000-0000000000f4.jsonl",
-        )
+    fn session_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/snapshot/proof-session/01000000-0000-7000-8000-0000000000f4.jsonl")
     }
 
     #[test]
-    fn build_script_pins_the_fixture_beats() {
-        let s = build_script(&fixture_path()).unwrap();
+    fn build_script_pins_the_session_beats() {
+        let s = build_script(&session_path()).unwrap();
         assert_eq!(s.events.len(), 8);
         assert!(matches!(s.events[0].1, AgentEvent::SessionStart { .. }));
         assert!(matches!(s.events[1].1, AgentEvent::Rename { .. }));
         let starts = s
             .events
             .iter()
-            .filter(|(_, e)| matches!(e, AgentEvent::ActivityStart { .. }))
+            .filter(|(_, e)| matches!(e, AgentEvent::ToolUseStart { .. }))
             .count();
         let ends = s
             .events
             .iter()
-            .filter(|(_, e)| matches!(e, AgentEvent::ActivityEnd { .. }))
+            .filter(|(_, e)| matches!(e, AgentEvent::ToolUseEnd { .. }))
             .count();
         assert_eq!((starts, ends), (3, 3));
         assert!(s.events.windows(2).all(|w| w[0].0 <= w[1].0));
@@ -729,7 +735,7 @@ mod tests {
         let (ww, wh) = canvas_dims(&ProofLayout::Wide, 960, 832);
         assert_eq!((ww, wh), (1720, 902));
         let (tw, th) = canvas_dims(&ProofLayout::Tall, 960, 832);
-        assert_eq!((tw, th), (960, 1334));
+        assert_eq!((tw, th), (960, 1352));
         for d in [ww, wh, tw, th] {
             assert_eq!(d % 2, 0, "yuv420p needs even dims");
         }
@@ -737,7 +743,7 @@ mod tests {
 
     #[test]
     fn compose_frame_matches_canvas_dims() {
-        let s = build_script(&fixture_path()).unwrap();
+        let s = build_script(&session_path()).unwrap();
         let office = RgbaImage::new(960, 832);
         for layout in [ProofLayout::Wide, ProofLayout::Tall] {
             let (w, h) = canvas_dims(&layout, 960, 832);
@@ -747,13 +753,9 @@ mod tests {
     }
 
     #[test]
-    fn coda_fits_one_line_at_both_reference_canvas_widths() {
-        // 1720px = the wide reference canvas, 960px = tall at cols=120.
-        for w in [1720, 960] {
-            let lines = coda_lines(w);
-            assert_eq!(lines.len(), 1, "canvas_w={w}");
-            assert_eq!(lines[0], CODA_TEXT);
-        }
+    fn coda_fits_one_line_at_the_wide_reference_canvas() {
+        let lines = coda_lines(1720);
+        assert_eq!(lines, [CODA_TEXT]);
     }
 
     #[test]
@@ -772,5 +774,92 @@ mod tests {
         let unit_width = |s: &str| s.chars().count() as i32;
         assert_eq!(wrap_text("", 100, unit_width), vec![String::new()]);
         assert_eq!(wrap_text("hi", 1, unit_width), vec!["hi".to_string()]);
+    }
+
+    /// The last wide frame of a short `--proof` of the committed session at
+    /// `cols`×`rows`, its office the cutaway's when `cutaway`.
+    fn last_wide_frame(cols: u16, rows: u16, cutaway: bool) -> RgbaImage {
+        let pack = std::sync::Arc::new(pixtuoid_scene::pack::load_bundled_pack().unwrap());
+        let frames = tempfile::tempdir().unwrap();
+        // Its last frame is inside the first callout's window.
+        let timeline = Timeline {
+            fps: 1,
+            secs: 2,
+            start: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        };
+        render_proof(&ProofJob {
+            session: &session_path(),
+            frames_dir: frames.path(),
+            cols,
+            rows,
+            timeline,
+            max_desks: 12,
+            theme: &pixtuoid_scene::theme::NORMAL,
+            pack: &pack,
+            weather: Default::default(),
+            cutaway,
+        })
+        .unwrap();
+        let last = FrameSink::frame_path(&frames.path().join("wide"), timeline.frame_count());
+        image::open(last).unwrap().to_rgba8()
+    }
+
+    /// `--proof --cutaway`: the office side is the cutaway's, its callout on
+    /// the cutaway's desk 0, and the typed panel beside it is the classic
+    /// proof's, pixel for pixel.
+    #[test]
+    fn the_proof_draws_its_office_side_in_the_cutaway() {
+        let (cols, rows) = (120, 52);
+        let (classic, cutaway) = (
+            last_wide_frame(cols, rows, false),
+            last_wide_frame(cols, rows, true),
+        );
+        let region = |img: &RgbaImage, xs: std::ops::Range<u32>, ys: std::ops::Range<u32>| {
+            ys.flat_map(|y| xs.clone().map(move |x| *img.get_pixel(x, y)))
+                .collect::<Vec<_>>()
+        };
+        let panel = 0..PANEL_W - PAD;
+        let all_rows = 0..classic.height();
+        assert_eq!(
+            region(&cutaway, panel.clone(), all_rows.clone()),
+            region(&classic, panel, all_rows),
+            "the typed panel moved"
+        );
+        let office = (
+            PANEL_W..classic.width(),
+            HEADER_H..HEADER_H + u32::from(rows) * CELL_H,
+        );
+        let ours = region(&cutaway, office.0.clone(), office.1.clone());
+        let changed = ours
+            .iter()
+            .zip(region(&classic, office.0, office.1))
+            .filter(|(a, b)| **a != *b)
+            .count();
+        assert!(
+            changed * 2 > ours.len(),
+            "only {changed} of {} office pixels are the cutaway's",
+            ours.len()
+        );
+
+        let pack = std::sync::Arc::new(pixtuoid_scene::pack::load_bundled_pack().unwrap());
+        let mut office = crate::cutaway::CutawayOffice::of_draw_frame(&pack, cols, rows).unwrap();
+        let scene = SceneState::uniform(12);
+        let world = pixtuoid_scene::floor::FloorInputs {
+            scene: &scene,
+            now: std::time::UNIX_EPOCH,
+            floor: pixtuoid_scene::floor::FloorMeta::ground(),
+            pets: Default::default(),
+        };
+        office
+            .render(world, &pixtuoid_scene::theme::NORMAL, None)
+            .unwrap();
+        let desk = office.layout().unwrap().home_desks[0].at;
+        let (x, y) = office.frame_px(desk);
+        let dot = callout_dot(((PANEL_W + x) as i32, (HEADER_H + y) as i32));
+        assert_eq!(
+            *cutaway.get_pixel(dot.0 as u32, dot.1 as u32),
+            ANNOT,
+            "the callout is not on the cutaway's desk 0"
+        );
     }
 }

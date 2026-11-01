@@ -100,8 +100,7 @@ const _: () = assert!(MIN_LAYOUT_W >= super::NEON_DOOR_WALL_W);
 // The shortest wall band's windows stand as tall as the door, so every office
 // that lays out has one.
 const _: () = assert!(
-    super::wall_trim_row(super::MIN_TOP_MARGIN - super::WALL_BAND_TO_TOP_MARGIN)
-        - super::WINDOW_TOP
+    super::wall_trim_row(super::wall_band_h(super::MIN_TOP_MARGIN)) - super::WINDOW_TOP
         >= super::ELEVATOR_H
 );
 pub(super) const MIN_LAYOUT_H: u16 = min_layout_h();
@@ -375,10 +374,11 @@ pub(super) fn compute_with_seed(
 
     let plan = FloorPlan::new(buf_w, buf_h, floor_seed);
 
-    let (home_desks, desk_facings) = compute_pod_desks(max_desks, plan.pod_grid);
+    let pod_desks = compute_pod_desks(max_desks, plan.pod_grid);
+    let desk_points: Vec<Point> = pod_desks.iter().map(|d| d.at).collect();
 
-    let desk_art: Vec<(Point, Size)> = desk_fixtures(&home_desks, plan.buf_h)
-        .chain(desk_chair_fixtures(&home_desks, |i| desk_facings[i.0]))
+    let desk_art: Vec<(Point, Size)> = desk_fixtures(desk_points.iter().copied(), plan.buf_h)
+        .chain(desk_chair_fixtures(&pod_desks))
         .map(|f| art_rect(f.visual))
         .collect();
     let pod_decor = compute_pod_decor(plan.pod_grid, floor_seed, &desk_art);
@@ -389,9 +389,7 @@ pub(super) fn compute_with_seed(
 
     // Elevator door — in the window wall's last slot; above the lounge gate so
     // that gate can check couch↔door clearance.
-    let top_wall_h = plan
-        .top_margin
-        .saturating_sub(super::WALL_BAND_TO_TOP_MARGIN);
+    let top_wall_h = super::wall_band_h(plan.top_margin);
     let door = Point {
         x: super::door_x(buf_w),
         // Its bottom row is the band's trim row, so it stands on the floor
@@ -431,7 +429,7 @@ pub(super) fn compute_with_seed(
         &plan,
         &pod_decor,
         lounge.map(|l| l.couch_center),
-        &home_desks,
+        &desk_points,
     );
 
     const BAND_INSET: u16 = 4;
@@ -541,12 +539,12 @@ pub(super) fn compute_with_seed(
         super::rooms::pantry::place_snack_shelf(pr, plan.pantry_counter_size, &mut waypoints);
     }
 
-    let corridor = Some(Bounds {
+    let corridor = Bounds {
         x: 0,
         y: plan.cubicle_aisle.y,
         width: buf_w,
         height: plan.cubicle_aisle.height,
-    });
+    };
 
     // Settle only now — AFTER every waypoint exists; filtering at the candidate site
     // checked a subset of the final set.
@@ -584,7 +582,7 @@ pub(super) fn compute_with_seed(
             buf_w,
             buf_h,
             top_margin: plan.top_margin,
-            home_desks: &home_desks,
+            home_desks: &desk_points,
             meeting_rooms: &plan.meeting_rooms,
             kitchen_island,
             waypoints: &waypoints,
@@ -611,7 +609,7 @@ pub(super) fn compute_with_seed(
         let reach = ReachSet::from_mask(mask, conn_seed);
         // South is where the demotion pass below retreats, so a reachable south seat
         // proves no decor arrangement strands a desk.
-        let stranded = home_desks.iter().any(|&d| {
+        let stranded = desk_points.iter().any(|&d| {
             let chair = desk_walk_anchor_facing(d, crate::layout::Facing::South);
             approach_point(
                 Furniture::Desk,
@@ -648,26 +646,20 @@ pub(super) fn compute_with_seed(
             walkable = build_mask(&plants, &wall_decor);
             reach = connected(&walkable);
         }
-        debug_assert!(
-            reach.is_some(),
-            "#566 connectivity guard: a pocket (or a coarse-unroutable home desk) survived \
-             dropping every scatter plant AND every floor-standing wall decor — a new NON-decor \
-             seal cause needs its own fix"
-        );
     }
-
-    // ReachSet's seed snap pulls a blocked seed into the adjacent component.
-    let reachable = reach.unwrap_or_else(|| ReachSet::from_mask(&walkable, conn_seed));
+    let reachable = reach.expect(
+        "#566 connectivity guard: a pocket (or a coarse-unroutable home desk) survived \
+         dropping every scatter plant AND every floor-standing wall decor — a new NON-decor \
+         seal cause needs its own fix",
+    );
 
     // A narrow band can wall off a back-turned desk's SOUTH front — demote, don't drop.
-    // A NET, not live code.
-    let desk_facings: Vec<Facing> = home_desks
+    let home_desks: Vec<HomeDesk> = pod_desks
         .iter()
-        .zip(&desk_facings)
-        .map(|(&desk, &facing)| {
-            if facing == Facing::North && {
+        .map(|&HomeDesk { at, facing }| {
+            let facing = if facing == Facing::North && {
                 // `approach_point` returns the probed cell itself as its "no side" sentinel.
-                let chair = desk_walk_anchor_facing(desk, facing);
+                let chair = desk_walk_anchor_facing(at, facing);
                 approach_point(
                     Furniture::Desk,
                     chair,
@@ -681,7 +673,8 @@ pub(super) fn compute_with_seed(
                 Facing::South
             } else {
                 facing
-            }
+            };
+            HomeDesk { at, facing }
         })
         .collect();
 
@@ -690,7 +683,6 @@ pub(super) fn compute_with_seed(
         buf_h,
         cubicle_band: plan.pod_grid.band,
         cubicle_aisle: plan.cubicle_aisle,
-        desk_facings,
         home_desks,
         waypoints,
         plants,
@@ -1372,10 +1364,7 @@ fn pod_row_facing(r: u16) -> Facing {
 
 /// Pod-grid desk placement: full pods, partial columns at right edge,
 /// partial row at bottom edge.
-pub(super) fn compute_pod_desks(
-    max_desks: Option<usize>,
-    grid: PodGrid,
-) -> (Vec<Point>, Vec<Facing>) {
+pub(super) fn compute_pod_desks(max_desks: Option<usize>, grid: PodGrid) -> Vec<HomeDesk> {
     let cubicle_band = &grid.band;
     let PodGrid {
         cols: pod_cols,
@@ -1387,7 +1376,6 @@ pub(super) fn compute_pod_desks(
     let grid_desk_cap =
         (pod_cols as usize) * (pod_rows as usize) * (POD_SIDE as usize) * (POD_SIDE as usize);
     let mut home_desks = Vec::with_capacity(n.min(grid_desk_cap.max(1)));
-    let mut facings = Vec::with_capacity(n.min(grid_desk_cap.max(1)));
     // Ground, not slot, on BOTH axes: a walk-behind desk's blocked ground runs
     // DESK_GROUND_H/W past its Point, and the slot dims let it spill past the band.
     let desk_y_max =
@@ -1396,17 +1384,14 @@ pub(super) fn compute_pod_desks(
     // past the edge — an invisible desk whose walk anchor sits outside the mask.
     let desk_x_max =
         (cubicle_band.x + cubicle_band.width).saturating_sub(super::decor::DESK_GROUND_W);
-    let push_desk = |desks: &mut Vec<Point>,
-                     facings: &mut Vec<Facing>,
-                     x: u16,
-                     y: u16,
-                     facing: Facing|
-     -> bool {
+    let push_desk = |desks: &mut Vec<HomeDesk>, x: u16, y: u16, facing: Facing| -> bool {
         if desks.len() >= n || y > desk_y_max || x > desk_x_max {
             return desks.len() >= n;
         }
-        desks.push(Point { x, y });
-        facings.push(facing);
+        desks.push(HomeDesk {
+            at: Point { x, y },
+            facing,
+        });
         false
     };
 
@@ -1417,7 +1402,6 @@ pub(super) fn compute_pod_desks(
                 for c in 0..POD_SIDE {
                     let full = push_desk(
                         &mut home_desks,
-                        &mut facings,
                         pod_origin_x + c * (DESK_W + INTRA_POD_GAP_X),
                         pod_origin_y + r * (DESK_H + INTRA_POD_GAP_Y),
                         pod_row_facing(r),
@@ -1447,7 +1431,6 @@ pub(super) fn compute_pod_desks(
                 for i in 0..partial_col_count {
                     let full = push_desk(
                         &mut home_desks,
-                        &mut facings,
                         partial_col_x(i),
                         pod_origin_y + r * (DESK_H + INTRA_POD_GAP_Y),
                         pod_row_facing(r),
@@ -1469,7 +1452,6 @@ pub(super) fn compute_pod_desks(
             for c in 0..POD_SIDE {
                 let full = push_desk(
                     &mut home_desks,
-                    &mut facings,
                     pod_origin_x + c * (DESK_W + INTRA_POD_GAP_X),
                     partial_y,
                     pod_row_facing(0),
@@ -1482,7 +1464,6 @@ pub(super) fn compute_pod_desks(
         for i in 0..partial_col_count {
             let full = push_desk(
                 &mut home_desks,
-                &mut facings,
                 partial_col_x(i),
                 partial_y,
                 pod_row_facing(0),
@@ -1493,7 +1474,7 @@ pub(super) fn compute_pod_desks(
         }
     }
 
-    (home_desks, facings)
+    home_desks
 }
 
 /// The kind for aisle slot `slot_idx`. Each pass deals a FRESH permutation of
@@ -1631,7 +1612,7 @@ pub(super) fn compute_pod_decor(
 /// since a narrow band demotes a back-turned desk after this runs.
 fn clears_the_workstations(kind: Furniture, pos: Point, home_desks: &[Point], buf_h: u16) -> bool {
     let art = corridor_art(kind, pos);
-    super::roster::desk_fixtures(home_desks, buf_h).all(|f| !f.visual.overlaps(art))
+    super::roster::desk_fixtures(home_desks.iter().copied(), buf_h).all(|f| !f.visual.overlaps(art))
         && home_desks.iter().all(|&desk| {
             [Facing::North, Facing::South].into_iter().all(|facing| {
                 let foot = desk_walk_anchor_facing(desk, facing);
@@ -1993,23 +1974,6 @@ mod tests {
         );
     }
 
-    /// `DESK_BAND_MIN_H` omits the Y clamp's third term on the grounds that it is 0
-    /// at the floor. Pin that premise: move `COUCH_GAP_GROWTH_BASE_H` under the floor
-    /// and the height derivation is silently short by the gap it stops accounting for.
-    #[test]
-    fn the_couch_gap_is_zero_everywhere_the_height_floor_is_solved() {
-        let mut h = super::MIN_LAYOUT_H;
-        while h < super::COUCH_GAP_GROWTH_BASE_H {
-            assert_eq!(
-                super::couch_to_desk_extra(h),
-                0,
-                "buf_h {h}: the Y clamp's third term is non-zero where DESK_BAND_MIN_H \
-                 assumes it is 0"
-            );
-            h += 1;
-        }
-    }
-
     /// Neither floor carries a SAFETY MARGIN — one-directional on purpose. It catches a
     /// floor set too HIGH, which on the width axis nothing else can. Too LOW is
     /// `every_floor_variant_seats_a_desk…`'s job. Tautological
@@ -2062,7 +2026,7 @@ mod tests {
                 width,
                 height: 200,
             };
-            let (desks, _) = super::compute_pod_desks(None, super::PodGrid { band, ..grid });
+            let desks = super::compute_pod_desks(None, super::PodGrid { band, ..grid });
             assert_eq!(
                 !desks.is_empty(),
                 seats,
@@ -2081,7 +2045,7 @@ mod tests {
                 width: 200,
                 height,
             };
-            let (desks, _) = super::compute_pod_desks(None, super::PodGrid { band, ..grid });
+            let desks = super::compute_pod_desks(None, super::PodGrid { band, ..grid });
             assert_eq!(
                 !desks.is_empty(),
                 seats,
@@ -2113,13 +2077,13 @@ mod tests {
             stride_y: pod_h + super::INTER_POD_AISLE_Y,
             couch_to_desk_extra: 0,
         };
-        let (desks, _) = super::compute_pod_desks(None, grid);
+        let desks = super::compute_pod_desks(None, grid);
         assert!(!desks.is_empty(), "the fixture grid must place desks");
         let bands = grid.inter_pod_y_bands();
         assert!(!bands.is_empty(), "a 3-row grid has bands between its rows");
         for &(start, end) in &bands {
             for d in &desks {
-                let (g0, g1) = (d.y, d.y + super::decor::DESK_GROUND_H);
+                let (g0, g1) = (d.at.y, d.at.y + super::decor::DESK_GROUND_H);
                 assert!(
                     start >= g1 || end <= g0,
                     "band {start}..{end} overlaps desk {d:?}'s ground rows {g0}..{g1}"

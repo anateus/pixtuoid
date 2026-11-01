@@ -10,19 +10,22 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::dropped::{self, Unjudged};
 use super::{
     LIFECYCLE_RECORD, MANIFEST, Manifest, Profile, SCENE_LOG, STEPS, Scenario, Shape, StepRecord,
-    Surface, literals, profile, tui,
+    Surface, TURN_BUDGET, literals, profile, tui,
 };
 use crate::harness::captures::{json_lines, jsonl_files_under};
-use crate::harness::provenance::{Dropped, Provenance};
+use crate::harness::provenance::Dropped;
 use crate::harness::reads::{
     blank_of, child_pointer, embedded_json, is_hook_envelope, is_shim_stamp, string_leaves,
 };
-use crate::harness::{Drive, Driven, HOOK_PAYLOADS, Reach, captures};
+use crate::harness::{
+    CaptureRecord, Drive, Driven, HOOK_PAYLOADS, ProcessExit, Reach, captures, read_json,
+};
 use crate::source::registry::ChildEndInference;
 use crate::{AgentEvent, AgentId};
 
@@ -30,7 +33,7 @@ use crate::{AgentEvent, AgentId};
 const BREADCRUMB_TARGET: &str = crate::source::drift::TARGET;
 
 /// A verdict's outcome, ordered by severity: a verdict is its worst finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Label {
     /// Every check held.
     Pass,
@@ -113,16 +116,16 @@ fn invalid(message: String) -> std::io::Error {
 ///
 /// # Errors
 ///
-/// If the manifest or a capture file cannot be read, or the manifest names no
-/// profiled scenario.
+/// If the manifest, a capture file or the scene log cannot be read, or the
+/// manifest names no profiled scenario.
 pub fn verify(dir: &Path) -> std::io::Result<Verdict> {
-    let manifest: Manifest = serde_json::from_str(&std::fs::read_to_string(dir.join(MANIFEST))?)?;
+    let manifest: Manifest = read_json(&dir.join(MANIFEST))?;
     let p = profile(&manifest.source)
         .ok_or_else(|| invalid(format!("{}: not a profiled source", manifest.source)))?;
     let scenario = p
         .scenario(&manifest.scenario)
         .ok_or_else(|| invalid(format!("{}: no scenario {}", p.source, manifest.scenario)))?;
-    let scene = std::fs::read_to_string(dir.join(SCENE_LOG)).unwrap_or_default();
+    let scene = std::fs::read_to_string(dir.join(SCENE_LOG))?;
     let mut findings = Vec::new();
     let unjudged = judge(p, scenario, &manifest, dir, &scene, &mut findings)?;
     let verdict = Verdict::new(findings);
@@ -140,8 +143,7 @@ pub fn verify(dir: &Path) -> std::io::Result<Verdict> {
 ///
 /// If its record is missing, a present file can't be read, or its scenario is unprofiled.
 pub fn verify_lifecycle(dir: &Path) -> std::io::Result<Verdict> {
-    let records: Vec<StepRecord> =
-        serde_json::from_str(&std::fs::read_to_string(dir.join(LIFECYCLE_RECORD))?)?;
+    let records: Vec<StepRecord> = read_json(&dir.join(LIFECYCLE_RECORD))?;
     let mut findings = Vec::new();
     for (i, want) in STEPS.iter().enumerate() {
         let n = i + 1;
@@ -174,8 +176,8 @@ pub fn verify_lifecycle(dir: &Path) -> std::io::Result<Verdict> {
             ));
         }
     }
-    let manifest: Manifest = match std::fs::read_to_string(dir.join(MANIFEST)) {
-        Ok(text) => serde_json::from_str(&text)?,
+    let manifest: Manifest = match read_json(&dir.join(MANIFEST)) {
+        Ok(manifest) => manifest,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             findings.push((
                 Label::Blocked,
@@ -185,24 +187,32 @@ pub fn verify_lifecycle(dir: &Path) -> std::io::Result<Verdict> {
         }
         Err(e) => return Err(e),
     };
-    let shape = profile(&manifest.source)
+    let scenario = profile(&manifest.source)
         .and_then(|p| p.scenario(&manifest.scenario))
         .ok_or_else(|| {
             invalid(format!(
                 "{}: no scenario {}",
                 manifest.source, manifest.scenario
             ))
-        })?
-        .shape;
+        })?;
+    // A budget's kill or an incomplete capture says nothing of the uninstall.
+    if manifest.capture.killed_turn().is_some() {
+        findings.push((Label::Blocked, uncompleted_turn(&manifest, scenario)));
+        return Ok(Verdict::new(findings));
+    }
+    if let Some(finding) = incomplete_capture(&manifest.capture) {
+        findings.push(finding);
+        return Ok(Verdict::new(findings));
+    }
     // The scenario's own turn just completed in this sandbox, so one that
     // cannot now is the uninstall's doing; with no turn, no hook proves nothing.
-    if !completed_turn(&manifest, shape, &mut findings) {
+    if !completed_turn(&manifest, scenario.shape, &mut findings) {
         findings.push((
             Label::Fail,
             format!(
-                "the turn after the last uninstall did not complete (exit {:?}, {} model \
+                "the turn after the last uninstall did not complete ({}, {} model \
                  requests): the uninstall left the CLI unable to run",
-                manifest.capture.exit_code, manifest.requests
+                manifest.capture.end, manifest.requests
             ),
         ));
         return Ok(Verdict::new(findings));
@@ -242,8 +252,7 @@ pub fn verify_source(p: &Profile, dirs: &[PathBuf]) -> std::io::Result<Verdict> 
     let mut kept = Fields::default();
     let mut ran = Vec::new();
     for dir in dirs {
-        let manifest: Manifest =
-            serde_json::from_str(&std::fs::read_to_string(dir.join(MANIFEST))?)?;
+        let manifest: Manifest = read_json(&dir.join(MANIFEST))?;
         ran.extend(p.scenarios.iter().filter(|s| s.name == manifest.scenario));
         for file in jsonl_files_under(dir) {
             let mut lines = json_lines(&file)?;
@@ -480,15 +489,11 @@ const HOOK: &str = "hook:";
 /// recording is `reads::strip_unread`'s fixed point, so its non-blank leaves
 /// are the read fields it recorded with a value, the shim's stamps aside; one
 /// read but recorded blank is not seen.
-/// A capture the strip skips proves nothing about reads.
 pub(crate) fn committed_reads(p: &Profile) -> std::io::Result<Fields> {
     let corpus = crate::harness::sources_root();
     let mut reads = Fields::default();
     for capture in captures(&corpus) {
         if capture.source != p.source {
-            continue;
-        }
-        if !Provenance::read(&capture.provenance_path())?.strips() {
             continue;
         }
         for file in capture.jsonl_files() {
@@ -575,7 +580,7 @@ pub(crate) fn scenario_reads<'a>(
 ) -> std::io::Result<Fields> {
     let mut reads = Fields::default();
     for s in scenarios {
-        for file in jsonl_files_under(&crate::harness::sources_root().join(s.fixture)) {
+        for file in jsonl_files_under(&crate::harness::sources_root().join(s.fixture(p.source))) {
             for line in json_lines(&file)? {
                 reads.add(p, &file, &line, false);
             }
@@ -600,6 +605,43 @@ fn completed_turn(manifest: &Manifest, shape: Shape, findings: &mut Vec<(Label, 
     manifest.capture.exited_as_scripted(shape) && (manifest.requests > 0 || !shape.asks_the_model())
 }
 
+/// Why `capture` is no whole capture, when its recorder said so.
+fn incomplete_capture(capture: &CaptureRecord) -> Option<(Label, String)> {
+    capture
+        .incomplete
+        .as_ref()
+        .map(|why| (Label::Blocked, format!("the capture is incomplete: {why}")))
+}
+
+/// Why `manifest`'s turn did not complete, in its driver's words when it
+/// gave up on it.
+fn uncompleted_turn(manifest: &Manifest, scenario: &Scenario) -> String {
+    let capture = &manifest.capture;
+    let requests = manifest.requests;
+    if let Some(turn) = capture.killed_turn() {
+        return format!(
+            "the CLI's {turn} was killed: the {:?} budget ran out after {requests} model requests",
+            TURN_BUDGET.here()
+        );
+    }
+    let second = capture
+        .second_turn
+        .as_ref()
+        .map_or(String::new(), |r| format!(", second turn {}", r.end));
+    let end = capture.end;
+    match &capture.give_up_reason {
+        Some(why) => format!(
+            "the turn's driver gave up on it ({end}{second}, {requests} model requests): {why}"
+        ),
+        None if scenario.shape.asks_the_model() => format!(
+            "the CLI did not complete a turn against the scripted model ({end}{second}, \
+             {requests} model requests): it could not run, or its model calls went elsewhere \
+             through a home the sandbox did not redirect"
+        ),
+        None => format!("the CLI did not complete its turn ({end}{second}): it could not run"),
+    }
+}
+
 fn judge(
     p: &Profile,
     scenario: &Scenario,
@@ -610,46 +652,56 @@ fn judge(
 ) -> std::io::Result<Option<Unjudged>> {
     // Before the Blocked return: a CLI the script lost may then exit non-zero.
     let completed = completed_turn(manifest, scenario.shape, findings);
-    let unrefused = matches!(scenario.surface, Surface::Tui { .. })
-        && manifest.capture.exit_code == Some(tui::UNREFUSED);
-    if unrefused && manifest.requests > 0 && manifest.unmatched == 0 {
-        findings.push((
-            Label::Fail,
-            "the turn raised no gate the driver knows to refuse".into(),
-        ));
+    let unanswered = match scenario.surface {
+        Surface::Tui { .. } if manifest.capture.end == ProcessExit::Exited(tui::UNANSWERED) => {
+            scenario.answer().awaits()
+        }
+        Surface::Tui { .. } | Surface::Headless => None,
+    };
+    if let Some(awaited) = unanswered
+        && manifest.requests > 0
+        && manifest.unmatched == 0
+    {
+        findings.push((Label::Fail, format!("the turn never showed {awaited}")));
         return Ok(None);
     }
     // A CLI that never ran says nothing about pixtuoid, so nothing below is judged.
     if !completed {
-        let second = manifest
-            .capture
-            .second_turn
-            .as_ref()
-            .map_or(String::new(), |r| {
-                format!(", second turn exit {:?}", r.exit_code)
-            });
-        let exit = manifest.capture.exit_code;
-        let why = if scenario.shape.asks_the_model() {
-            format!(
-                "the CLI did not complete a turn against the scripted model (exit {exit:?}{second}, \
-                 {} model requests): it could not run, or its model calls went elsewhere \
-                 through a home the sandbox did not redirect",
-                manifest.requests
-            )
-        } else {
-            format!("the CLI did not complete its turn (exit {exit:?}{second}): it could not run")
-        };
-        findings.push((Label::Blocked, why));
+        findings.push((Label::Blocked, uncompleted_turn(manifest, scenario)));
         return Ok(None);
     }
-    // A second turn that never ran had no session the first turn's wire named,
-    // which is pixtuoid's to name; one that ran `completed_turn` held.
-    if scenario.turn.second.is_some() && manifest.capture.second_turn.is_none() {
+    if let Some(finding) = incomplete_capture(&manifest.capture) {
+        findings.push(finding);
+        return Ok(None);
+    }
+    // A headless second turn that never ran had no session the first turn's
+    // wire named, which is pixtuoid's to name; one that ran `completed_turn` held.
+    if scenario.headless_second().is_some() && manifest.capture.second_turn.is_none() {
         findings.push((
             Label::Fail,
             "the first turn's wire named no session for its second turn".into(),
         ));
         return Ok(None);
+    }
+    // A server the turns left up ends their sessions only when it dies, outside
+    // the run.
+    if let Some(words) = p.server_stop
+        && let Some(how) = match &manifest.capture.server_stop {
+            None => Some("never ran".to_owned()),
+            Some(stop) if stop.exit != ProcessExit::Exited(0) => Some(stop.exit.to_string()),
+            Some(stop) if !stop.outlived.is_empty() => {
+                Some(format!("left pid {:?} running", stop.outlived))
+            }
+            Some(_) => None,
+        }
+    {
+        findings.push((
+            Label::Fail,
+            format!(
+                "`{}` {how}: the CLI's server outlived the run",
+                words.join(" ")
+            ),
+        ));
     }
     if p.result_unseen && manifest.results_seen > 0 {
         findings.push((
@@ -678,7 +730,7 @@ fn judge(
     let mut events: Vec<AgentEvent> = Vec::new();
     let mut reaches: Vec<(AgentId, Reach)> = Vec::new();
     let mut absorb = |what: &str, d: Driven, findings: &mut Vec<(Label, String)>| {
-        for f in d.decode_errors.iter().chain(&d.panics) {
+        for f in &d.decode_errors {
             findings.push((Label::Fail, format!("{what}: {f}")));
         }
         if d.unparseable > 0 {
@@ -700,10 +752,10 @@ fn judge(
         let Some(drive) = Drive::transcript_at(p.source, &t) else {
             continue;
         };
-        let text = std::fs::read_to_string(&t)?;
+        let bytes = std::fs::read(&t)?;
         absorb(
             &t.display().to_string(),
-            drive.seeded().lines(text.lines()),
+            drive.seeded().body(&bytes),
             findings,
         );
     }
@@ -720,7 +772,7 @@ fn judge(
         return Ok(None);
     }
     let sessions = match scenario.shape {
-        Shape::ToolRun | Shape::Permission | Shape::ModelError => 1,
+        Shape::ToolRun | Shape::Permission | Shape::ModelError | Shape::Cancel => 1,
         Shape::Subagent | Shape::ChildError | Shape::Succession => 2,
     };
     started_in(
@@ -742,7 +794,7 @@ fn judge(
             p.descriptor().caps().child_end_inference,
             findings,
         ),
-        Shape::ModelError => model_error(&events, findings),
+        Shape::ModelError | Shape::Cancel => turn_ended(&events, findings),
         Shape::ChildError => child_error(
             &events,
             &reaches,
@@ -751,13 +803,22 @@ fn judge(
         ),
         Shape::Succession => succession(&events, findings),
     }
+    if p.descriptor().caps().brackets_turns {
+        bracketed(p, scenario, &events, &reached, findings);
+    }
     let shown = match scenario.shape {
-        Shape::ToolRun | Shape::Subagent | Shape::ChildError => "active",
-        Shape::Permission => "waiting",
-        Shape::ModelError | Shape::Succession => "idle",
+        // An item, not a bare open turn: the live pipeline delivered its start.
+        Shape::ToolRun | Shape::Subagent | Shape::ChildError => "running(",
+        Shape::Permission => "requires_action",
+        Shape::ModelError | Shape::Succession | Shape::Cancel => "idle",
     };
     judge_scene(p, scene, shown, findings);
-    new_types(p, dir, dropped::baseline_of(scenario)?.as_ref(), findings)
+    new_types(
+        p,
+        dir,
+        dropped::baseline_of(p, scenario)?.as_ref(),
+        findings,
+    )
 }
 
 /// Each type a run in `dir` left unread that `baseline`, its recording's,
@@ -860,7 +921,7 @@ fn started_in(
 
 fn tool_run(events: &[AgentEvent], reached: &[Reach], findings: &mut Vec<(Label, String)>) {
     let named = events.iter().any(|e| {
-        matches!(e, AgentEvent::ActivityStart { detail: Some(d), .. }
+        matches!(e, AgentEvent::ToolUseStart { detail: Some(d), .. }
             if !d.display().trim().is_empty() && d.display() != "?")
     });
     if !named {
@@ -869,13 +930,16 @@ fn tool_run(events: &[AgentEvent], reached: &[Reach], findings: &mut Vec<(Label,
             "no tool start decoded with a detail naming the tool".into(),
         ));
     }
-    if !reached.contains(&Reach::Active) {
-        findings.push((Label::Fail, "the slot never went Active".into()));
+    if !reached.contains(&Reach::Running) {
+        findings.push((Label::Fail, "the slot never went Running".into()));
     }
-    if !events
-        .iter()
-        .any(|e| matches!(e, AgentEvent::ActivityEnd { .. }))
-    {
+    // A turn's end settles a call whose own end never comes.
+    if !events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::ToolUseEnd { .. } | AgentEvent::TurnEnd { .. }
+        )
+    }) {
         findings.push((Label::Fail, "the tool never ended".into()));
     }
 }
@@ -889,8 +953,8 @@ fn permission(
     if !note_survived {
         findings.push((Label::Fail, "the note is gone".into()));
     }
-    if !reached.contains(&Reach::Waiting) {
-        findings.push((Label::Fail, "the slot never went Waiting".into()));
+    if !reached.contains(&Reach::RequiresAction) {
+        findings.push((Label::Fail, "the slot never went RequiresAction".into()));
     }
     // In any order: a hook payload's arrival order is its shim process's, not
     // the CLI's, so the wait, the decision and the result can land in any order.
@@ -898,21 +962,21 @@ fn permission(
         events.iter().filter_map(pick).collect()
     };
     let waited = calls(|e| match e {
-        AgentEvent::Waiting {
+        AgentEvent::UserActionRequest {
             tool_use_id: Some(t),
             ..
         } => Some(t),
         _ => None,
     });
     let ended_calls = calls(|e| match e {
-        AgentEvent::ActivityEnd {
+        AgentEvent::ToolUseEnd {
             tool_use_id: Some(t),
             ..
         } => Some(t),
         _ => None,
     });
     let started = calls(|e| match e {
-        AgentEvent::ActivityStart {
+        AgentEvent::ToolUseStart {
             tool_use_id: Some(t),
             ..
         } => Some(t),
@@ -924,13 +988,14 @@ fn permission(
         // No start carries a call id (reasonix): one End per Start (a
         // guardian's read before the wait) plus the turn's, counted not paired
         // (`internal/ext/hook/runner.go:154`, `:166` at v2.44.0).
-        // `a_permission_script_calls_no_tool_after_its_refusal` forbids a
+        // `a_permission_script_calls_no_tool_after_its_gated_call` forbids a
         // retry, and the note's survival proves the refused call never ran.
         let count = |is: fn(&AgentEvent) -> bool| events.iter().filter(|e| is(e)).count();
-        let starts = count(|e| matches!(e, AgentEvent::ActivityStart { .. }));
-        let ends = count(|e| matches!(e, AgentEvent::ActivityEnd { .. }));
+        let starts = count(|e| matches!(e, AgentEvent::ToolUseStart { .. }));
+        let ends = count(|e| matches!(e, AgentEvent::ToolUseEnd { .. }));
+        let turn_ends = count(|e| matches!(e, AgentEvent::TurnEnd { .. }));
         // An End naming a call no Start opened is not this branch's to count.
-        ended_calls.is_empty() && ends == starts + 1
+        ended_calls.is_empty() && ends == starts && turn_ends == 1
     } else {
         // Starts carry call ids (claude-code, whose `PermissionRequest` names
         // none): every started call ends.
@@ -944,20 +1009,64 @@ fn permission(
     }
 }
 
-/// The failed turn ends. Its script answers the turn only with an error
-/// (`a_model_error_script_errs_and_calls_no_tool`), so a run that reached the
-/// model failed.
-fn model_error(events: &[AgentEvent], findings: &mut Vec<(Label, String)>) {
-    if !events.iter().any(|e| {
-        matches!(
-            e,
-            AgentEvent::ActivityEnd {
-                tool_use_id: None,
-                ..
-            }
-        )
-    }) {
-        findings.push((Label::Fail, "the failed turn never ended".into()));
+/// A run of a source that brackets its turns: once a turn asks the model, the
+/// agent shows running with no item, and every turn the run opened ended.
+fn bracketed(
+    p: &Profile,
+    scenario: &Scenario,
+    events: &[AgentEvent],
+    reached: &[Reach],
+    findings: &mut Vec<(Label, String)>,
+) {
+    if scenario.shape.asks_the_model() && !reached.contains(&Reach::RunningNoItem) {
+        findings.push((
+            Label::Fail,
+            "the open turn never showed the agent running with no item".into(),
+        ));
+    }
+    let open = unclosed_turns(events);
+    if !open.is_empty() {
+        let by = p
+            .turn_exits
+            .iter()
+            .find(|e| e.scenario == scenario.name)
+            .map_or_else(String::new, |e| format!(" by its {e} exit"));
+        findings.push((
+            Label::Fail,
+            format!("the run ended{by} with turn(s) {open:?} open"),
+        ));
+    }
+}
+
+/// The turns `events` start that none of them ends, by agent and key.
+pub(crate) fn unclosed_turns(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnStart { agent_id, turn } => Some((agent_id, turn)),
+            _ => None,
+        })
+        .filter(|(agent, key)| {
+            !events.iter().any(|e| {
+                matches!(e, AgentEvent::TurnEnd { agent_id, turn: Some(k) }
+                    if agent_id == *agent && k == *key)
+            })
+        })
+        .map(|(agent, key)| format!("{agent:?} {key:?}"))
+        .collect()
+}
+
+/// The turn ends, which its script leaves only one way to: a model error's
+/// answers it with nothing but the error
+/// (`a_model_error_script_errs_and_calls_no_tool`), and a cancel's reply
+/// outlasts the run (`a_cancel_script_streams_its_reply_past_the_drivers_budget`),
+/// so its end is the cancel's.
+fn turn_ended(events: &[AgentEvent], findings: &mut Vec<(Label, String)>) {
+    if !events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::TurnEnd { .. }))
+    {
+        findings.push((Label::Fail, "the turn never ended".into()));
     }
 }
 
@@ -985,7 +1094,7 @@ fn delegated(
     let tasks: BTreeSet<(AgentId, &str)> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id,
                 tool_use_id: Some(t),
                 detail: Some(d),
@@ -1000,29 +1109,30 @@ fn delegated(
             false
         }
     };
-    // The reducer's untracked site (`apply_activity_end`): an id-less end while
-    // an id-less Task stands.
+    // The reducer's untracked site (`Reducer::end_item`): an end naming no call
+    // while an id-less Task stands.
     let mut standing = BTreeSet::new();
     let mut untracked_ends = BTreeSet::new();
     for e in events {
         match e {
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id,
                 tool_use_id: None,
                 detail: Some(d),
             } if d.is_task() => {
                 standing.insert(*agent_id);
             }
-            AgentEvent::ActivityStart { agent_id, .. } => {
+            AgentEvent::ToolUseStart { agent_id, .. } => {
                 standing.remove(agent_id);
             }
-            AgentEvent::ActivityEnd {
+            AgentEvent::ToolUseEnd {
                 agent_id,
-                tool_use_id,
-            } => {
-                if tool_use_id.is_none() && standing.remove(agent_id) {
-                    untracked_ends.insert(*agent_id);
-                }
+                tool_use_id: None,
+            }
+            | AgentEvent::TurnEnd { agent_id, .. } => {
+                untracked_ends.extend(standing.take(agent_id));
+            }
+            AgentEvent::ToolUseEnd { agent_id, .. } => {
                 standing.remove(agent_id);
             }
             _ => {}
@@ -1033,17 +1143,14 @@ fn delegated(
             || events.iter().any(|e| match e {
                 AgentEvent::SessionEnd { agent_id, .. } => *agent_id == child,
                 // The reducer's b1 cascade walks a drained Task's subtree out.
-                AgentEvent::ActivityEnd {
+                AgentEvent::ToolUseEnd {
                     agent_id,
                     tool_use_id: Some(t),
                 } if inference.dispatch_end_ends_child(true) => {
                     *agent_id == parent && tasks.contains(&(parent, t.as_str()))
                 }
                 // No run deletes a durable child, so its turn's end is the end a run sees.
-                AgentEvent::ActivityEnd {
-                    agent_id,
-                    tool_use_id: None,
-                } if durable => *agent_id == child,
+                AgentEvent::TurnEnd { agent_id, .. } if durable => *agent_id == child,
                 _ => false,
             })
     };
@@ -1073,7 +1180,7 @@ fn subagent(
         events
             .iter()
             .filter_map(|e| match e {
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id,
                     tool_use_id: Some(t),
                     ..
@@ -1093,7 +1200,7 @@ fn subagent(
     }
     let works = |id: AgentId| {
         events.iter().any(|e| {
-            matches!(e, AgentEvent::ActivityStart { agent_id, detail, .. }
+            matches!(e, AgentEvent::ToolUseStart { agent_id, detail, .. }
                 if *agent_id == id && !detail.as_ref().is_some_and(|d| d.is_task()))
         })
     };
@@ -1103,12 +1210,12 @@ fn subagent(
             "a child's tool never landed on the child".into(),
         ));
     }
-    // Per slot: a parent's own tool going Active proves nothing of its child.
+    // Per slot: a parent's own tool going Running proves nothing of its child.
     if !children
         .iter()
-        .all(|&(child, _)| reaches.contains(&(child, Reach::Active)))
+        .all(|&(child, _)| reaches.contains(&(child, Reach::Running)))
     {
-        findings.push((Label::Fail, "the child's tool never went Active".into()));
+        findings.push((Label::Fail, "the child's tool never went Running".into()));
     }
 }
 
@@ -1124,11 +1231,9 @@ fn child_error(
     // the session's own (copilot's plain `-p` writes no `session.task_complete`).
     let ended = |parent: AgentId| {
         events.iter().any(|e| match e {
-            AgentEvent::ActivityEnd {
-                agent_id,
-                tool_use_id: None,
+            AgentEvent::TurnEnd { agent_id, .. } | AgentEvent::SessionEnd { agent_id, .. } => {
+                *agent_id == parent
             }
-            | AgentEvent::SessionEnd { agent_id, .. } => *agent_id == parent,
             _ => false,
         })
     };
@@ -1178,10 +1283,10 @@ fn succession(events: &[AgentEvent], findings: &mut Vec<(Label, String)>) {
 
 /// The scene a headless pixtuoid painted, and every drift breadcrumb it logged.
 /// The agent must be seen in the `shown` state its shape is about, and every
-/// agent, a child under its own label included, gone once the CLI has exited:
-/// every profiled CLI's clean exit ends its sprites, whether by an end event,
-/// a drain or its process's death, so one left standing is a session pixtuoid
-/// lost track of.
+/// agent, a child under its own label included, gone once the run's last step
+/// exited: every profiled CLI's clean exit, or its server's stop, ends its
+/// sprites, whether by an end event, a drain or a process's death, so one left
+/// standing is a session pixtuoid lost track of.
 fn judge_scene(p: &Profile, scene: &str, shown: &str, findings: &mut Vec<(Label, String)>) {
     let prefix = format!("{}\u{b7}", p.descriptor().label_prefix);
     let frames = rosters(scene, "agents");
@@ -1205,21 +1310,25 @@ fn judge_scene(p: &Profile, scene: &str, shown: &str, findings: &mut Vec<(Label,
 pub(super) fn settled(shape: Shape) -> Option<&'static str> {
     match shape {
         Shape::ToolRun => Some("idle"),
-        // `RunFailed` latches it (`crate::source::daemon`).
+        // `TurnFailed` latches it (`crate::source::daemon`).
         Shape::ModelError => Some("degraded"),
-        Shape::Permission | Shape::Subagent | Shape::ChildError | Shape::Succession => None,
+        Shape::Permission
+        | Shape::Subagent
+        | Shape::ChildError
+        | Shape::Succession
+        | Shape::Cancel => None,
     }
 }
 
-/// A daemon's turn on the scene: its mascot busy, then `settled` once the turn
+/// A daemon's turn on the scene: its mascot running, then `settled` once the turn
 /// ended, and down or gone once the daemon stopped.
 fn judge_presence(p: &Profile, scene: &str, settled: &str, findings: &mut Vec<(Label, String)>) {
     let mascot = format!("{}@", p.source);
     let frames = rosters(scene, "daemons");
-    match frames.iter().position(|f| holds(f, &mascot, "busy")) {
+    match frames.iter().position(|f| holds(f, &mascot, "running")) {
         None => findings.push((
             Label::Fail,
-            format!("the scene never showed a {mascot} daemon busy"),
+            format!("the scene never showed a {mascot} daemon running"),
         )),
         Some(at) if !frames[at..].iter().any(|f| holds(f, &mascot, settled)) => findings.push((
             Label::Fail,
@@ -1290,16 +1399,14 @@ fn canonical(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::CaptureRecord;
+    use crate::harness::{CaptureRecord, ProcessExit, ServerStop};
 
     const RECORDED_WORKSPACE: &str = "/private/tmp/pixtuoid-capture/proj";
 
     /// A run directory built from a committed recording of `source`'s tool run,
     /// judged as if the tier had just produced it.
     fn run_from(source: &str, scenario_dir: &str, scene: &str) -> tempfile::TempDir {
-        let src = crate::harness::sources_root()
-            .join("fixtures")
-            .join(source)
+        let src = crate::harness::fixtures_dir(&crate::harness::sources_root(), source)
             .join(scenario_dir);
         run_of(&src, source, "tool-run", scene)
     }
@@ -1310,12 +1417,14 @@ mod tests {
         let scenario = profile(source)
             .and_then(|p| p.scenario(name))
             .expect("a profiled scenario");
-        let src = crate::harness::sources_root().join(scenario.fixture);
+        let src = crate::harness::sources_root().join(scenario.fixture(source));
         let d = run_of(&src, source, name, scene);
-        if scenario.turn.second.is_some() {
+        if scenario.headless_second().is_some() {
             write_manifest(d.path(), source, |m| {
                 m.scenario = name.into();
-                m.capture.second_turn = Some(crate::harness::SecondTurn { exit_code: Some(0) });
+                m.capture.second_turn = Some(crate::harness::SecondTurn {
+                    end: ProcessExit::Exited(0),
+                });
             });
         }
         d
@@ -1349,8 +1458,16 @@ mod tests {
                 workspace: PathBuf::from(RECORDED_WORKSPACE),
                 cli: "test".into(),
                 version: "test".into(),
-                exit_code: Some(0),
+                end: ProcessExit::Exited(0),
+                give_up_reason: None,
+                incomplete: None,
                 second_turn: None,
+                server_stop: profile(source)
+                    .and_then(|p| p.server_stop)
+                    .map(|_| ServerStop {
+                        exit: ProcessExit::Exited(0),
+                        outlived: Vec::new(),
+                    }),
                 note_survived: true,
             },
             aimock: "test".into(),
@@ -1477,7 +1594,9 @@ mod tests {
         let v = verify_lifecycle(d.path()).expect("verify");
         assert!(has(&v, Label::Blocked, "did not run"), "{:?}", v.findings());
         let d = lifecycle_run(&sound(), 0);
-        write_manifest(d.path(), "codex", |m| m.capture.exit_code = Some(1));
+        write_manifest(d.path(), "codex", |m| {
+            m.capture.end = ProcessExit::Exited(1)
+        });
         let v = verify_lifecycle(d.path()).expect("verify");
         assert!(
             has(&v, Label::Fail, "did not complete"),
@@ -1527,42 +1646,44 @@ mod tests {
             .any(|f| f.0 == label && f.1.contains(text))
     }
 
-    const CX_SCENE: &str = "agents=[cx\u{b7}proj@0:active(Bash: cat NOTE.txt)]\n\
+    const CX_SCENE: &str = "agents=[cx\u{b7}proj@0:running(Bash: cat NOTE.txt)]\n\
                             agents=[cx\u{b7}proj@0:idle]\nagents=[] daemons=[]\n";
-    const CX_DELEGATE_SCENE: &str = "agents=[cx\u{b7}proj@0:active(Delegating), \
-                                     cx\u{b7}proj@1:active(Bash: cat NOTE.txt)]\n\
+    const CX_DELEGATE_SCENE: &str = "agents=[cx\u{b7}proj@0:running(Delegating), \
+                                     cx\u{b7}proj@1:running(Bash: cat NOTE.txt)]\n\
                                      agents=[] daemons=[]\n";
-    const OC_DELEGATE_SCENE: &str = "agents=[oc\u{b7}proj@0:active(Delegating), \
-                                     oc\u{b7}proj@1:active(read)]\n\
+    const OC_DELEGATE_SCENE: &str = "agents=[oc\u{b7}proj@0:running(Delegating), \
+                                     oc\u{b7}proj@1:running(read)]\n\
                                      agents=[] daemons=[]\n";
-    const CC_SCENE: &str = "agents=[cc\u{b7}proj@0:active(Read: NOTE.txt)]\nagents=[] daemons=[]\n";
-    const CC_WAIT_SCENE: &str =
-        "agents=[cc\u{b7}proj@0:waiting(permission)]\nagents=[] daemons=[]\n";
-    const CX_WAIT_SCENE: &str =
-        "agents=[cx\u{b7}proj@0:waiting(permission)]\nagents=[] daemons=[]\n";
-    const RX_WAIT_SCENE: &str = "agents=[rx\u{b7}proj@0:waiting(approval needed: bash rm NOTE.txt)]\n\
+    const CC_SCENE: &str =
+        "agents=[cc\u{b7}proj@0:running(Read: NOTE.txt)]\nagents=[] daemons=[]\n";
+    const CC_REQUIRES_ACTION_SCENE: &str =
+        "agents=[cc\u{b7}proj@0:requires_action(permission)]\nagents=[] daemons=[]\n";
+    const CX_REQUIRES_ACTION_SCENE: &str =
+        "agents=[cx\u{b7}proj@0:requires_action(permission)]\nagents=[] daemons=[]\n";
+    const RX_REQUIRES_ACTION_SCENE: &str = "agents=[rx\u{b7}proj@0:requires_action(approval needed: bash rm NOTE.txt)]\n\
                                  agents=[] daemons=[]\n";
 
-    const DS_WAIT_SCENE: &str =
-        "agents=[ds\u{b7}proj@0:waiting(bash: escalate)]\nagents=[] daemons=[]\n";
-    const DS_DELEGATE_SCENE: &str = "agents=[ds\u{b7}proj@0:active(Delegating), \
-                                     ds\u{b7}proj@1:active(read)]\nagents=[] daemons=[]\n";
-    const CP_SCENE: &str = "agents=[cp\u{b7}proj@0:active(view: NOTE.txt)]\nagents=[] daemons=[]\n";
+    const DS_REQUIRES_ACTION_SCENE: &str =
+        "agents=[ds\u{b7}proj@0:requires_action(bash: escalate)]\nagents=[] daemons=[]\n";
+    const DS_DELEGATE_SCENE: &str = "agents=[ds\u{b7}proj@0:running(Delegating), \
+                                     ds\u{b7}proj@1:running(read)]\nagents=[] daemons=[]\n";
+    const CP_SCENE: &str =
+        "agents=[cp\u{b7}proj@0:running(view: NOTE.txt)]\nagents=[] daemons=[]\n";
     const CP_AUTOPILOT_SCENE: &str =
-        "agents=[cp\u{b7}proj@0:active(task_complete)]\nagents=[] daemons=[]\n";
-    const CP_WAIT_SCENE: &str =
-        "agents=[cp\u{b7}proj@0:waiting(permission: shell)]\nagents=[] daemons=[]\n";
-    const CP_DELEGATE_SCENE: &str = "agents=[cp\u{b7}proj@0:active(Delegating), \
-                                     reader@1:active(view: NOTE.txt)]\nagents=[] daemons=[]\n";
-    const CP_CHILD_ERROR_SCENE: &str = "agents=[cp\u{b7}proj@0:active(Delegating), \
+        "agents=[cp\u{b7}proj@0:running(task_complete)]\nagents=[] daemons=[]\n";
+    const CP_REQUIRES_ACTION_SCENE: &str =
+        "agents=[cp\u{b7}proj@0:requires_action(permission: shell)]\nagents=[] daemons=[]\n";
+    const CP_DELEGATE_SCENE: &str = "agents=[cp\u{b7}proj@0:running(Delegating), \
+                                     reader@1:running(view: NOTE.txt)]\nagents=[] daemons=[]\n";
+    const CP_CHILD_ERROR_SCENE: &str = "agents=[cp\u{b7}proj@0:running(Delegating), \
                                         reader@1:idle]\nagents=[] daemons=[]\n";
-    const GK_SCENE: &str = "agents=[gk\u{b7}proj@0:active(read_file)]\nagents=[] daemons=[]\n";
+    const GK_SCENE: &str = "agents=[gk\u{b7}proj@0:running(read_file)]\nagents=[] daemons=[]\n";
     const AG_SCENE: &str =
-        "agents=[ag\u{b7}proj@0:active(view_file: NOTE.txt)]\nagents=[] daemons=[]\n";
-    const GK_DELEGATE_SCENE: &str = "agents=[gk\u{b7}proj@0:active(Delegating), \
-                                     Read the note@1:active(read_file)]\nagents=[] daemons=[]\n";
-    const RX_DELEGATE_SCENE: &str = "agents=[rx\u{b7}proj@0:active(Delegating), \
-                                     rx\u{b7}proj@1:active(read_file)]\nagents=[] daemons=[]\n";
+        "agents=[ag\u{b7}proj@0:running(view_file: NOTE.txt)]\nagents=[] daemons=[]\n";
+    const GK_DELEGATE_SCENE: &str = "agents=[gk\u{b7}proj@0:running(Delegating), \
+                                     Read the note@1:running(read_file)]\nagents=[] daemons=[]\n";
+    const RX_DELEGATE_SCENE: &str = "agents=[rx\u{b7}proj@0:running(Delegating), \
+                                     rx\u{b7}proj@1:running(read_file)]\nagents=[] daemons=[]\n";
     const OM_NEW_SCENE: &str = "agents=[om\u{b7}proj@0:idle]\n\
                                 agents=[om\u{b7}proj@0:idle, om\u{b7}proj@1:idle]\n\
                                 agents=[om\u{b7}proj@1:idle]\nagents=[] daemons=[]\n";
@@ -1591,15 +1712,11 @@ mod tests {
         write_manifest(d.path(), "omp", |m| {
             m.scenario = "new-session".into();
             m.requests = 0;
-            m.capture.exit_code = Some(1);
+            m.capture.end = ProcessExit::Exited(1);
         });
         let v = verify(d.path()).expect("verify");
         assert!(
-            has(
-                &v,
-                Label::Blocked,
-                "did not complete its turn (exit Some(1))"
-            ),
+            has(&v, Label::Blocked, "did not complete its turn (exit 1)"),
             "{:?}",
             v.findings()
         );
@@ -1640,18 +1757,18 @@ mod tests {
 
     #[test]
     fn a_recorded_dsh_permission_run_passes() {
-        let d = recorded("dsh", "permission", DS_WAIT_SCENE);
+        let d = recorded("dsh", "permission", DS_REQUIRES_ACTION_SCENE);
         let v = verify(d.path()).expect("verify");
         assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
     }
 
     #[test]
     fn a_permission_run_that_never_waits_fails() {
-        let d = recorded("dsh", "permission", DS_WAIT_SCENE);
+        let d = recorded("dsh", "permission", DS_REQUIRES_ACTION_SCENE);
         edit_hooks(d.path(), |v| (v["type"] != "approval_asked").then_some(v));
         let v = verify(d.path()).expect("verify");
         assert!(
-            has(&v, Label::Fail, "never went Waiting"),
+            has(&v, Label::Fail, "never went RequiresAction"),
             "{:?}",
             v.findings()
         );
@@ -1662,28 +1779,32 @@ mod tests {
         let d = recorded(
             "dsh",
             "permission",
-            "agents=[ds\u{b7}proj@0:active(bash)]\n",
+            "agents=[ds\u{b7}proj@0:running(bash)]\n",
         );
         let v = verify(d.path()).expect("verify");
-        assert!(has(&v, Label::Fail, "agent waiting"), "{:?}", v.findings());
+        assert!(
+            has(&v, Label::Fail, "agent requires_action"),
+            "{:?}",
+            v.findings()
+        );
     }
 
     #[test]
     fn a_recorded_codex_tui_permission_run_passes() {
-        let d = recorded("codex", "permission", CX_WAIT_SCENE);
+        let d = recorded("codex", "permission", CX_REQUIRES_ACTION_SCENE);
         let v = verify(d.path()).expect("verify");
         assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
     }
 
     #[test]
     fn a_refused_call_that_never_started_ends_with_its_turn() {
-        let d = recorded("reasonix", "permission", RX_WAIT_SCENE);
+        let d = recorded("reasonix", "permission", RX_REQUIRES_ACTION_SCENE);
         let v = verify(d.path()).expect("verify");
         assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
         edit_hooks(d.path(), |v| (v["event"] != "Stop").then_some(v));
         let v = verify(d.path()).expect("verify");
         assert!(has(&v, Label::Fail, "never ended"), "{:?}", v.findings());
-        let d = recorded("reasonix", "permission", RX_WAIT_SCENE);
+        let d = recorded("reasonix", "permission", RX_REQUIRES_ACTION_SCENE);
         reorder_hooks(d.path(), |lines| {
             let at = lines
                 .iter()
@@ -1703,7 +1824,7 @@ mod tests {
 
     #[test]
     fn a_guardian_that_reads_before_the_wait_passes_while_the_read_ends() {
-        let d = recorded("reasonix", "permission", RX_WAIT_SCENE);
+        let d = recorded("reasonix", "permission", RX_REQUIRES_ACTION_SCENE);
         let v = verify(d.path()).expect("verify");
         assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
         edit_hooks(d.path(), |v| {
@@ -1723,31 +1844,31 @@ mod tests {
     #[test]
     fn an_orphaned_id_bearing_end_cannot_mask_an_idless_calls_missing_end() {
         let agent_id = AgentId::from_parts("reasonix", "p");
-        let end = |tool_use_id: Option<&str>| AgentEvent::ActivityEnd {
+        let end = |tool_use_id: Option<&str>| AgentEvent::ToolUseEnd {
             agent_id,
             tool_use_id: tool_use_id.map(Into::into),
         };
         let events = |read_ends_as: Option<&str>| {
             vec![
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id,
                     tool_use_id: None,
                     detail: None,
                 },
                 end(read_ends_as),
-                AgentEvent::Waiting {
+                AgentEvent::user_action_request(
                     agent_id,
-                    reason: "approval".into(),
-                    tool_use_id: None,
-                },
-                end(None),
+                    Some("approval".into()),
+                    crate::source::RequestKeys::default(),
+                ),
+                AgentEvent::turn_end(agent_id),
             ]
         };
         let judged = |read_ends_as| {
             let mut findings = Vec::new();
             permission(
                 &events(read_ends_as),
-                &[Reach::Waiting],
+                &[Reach::RequiresAction],
                 true,
                 &mut findings,
             );
@@ -1763,8 +1884,47 @@ mod tests {
     }
 
     #[test]
+    fn the_turns_end_is_counted_apart_from_the_calls_ends() {
+        let agent_id = AgentId::from_parts("reasonix", "p");
+        let start = AgentEvent::ToolUseStart {
+            agent_id,
+            tool_use_id: None,
+            detail: None,
+        };
+        let end = AgentEvent::ToolUseEnd {
+            agent_id,
+            tool_use_id: None,
+        };
+        let wait = AgentEvent::user_action_request(
+            agent_id,
+            Some("approval".into()),
+            crate::source::RequestKeys::default(),
+        );
+        let turn = AgentEvent::turn_end(agent_id);
+        let judged = |events: Vec<AgentEvent>| {
+            let mut findings = Vec::new();
+            permission(&events, &[Reach::RequiresAction], true, &mut findings);
+            findings
+        };
+        let lost_turn = vec![start.clone(), end.clone(), end.clone(), wait.clone()];
+        let control = vec![start, end, wait, turn.clone()];
+        assert!(judged(control.clone()).is_empty());
+        let mut two_turns = control;
+        two_turns.push(turn);
+        for (events, why) in [
+            (lost_turn, "a surplus End stands in for a lost turn's end"),
+            (two_turns, "the run's one turn ends once"),
+        ] {
+            assert!(
+                judged(events).iter().any(|f| f.1.contains("never ended")),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
     fn an_end_no_call_owns_fails() {
-        let d = recorded("reasonix", "permission", RX_WAIT_SCENE);
+        let d = recorded("reasonix", "permission", RX_REQUIRES_ACTION_SCENE);
         reorder_hooks(d.path(), |lines| {
             let end = lines
                 .iter()
@@ -1783,7 +1943,7 @@ mod tests {
 
     #[test]
     fn a_refused_call_that_took_the_note_with_it_fails() {
-        let d = recorded("dsh", "permission", DS_WAIT_SCENE);
+        let d = recorded("dsh", "permission", DS_REQUIRES_ACTION_SCENE);
         write_manifest(d.path(), "dsh", |m| {
             m.scenario = "permission".into();
             m.capture.note_survived = false;
@@ -1798,14 +1958,14 @@ mod tests {
 
     #[test]
     fn a_recorded_claude_code_tui_permission_run_passes() {
-        let d = recorded("claude-code", "permission", CC_WAIT_SCENE);
+        let d = recorded("claude-code", "permission", CC_REQUIRES_ACTION_SCENE);
         let v = verify(d.path()).expect("verify");
         assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
     }
 
     #[test]
     fn a_wait_naming_no_call_fails_when_a_started_tool_never_ends() {
-        let d = recorded("claude-code", "permission", CC_WAIT_SCENE);
+        let d = recorded("claude-code", "permission", CC_REQUIRES_ACTION_SCENE);
         edit_transcripts(d.path(), |line| !line.contains("tool_result"));
         let v = verify(d.path()).expect("verify");
         assert!(
@@ -1817,7 +1977,7 @@ mod tests {
 
     #[test]
     fn a_wait_naming_no_call_fails_when_no_tool_started() {
-        let d = recorded("claude-code", "permission", CC_WAIT_SCENE);
+        let d = recorded("claude-code", "permission", CC_REQUIRES_ACTION_SCENE);
         edit_hooks(d.path(), |v| {
             (v["hook_event_name"] != "PreToolUse").then_some(v)
         });
@@ -1832,7 +1992,7 @@ mod tests {
 
     #[test]
     fn a_wait_whose_tool_never_ends_fails() {
-        let d = recorded("dsh", "permission", DS_WAIT_SCENE);
+        let d = recorded("dsh", "permission", DS_REQUIRES_ACTION_SCENE);
         edit_hooks(d.path(), |v| {
             (v["type"] != "tool_result" && v["type"] != "approval_decided").then_some(v)
         });
@@ -1846,7 +2006,7 @@ mod tests {
 
     #[test]
     fn a_wait_that_lands_after_every_end_of_its_tool_still_passes() {
-        let d = recorded("dsh", "permission", DS_WAIT_SCENE);
+        let d = recorded("dsh", "permission", DS_REQUIRES_ACTION_SCENE);
         reorder_hooks(d.path(), |lines| {
             let asked = lines
                 .iter()
@@ -1865,7 +2025,7 @@ mod tests {
 
     #[test]
     fn a_wait_ended_only_by_another_tool_fails() {
-        let d = recorded("dsh", "permission", DS_WAIT_SCENE);
+        let d = recorded("dsh", "permission", DS_REQUIRES_ACTION_SCENE);
         edit_hooks(d.path(), |mut v| {
             if v["type"] == "tool_result" {
                 v["callId"] = "another-call".into();
@@ -1880,8 +2040,8 @@ mod tests {
         );
     }
 
-    const CC_DELEGATE_SCENE: &str = "agents=[cc\u{b7}proj@0:active(Delegating), \
-        general-purpose@1:active(Read: NOTE.txt)]\nagents=[] daemons=[]\n";
+    const CC_DELEGATE_SCENE: &str = "agents=[cc\u{b7}proj@0:running(Delegating), \
+        general-purpose@1:running(Read: NOTE.txt)]\nagents=[] daemons=[]\n";
 
     /// The recorded CC delegation keys the child's tool hooks by `agent_id`;
     /// without it they land on the root while the child's transcript shows
@@ -1947,7 +2107,7 @@ mod tests {
         });
         let v = verify(d.path()).expect("verify");
         assert!(
-            has(&v, Label::Fail, "child's tool never went Active"),
+            has(&v, Label::Fail, "child's tool never went Running"),
             "{:?}",
             v.findings()
         );
@@ -1978,7 +2138,7 @@ mod tests {
         );
     }
 
-    /// `events` judged with each child reaching Active and each parent
+    /// `events` judged with each child reaching Running and each parent
     /// Delegating.
     fn subagent_findings(
         events: &[AgentEvent],
@@ -1991,7 +2151,7 @@ mod tests {
                     agent_id,
                     parent_id: Some(parent),
                     ..
-                } => Some([(*agent_id, Reach::Active), (*parent, Reach::Delegating)]),
+                } => Some([(*agent_id, Reach::Running), (*parent, Reach::Delegating)]),
                 _ => None,
             })
             .flatten()
@@ -2021,12 +2181,12 @@ mod tests {
             cwd: PathBuf::from("/proj"),
             parent_id,
         };
-        let started = |agent_id, detail| AgentEvent::ActivityStart {
+        let started = |agent_id, detail| AgentEvent::ToolUseStart {
             agent_id,
             tool_use_id: None,
             detail: Some(detail),
         };
-        let end = |agent_id| AgentEvent::ActivityEnd {
+        let end = |agent_id| AgentEvent::ToolUseEnd {
             agent_id,
             tool_use_id: None,
         };
@@ -2048,6 +2208,13 @@ mod tests {
             subagent_findings(&run, ChildEndInference::AnyTaskEnd),
             vec![]
         );
+        let mut turn_ended = run.clone();
+        turn_ended[6] = AgentEvent::turn_end(parent);
+        assert_eq!(
+            subagent_findings(&turn_ended, ChildEndInference::AnyTaskEnd),
+            vec![],
+            "a turn's end is an id-less end too"
+        );
         for inference in [ChildEndInference::None, ChildEndInference::TaskDrain] {
             assert!(child_unended(&run, inference), "{inference:?}");
         }
@@ -2057,6 +2224,49 @@ mod tests {
             child_unended(&own_tool, ChildEndInference::AnyTaskEnd),
             "the parent's own tool ending is no dispatch's"
         );
+    }
+
+    #[test]
+    fn a_tracked_dispatch_end_ends_the_child_only_under_task_drain_or_any_task_end() {
+        use crate::source::ToolDetail;
+        let (parent, child) = (
+            AgentId::from_parts("copilot", "root"),
+            AgentId::from_parts("copilot", "call_1"),
+        );
+        let session = |agent_id, id: &str, parent_id| AgentEvent::SessionStart {
+            agent_id,
+            source: "copilot".into(),
+            session_id: id.into(),
+            cwd: PathBuf::from("/proj"),
+            parent_id,
+        };
+        let started = |agent_id, id: &str, detail| AgentEvent::ToolUseStart {
+            agent_id,
+            tool_use_id: Some(id.into()),
+            detail: Some(detail),
+        };
+        let run = vec![
+            session(parent, "root", None),
+            started(parent, "call_1", ToolDetail::Task),
+            session(child, "call_1", Some(parent)),
+            started(
+                child,
+                "view_1",
+                ToolDetail::Generic {
+                    display: "view".into(),
+                },
+            ),
+            AgentEvent::ToolUseEnd {
+                agent_id: parent,
+                tool_use_id: Some("call_1".into()),
+            },
+        ];
+        for inference in [ChildEndInference::TaskDrain, ChildEndInference::AnyTaskEnd] {
+            assert_eq!(subagent_findings(&run, inference), vec![], "{inference:?}");
+        }
+        for inference in [ChildEndInference::None, ChildEndInference::Durable] {
+            assert!(child_unended(&run, inference), "{inference:?}");
+        }
     }
 
     #[test]
@@ -2077,7 +2287,7 @@ mod tests {
         // turn; copilot's `-p` ends its session instead (`shut_down` below).
         let run = vec![
             session(parent, "root", None),
-            AgentEvent::ActivityStart {
+            AgentEvent::ToolUseStart {
                 agent_id: parent,
                 tool_use_id: Some("call_1".into()),
                 detail: Some(ToolDetail::Task),
@@ -2087,14 +2297,11 @@ mod tests {
                 agent_id: child,
                 as_child: true,
             },
-            AgentEvent::ActivityEnd {
+            AgentEvent::ToolUseEnd {
                 agent_id: parent,
                 tool_use_id: Some("call_1".into()),
             },
-            AgentEvent::ActivityEnd {
-                agent_id: parent,
-                tool_use_id: None,
-            },
+            AgentEvent::turn_end(parent),
         ];
         let judged = |events: &[AgentEvent], reaches: &[(AgentId, Reach)], inference| {
             let mut findings = Vec::new();
@@ -2137,15 +2344,12 @@ mod tests {
             AgentId::from_parts("opencode", "ses_parent"),
             AgentId::from_parts("opencode", "ses_child"),
         );
-        let started = |agent_id, id: &str, detail| AgentEvent::ActivityStart {
+        let started = |agent_id, id: &str, detail| AgentEvent::ToolUseStart {
             agent_id,
             tool_use_id: Some(id.into()),
             detail: Some(detail),
         };
-        let turn_end = |agent_id| AgentEvent::ActivityEnd {
-            agent_id,
-            tool_use_id: None,
-        };
+        let turn_end = AgentEvent::turn_end;
         let session = |agent_id, id: &str, parent_id| AgentEvent::SessionStart {
             agent_id,
             source: "opencode".into(),
@@ -2169,11 +2373,11 @@ mod tests {
         assert_eq!(subagent_findings(&run, ChildEndInference::Durable), vec![]);
         for (reaches, missing) in [
             (
-                [(parent, Reach::Active), (parent, Reach::Delegating)],
-                "the child's tool never went Active",
+                [(parent, Reach::Running), (parent, Reach::Delegating)],
+                "the child's tool never went Running",
             ),
             (
-                [(child, Reach::Active), (child, Reach::Delegating)],
+                [(child, Reach::Running), (child, Reach::Delegating)],
                 "the parent never went Delegating",
             ),
         ] {
@@ -2221,32 +2425,22 @@ mod tests {
 
     #[test]
     fn a_child_that_names_no_parent_or_never_ends_fails() {
-        // The lines that end the child: its own end, and its parent's drain of
-        // the Task that spawned it. Any one alone ends it.
-        let dsh: &[fn(&Value) -> bool] = &[
-            |v| v["type"] == "session_end" && v.get("parentSession").is_some(),
-            |v| v["type"] == "tool_result" && v.get("parentSession").is_none(),
-        ];
-        let reasonix: &[fn(&Value) -> bool] = &[|v| v["event"] == "SubagentStop"];
-        // claude-code infers no end from the drained Agent call: its Stop alone.
-        let claude: &[fn(&Value) -> bool] = &[|v| v["hook_event_name"] == "SubagentStop"];
+        // The one line that ends each child: dsh's and claude-code's own end,
+        // reasonix's SubagentStop (its dispatch's end, under AnyTaskEnd).
+        let dsh: fn(&Value) -> bool =
+            |v| v["type"] == "session_end" && v.get("parentSession").is_some();
+        let reasonix: fn(&Value) -> bool = |v| v["event"] == "SubagentStop";
+        let claude: fn(&Value) -> bool = |v| v["hook_event_name"] == "SubagentStop";
         let never = "child session never ended";
-        for (source, scene, ends) in [
+        for (source, scene, end) in [
             ("dsh", DS_DELEGATE_SCENE, dsh),
             ("reasonix", RX_DELEGATE_SCENE, reasonix),
             ("claude-code", CC_DELEGATE_SCENE, claude),
         ] {
-            for keep in 0..ends.len() {
-                let d = recorded(source, "subagent", scene);
-                edit_hooks(d.path(), |v| {
-                    let dropped = ends.iter().enumerate().any(|(i, e)| i != keep && e(&v));
-                    (!dropped).then_some(v)
-                });
-                let v = verify(d.path()).expect("verify");
-                assert!(!has(&v, Label::Fail, never), "{source}: {:?}", v.findings());
-            }
             let d = recorded(source, "subagent", scene);
-            edit_hooks(d.path(), |v| (!ends.iter().any(|e| e(&v))).then_some(v));
+            let v = verify(d.path()).expect("verify");
+            assert!(!has(&v, Label::Fail, never), "{source}: {:?}", v.findings());
+            edit_hooks(d.path(), |v| (!end(&v)).then_some(v));
             let v = verify(d.path()).expect("verify");
             assert!(has(&v, Label::Fail, never), "{source}: {:?}", v.findings());
         }
@@ -2268,8 +2462,8 @@ mod tests {
     #[test]
     fn a_child_still_in_the_scene_after_the_cli_exited_fails() {
         // A child renamed after its task carries no source prefix (grok's).
-        let scene = "agents=[ds\u{b7}proj@0:active(Delegating), \
-                     Read the note@1:active(read)]\n\
+        let scene = "agents=[ds\u{b7}proj@0:running(Delegating), \
+                     Read the note@1:running(read)]\n\
                      agents=[Read the note@1:idle] daemons=[]\n";
         let d = recorded("dsh", "subagent", scene);
         let v = verify(d.path()).expect("verify");
@@ -2282,9 +2476,21 @@ mod tests {
 
     #[test]
     fn a_recorded_codex_tool_run_passes() {
-        let d = run_from("codex", "tool-run-recorded", CX_SCENE);
+        let d = recorded("codex", "tool-run", CX_SCENE);
         let v = verify(d.path()).expect("verify");
         assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
+    }
+
+    #[test]
+    fn a_tool_run_whose_scene_shows_only_its_open_turn_fails() {
+        let scene = "agents=[cx\u{b7}proj@0:running]\nagents=[] daemons=[]\n";
+        let d = recorded("codex", "tool-run", scene);
+        let v = verify(d.path()).expect("verify");
+        assert!(
+            has(&v, Label::Fail, "never showed a cx\u{b7} agent running("),
+            "{:?}",
+            v.findings()
+        );
     }
 
     #[test]
@@ -2316,7 +2522,7 @@ mod tests {
             ("tool-run", CP_SCENE),
             ("resume", CP_SCENE),
             ("autopilot", CP_AUTOPILOT_SCENE),
-            ("permission", CP_WAIT_SCENE),
+            ("permission", CP_REQUIRES_ACTION_SCENE),
             ("subagent", CP_DELEGATE_SCENE),
             ("child-error", CP_CHILD_ERROR_SCENE),
         ] {
@@ -2328,30 +2534,35 @@ mod tests {
 
     #[test]
     fn a_second_turn_passes_only_once_it_ran_and_exited_clean() {
-        let src = crate::harness::sources_root().join("fixtures/claude-code/ultra-effort-hermetic");
-        let judged = |exit_code, second: Option<crate::harness::SecondTurn>| {
+        let src = crate::harness::sources_root().join("claude_code/fixtures/ultra-effort-hermetic");
+        let judged = |end, second: Option<crate::harness::SecondTurn>| {
             let d = run_of(&src, "claude-code", "ultra-effort", CC_SCENE);
             write_manifest(d.path(), "claude-code", |m| {
                 m.scenario = "ultra-effort".into();
-                m.capture.exit_code = exit_code;
+                m.capture.end = end;
                 m.capture.second_turn = second;
             });
             verify(d.path()).expect("verify")
         };
-        let second = |exit_code| Some(crate::harness::SecondTurn { exit_code });
-        let v = judged(Some(0), second(Some(0)));
+        let second = |end| Some(crate::harness::SecondTurn { end });
+        let v = judged(ProcessExit::Exited(0), second(ProcessExit::Exited(0)));
         assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
         assert!(has(
-            &judged(Some(0), None),
+            &judged(ProcessExit::Exited(0), None),
             Label::Fail,
             "named no session for its second turn"
         ));
         assert!(has(
-            &judged(Some(0), second(Some(1))),
+            &judged(ProcessExit::Exited(0), second(ProcessExit::Exited(1))),
             Label::Blocked,
-            "second turn exit Some(1)"
+            "second turn exit 1"
         ));
-        let v = judged(Some(1), None);
+        assert!(has(
+            &judged(ProcessExit::Exited(0), second(ProcessExit::OutOfTime)),
+            Label::Blocked,
+            "second turn was killed"
+        ));
+        let v = judged(ProcessExit::Exited(1), None);
         assert_eq!(v.label(), Label::Blocked, "{:?}", v.findings());
         assert!(
             !has(&v, Label::Fail, "named no session"),
@@ -2375,14 +2586,14 @@ mod tests {
 
     #[test]
     fn a_recorded_claude_code_tool_run_passes() {
-        let d = run_from("claude-code", "tool-run-recorded", CC_SCENE);
+        let d = recorded("claude-code", "tool-run", CC_SCENE);
         let v = verify(d.path()).expect("verify");
         assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
     }
 
     #[test]
     fn a_session_id_that_splits_the_run_into_two_agents_fails() {
-        let d = run_from("codex", "tool-run-recorded", CX_SCENE);
+        let d = recorded("codex", "tool-run", CX_SCENE);
         let mut first = true;
         edit_hooks(d.path(), |mut v| {
             if std::mem::take(&mut first) {
@@ -2428,7 +2639,7 @@ mod tests {
 
     #[test]
     fn a_cwd_outside_the_workspace_fails() {
-        let d = run_from("codex", "tool-run-recorded", CX_SCENE);
+        let d = recorded("codex", "tool-run", CX_SCENE);
         write_manifest(d.path(), "codex", |m| {
             m.capture.workspace = PathBuf::from("/elsewhere")
         });
@@ -2498,21 +2709,25 @@ mod tests {
 
     #[test]
     fn a_succession_completes_with_no_model_request_and_only_on_a_clean_exit() {
-        let completed = |shape, exit_code, requests| {
+        let completed = |shape, end, requests| {
             let m = manifest("omp", |m| {
-                m.capture.exit_code = exit_code;
+                m.capture.end = end;
                 m.requests = requests;
             });
             completed_turn(&m, shape, &mut Vec::new())
         };
-        assert!(completed(Shape::Succession, Some(0), 0));
-        assert!(!completed(Shape::Succession, Some(1), 0));
+        assert!(completed(Shape::Succession, ProcessExit::Exited(0), 0));
+        assert!(!completed(Shape::Succession, ProcessExit::Exited(1), 0));
         assert!(
-            !completed(Shape::Succession, None, 0),
+            !completed(Shape::Succession, ProcessExit::Signalled, 0),
             "a signal ends no turn"
         );
         assert!(
-            !completed(Shape::ToolRun, Some(0), 0),
+            !completed(Shape::Succession, ProcessExit::OutOfTime, 0),
+            "nor does the budget"
+        );
+        assert!(
+            !completed(Shape::ToolRun, ProcessExit::Exited(0), 0),
             "a turn that asks the model"
         );
     }
@@ -2560,7 +2775,7 @@ mod tests {
     #[test]
     fn a_run_with_no_session_start_fails() {
         // Not codex: its UserPromptSubmit decodes to a SessionStart too.
-        let d = run_from("claude-code", "tool-run-recorded", CC_SCENE);
+        let d = recorded("claude-code", "tool-run", CC_SCENE);
         edit_hooks(d.path(), |v| {
             (v["hook_event_name"] != "SessionStart").then_some(v)
         });
@@ -2576,7 +2791,7 @@ mod tests {
     #[test]
     fn a_tool_that_never_ends_fails() {
         // Not codex: its Stop ends the activity too.
-        let d = run_from("claude-code", "tool-run-recorded", CC_SCENE);
+        let d = recorded("claude-code", "tool-run", CC_SCENE);
         edit_hooks(d.path(), |v| {
             (v["hook_event_name"] != "PostToolUse").then_some(v)
         });
@@ -2590,8 +2805,28 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_start_with_no_name_fails_and_a_slot_with_no_tool_never_goes_active() {
-        let d = run_from("claude-code", "tool-run-recorded", CC_SCENE);
+    fn a_tool_its_turn_ended_has_ended() {
+        let agent_id = AgentId::from_parts("kimi", "session");
+        let start = AgentEvent::ToolUseStart {
+            agent_id,
+            tool_use_id: Some("call_1".into()),
+            detail: Some("Bash: ls".into()),
+        };
+        let judged = |events: &[AgentEvent]| {
+            let mut findings = Vec::new();
+            tool_run(events, &[Reach::Running], &mut findings);
+            findings.into_iter().map(|f| f.1).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            judged(&[start.clone(), AgentEvent::turn_end(agent_id)]),
+            Vec::<String>::new()
+        );
+        assert_eq!(judged(&[start]), ["the tool never ended"]);
+    }
+
+    #[test]
+    fn a_tool_start_with_no_name_fails_and_a_slot_with_no_tool_never_goes_running() {
+        let d = recorded("claude-code", "tool-run", CC_SCENE);
         // Both transports name the tool, so both lose it.
         edit_hooks(d.path(), |mut v| {
             if v.get("tool_name").is_some() {
@@ -2612,7 +2847,7 @@ mod tests {
         });
         let v = verify(d.path()).expect("verify");
         assert!(
-            has(&v, Label::Fail, "never went Active"),
+            has(&v, Label::Fail, "never went Running"),
             "{:?}",
             v.findings()
         );
@@ -2620,7 +2855,7 @@ mod tests {
 
     #[test]
     fn a_line_the_decoder_rejects_fails() {
-        let d = run_from("codex", "tool-run-recorded", CX_SCENE);
+        let d = recorded("codex", "tool-run", CX_SCENE);
         edit_hooks(d.path(), |mut v| {
             if v["hook_event_name"] == "PreToolUse" {
                 v["session_id"] = Value::Null;
@@ -2639,7 +2874,7 @@ mod tests {
 
     #[test]
     fn a_hook_the_scenario_expects_but_never_fired_fails() {
-        let d = run_from("codex", "tool-run-recorded", CX_SCENE);
+        let d = recorded("codex", "tool-run", CX_SCENE);
         edit_hooks(d.path(), |v| (v["hook_event_name"] != "Stop").then_some(v));
         let v = verify(d.path()).expect("verify");
         assert!(has(&v, Label::Fail, "must fire Stop"), "{:?}", v.findings());
@@ -2647,18 +2882,22 @@ mod tests {
 
     #[test]
     fn a_tui_turn_that_raised_no_gate_to_refuse_fails() {
-        let d = recorded("claude-code", "permission", CC_WAIT_SCENE);
+        let d = recorded("claude-code", "permission", CC_REQUIRES_ACTION_SCENE);
         let unrefused = |requests, unmatched| {
             write_manifest(d.path(), "claude-code", |m| {
                 m.scenario = "permission".into();
-                m.capture.exit_code = Some(tui::UNREFUSED);
+                m.capture.end = ProcessExit::Exited(tui::UNANSWERED);
                 m.requests = requests;
                 m.unmatched = unmatched;
             });
             verify(d.path()).expect("verify")
         };
         let v = unrefused(2, 0);
-        assert!(has(&v, Label::Fail, "no gate"), "{:?}", v.findings());
+        assert!(
+            has(&v, Label::Fail, "never showed a gate"),
+            "{:?}",
+            v.findings()
+        );
         assert_eq!(
             unrefused(0, 0).label(),
             Label::Blocked,
@@ -2669,9 +2908,9 @@ mod tests {
             Label::Script,
             "a script that lost the turn never asked for the gated tool"
         );
-        let h = run_from("codex", "tool-run-recorded", CX_SCENE);
+        let h = recorded("codex", "tool-run", CX_SCENE);
         write_manifest(h.path(), "codex", |m| {
-            m.capture.exit_code = Some(tui::UNREFUSED)
+            m.capture.end = ProcessExit::Exited(tui::UNANSWERED)
         });
         assert_eq!(
             verify(h.path()).expect("verify").label(),
@@ -2692,15 +2931,17 @@ mod tests {
 
     #[test]
     fn an_unmatched_model_request_is_script_and_a_cli_that_never_ran_is_blocked() {
-        let d = run_from("codex", "tool-run-recorded", CX_SCENE);
+        let d = recorded("codex", "tool-run", CX_SCENE);
         write_manifest(d.path(), "codex", |m| m.unmatched = 1);
         assert_eq!(verify(d.path()).expect("verify").label(), Label::Script);
-        write_manifest(d.path(), "codex", |m| m.capture.exit_code = Some(1));
+        write_manifest(d.path(), "codex", |m| {
+            m.capture.end = ProcessExit::Exited(1)
+        });
         assert_eq!(verify(d.path()).expect("verify").label(), Label::Blocked);
         write_manifest(d.path(), "codex", |m| m.requests = 0);
         assert_eq!(verify(d.path()).expect("verify").label(), Label::Blocked);
         write_manifest(d.path(), "codex", |m| {
-            m.capture.exit_code = Some(1);
+            m.capture.end = ProcessExit::Exited(1);
             m.unmatched = 1;
         });
         assert_eq!(
@@ -2711,31 +2952,152 @@ mod tests {
     }
 
     #[test]
-    fn a_daemon_s_turn_shows_busy_then_idle_then_gone() {
+    fn a_turn_killed_at_its_budget_is_blocked_and_judges_nothing() {
+        let judged = |unmatched| {
+            let d = recorded("codex", "tool-run", CX_SCENE);
+            write_manifest(d.path(), "codex", |m| {
+                m.capture.end = ProcessExit::OutOfTime;
+                m.requests = 4210;
+                m.unmatched = unmatched;
+            });
+            verify(d.path()).expect("verify")
+        };
+        let v = judged(0);
+        let killed = format!(
+            "the {:?} budget ran out after 4210 model requests",
+            TURN_BUDGET.here()
+        );
+        assert_eq!(v.label(), Label::Blocked, "{:?}", v.findings());
+        assert!(has(&v, Label::Blocked, &killed), "{:?}", v.findings());
+        assert!(!v.judged(), "its lifecycle and census included");
+        assert_eq!(
+            judged(1).label(),
+            Label::Script,
+            "a request no script line answers is the script's alone"
+        );
+    }
+
+    #[test]
+    fn a_lifecycle_turn_a_budget_killed_blames_no_uninstall() {
+        let d = lifecycle_run(&sound(), 0);
+        write_manifest(d.path(), "codex", |m| {
+            m.capture.end = ProcessExit::OutOfTime
+        });
+        let v = verify_lifecycle(d.path()).expect("verify");
+        assert!(
+            has(&v, Label::Blocked, "after 2 model requests"),
+            "{:?}",
+            v.findings()
+        );
+        assert!(!has(&v, Label::Fail, "uninstall"), "{:?}", v.findings());
+        assert!(!v.judged());
+    }
+
+    #[test]
+    fn an_incomplete_capture_is_blocked_and_judges_nothing() {
+        const WHY: &str = "the daemon outlived its stdin and was killed";
+        let judged = |end| {
+            let d = recorded("codex", "tool-run", CX_SCENE);
+            write_manifest(d.path(), "codex", |m| {
+                m.capture.end = end;
+                m.capture.incomplete = Some(WHY.into());
+            });
+            verify(d.path()).expect("verify")
+        };
+        let v = judged(ProcessExit::Exited(0));
+        assert!(has(&v, Label::Blocked, WHY), "{:?}", v.findings());
+        assert!(!v.judged());
+        let v = judged(ProcessExit::OutOfTime);
+        assert!(
+            has(&v, Label::Blocked, "turn was killed"),
+            "the kill comes first: {:?}",
+            v.findings()
+        );
+        let d = lifecycle_run(&sound(), 0);
+        write_manifest(d.path(), "codex", |m| {
+            m.capture.incomplete = Some(WHY.into())
+        });
+        let v = verify_lifecycle(d.path()).expect("verify");
+        assert!(has(&v, Label::Blocked, WHY), "{:?}", v.findings());
+        assert!(!has(&v, Label::Fail, "uninstall"), "{:?}", v.findings());
+    }
+
+    /// A server stop fails the run on a non-zero exit or on a stamped pid it left
+    /// running, whatever else the run shows.
+    #[test]
+    fn a_run_whose_server_was_not_stopped_fails() {
+        let d = recorded("hermes", "tool-run", "agents=[] daemons=[]\n");
+        let outlived = |dir: &Path| {
+            has(
+                &verify(dir).expect("verify"),
+                Label::Fail,
+                "outlived the run",
+            )
+        };
+        assert!(!outlived(d.path()));
+        let stop = |exit, outlived| Some(ServerStop { exit, outlived });
+        for server_stop in [
+            None,
+            stop(ProcessExit::Exited(1), Vec::new()),
+            stop(ProcessExit::Exited(0), vec![4242]),
+        ] {
+            write_manifest(d.path(), "hermes", |m| {
+                m.capture.server_stop = server_stop.clone();
+            });
+            assert!(outlived(d.path()), "{server_stop:?}");
+        }
+    }
+
+    #[test]
+    fn a_tui_turn_its_driver_gave_up_on_is_blocked_for_the_drivers_reason() {
+        const WHY: &str = "the screen stood still with the turn unfinished";
+        let d = recorded("claude-code", "permission", CC_REQUIRES_ACTION_SCENE);
+        write_manifest(d.path(), "claude-code", |m| {
+            m.scenario = "permission".into();
+            m.capture.end = ProcessExit::Exited(tui::GAVE_UP);
+            m.capture.give_up_reason = Some(WHY.into());
+        });
+        let v = verify(d.path()).expect("verify");
+        assert!(has(&v, Label::Blocked, WHY), "{:?}", v.findings());
+        assert!(
+            !has(&v, Label::Blocked, "did not redirect"),
+            "the driver said why: {:?}",
+            v.findings()
+        );
+    }
+
+    #[test]
+    fn a_daemon_s_turn_shows_running_then_idle_then_gone() {
         let judged = |scene: &str| {
             let d = recorded("openclaw", "tool-run", scene);
             verify(d.path()).expect("verify").findings().to_vec()
         };
         let frame = |state: &str| format!("agents=[] daemons=[openclaw@59871:{state}]\n");
         let gone = "agents=[] daemons=[]\n";
-        let ran = [frame("idle"), frame("busy"), frame("idle"), frame("down")].concat();
+        let ran = [
+            frame("idle"),
+            frame("running"),
+            frame("idle"),
+            frame("down"),
+        ]
+        .concat();
         assert_eq!(judged(&(ran.clone() + gone)), vec![]);
         assert_eq!(
             judged(&ran),
             vec![],
             "down is stopped, before its linger ends"
         );
-        let never_busy = [frame("idle"), frame("down")].concat() + gone;
+        let never_running = [frame("idle"), frame("down")].concat() + gone;
         assert!(
-            judged(&never_busy)[0].1.contains("busy"),
+            judged(&never_running)[0].1.contains("running"),
             "{:?}",
-            judged(&never_busy)
+            judged(&never_running)
         );
-        let never_settled = [frame("busy"), frame("down")].concat() + gone;
+        let never_settled = [frame("running"), frame("down")].concat() + gone;
         assert!(judged(&never_settled)[0].1.contains("idle"));
-        let idle_only_before = [frame("idle"), frame("busy"), frame("down")].concat() + gone;
+        let idle_only_before = [frame("idle"), frame("running"), frame("down")].concat() + gone;
         assert!(judged(&idle_only_before)[0].1.contains("idle"));
-        let lingering = [frame("busy"), frame("idle")].concat();
+        let lingering = [frame("running"), frame("idle")].concat();
         assert!(judged(&lingering)[0].1.contains("still up"));
     }
 
@@ -2745,7 +3107,7 @@ mod tests {
             let d = recorded("openclaw", "model-error", scene);
             write_manifest(d.path(), "openclaw", |m| {
                 m.scenario = "model-error".into();
-                m.capture.exit_code = Some(1);
+                m.capture.end = ProcessExit::Exited(1);
             });
             verify(d.path()).expect("verify").findings().to_vec()
         };
@@ -2753,13 +3115,13 @@ mod tests {
         let gone = "agents=[] daemons=[]\n";
         let failed = [
             frame("idle"),
-            frame("busy"),
+            frame("running"),
             frame("degraded"),
             frame("down"),
         ]
         .concat();
         assert_eq!(judged(&(failed + gone)), vec![]);
-        let sound = [frame("busy"), frame("idle"), frame("down")].concat() + gone;
+        let sound = [frame("running"), frame("idle"), frame("down")].concat() + gone;
         assert!(
             judged(&sound)[0].1.contains("degraded"),
             "{:?}",
@@ -2769,14 +3131,14 @@ mod tests {
 
     #[test]
     fn only_a_turn_scripted_to_fail_may_exit_non_zero() {
-        let scene = "agents=[] daemons=[openclaw@55306:busy]\n\
+        let scene = "agents=[] daemons=[openclaw@55306:running]\n\
                      agents=[] daemons=[openclaw@55306:degraded]\n\
                      agents=[] daemons=[openclaw@55306:down]\nagents=[] daemons=[]\n";
-        let judged = |scenario: &str, exit_code, requests| {
+        let judged = |scenario: &str, end, requests| {
             let d = recorded("openclaw", "model-error", scene);
             write_manifest(d.path(), "openclaw", |m| {
                 m.scenario = scenario.into();
-                m.capture.exit_code = exit_code;
+                m.capture.end = end;
                 m.requests = requests;
             });
             has(
@@ -2785,13 +3147,16 @@ mod tests {
                 "did not complete",
             )
         };
-        assert!(!judged("model-error", Some(1), 1));
+        assert!(!judged("model-error", ProcessExit::Exited(1), 1));
         assert!(
-            judged("model-error", Some(1), 0),
+            judged("model-error", ProcessExit::Exited(1), 0),
             "it never reached the model"
         );
-        assert!(judged("model-error", None, 1), "a signal ends no turn");
-        assert!(judged("tool-run", Some(1), 1));
+        assert!(
+            judged("model-error", ProcessExit::Signalled, 1),
+            "a signal ends no turn"
+        );
+        assert!(judged("tool-run", ProcessExit::Exited(1), 1));
     }
 
     #[test]
@@ -2804,7 +3169,7 @@ mod tests {
             );
             write_manifest(d.path(), "opencode", |m| {
                 m.scenario = "model-error".into();
-                m.capture.exit_code = Some(1);
+                m.capture.end = ProcessExit::Exited(1);
             });
             edit(d.path());
             verify(d.path()).expect("verify")
@@ -2825,32 +3190,71 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_turn_is_held_to_its_end() {
+    fn a_failed_or_cancelled_turn_is_held_to_its_end() {
         let agent_id = AgentId::from_parts("kimi", "session");
-        let judged = |tool_use_id: Option<&str>| {
+        let judged = |end: AgentEvent| {
             let mut findings = Vec::new();
-            model_error(
-                &[AgentEvent::ActivityEnd {
-                    agent_id,
-                    tool_use_id: tool_use_id.map(str::to_owned),
-                }],
-                &mut findings,
-            );
+            turn_ended(&[end], &mut findings);
             findings
         };
-        assert_eq!(judged(None), vec![]);
-        assert!(
-            judged(Some("call"))
+        assert_eq!(judged(AgentEvent::turn_end(agent_id)), vec![]);
+        for tool_use_id in [None, Some("call".to_owned())] {
+            assert!(
+                judged(AgentEvent::ToolUseEnd {
+                    agent_id,
+                    tool_use_id
+                })
                 .iter()
                 .any(|f| f.1.contains("never ended"))
-        );
+            );
+        }
     }
 
     #[test]
-    fn a_scene_that_never_shows_the_agent_active_fails() {
-        let d = run_from(
+    fn a_recorded_codex_cancel_passes_only_on_its_aborted_turn() {
+        let run = |cut: bool| {
+            let d = recorded(
+                "codex",
+                "cancel",
+                "agents=[cx\u{b7}proj@0:idle]\nagents=[] daemons=[]\n",
+            );
+            if cut {
+                edit_transcripts(d.path(), |l| !l.contains("\"turn_aborted\""));
+            }
+            verify(d.path()).expect("verify")
+        };
+        let v = run(false);
+        assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
+        let v = run(true);
+        assert!(has(&v, Label::Fail, "never ended"), "{:?}", v.findings());
+    }
+
+    #[test]
+    fn a_recorded_opencode_cancel_passes_only_on_its_interrupted_execution() {
+        let run = |cut: bool| {
+            let d = recorded(
+                "opencode",
+                "cancel",
+                "agents=[oc\u{b7}proj@0:idle]\nagents=[] daemons=[]\n",
+            );
+            if cut {
+                edit_hooks(d.path(), |v| {
+                    (v["type"] != "session.execution.interrupted").then_some(v)
+                });
+            }
+            verify(d.path()).expect("verify")
+        };
+        let v = run(false);
+        assert_eq!(v.label(), Label::Pass, "{:?}", v.findings());
+        let v = run(true);
+        assert!(has(&v, Label::Fail, "never ended"), "{:?}", v.findings());
+    }
+
+    #[test]
+    fn a_scene_that_never_shows_the_agent_running_fails() {
+        let d = recorded(
             "codex",
-            "tool-run-recorded",
+            "tool-run",
             "agents=[cx\u{b7}proj@0:idle]\nagents=[]\n",
         );
         let v = verify(d.path()).expect("verify");
@@ -2860,8 +3264,8 @@ mod tests {
     #[test]
     fn an_agent_still_in_the_scene_after_the_cli_exited_fails() {
         let scene =
-            "agents=[cx\u{b7}proj@0:active(Bash: cat NOTE.txt)]\nagents=[cx\u{b7}proj@0:idle]\n";
-        let d = run_from("codex", "tool-run-recorded", scene);
+            "agents=[cx\u{b7}proj@0:running(Bash: cat NOTE.txt)]\nagents=[cx\u{b7}proj@0:idle]\n";
+        let d = recorded("codex", "tool-run", scene);
         let v = verify(d.path()).expect("verify");
         assert!(
             has(&v, Label::Fail, "after the CLI exited"),
@@ -2875,11 +3279,7 @@ mod tests {
         let breadcrumb = crate::test_capture::capture_logs(|| {
             crate::source::drift::missing_field("codex", "PreToolUse", "tool_name");
         });
-        let d = run_from(
-            "codex",
-            "tool-run-recorded",
-            &format!("{breadcrumb}{CX_SCENE}"),
-        );
+        let d = recorded("codex", "tool-run", &format!("{breadcrumb}{CX_SCENE}"));
         let v = verify(d.path()).expect("verify");
         assert!(
             has(&v, Label::Fail, "drift breadcrumb"),
@@ -2911,7 +3311,7 @@ mod tests {
 
     #[test]
     fn a_not_yet_hook_any_run_fires_is_stale() {
-        let d = run_from("claude-code", "tool-run-recorded", CC_SCENE);
+        let d = recorded("claude-code", "tool-run", CC_SCENE);
         let mut first = true;
         edit_hooks(d.path(), |mut v| {
             if std::mem::take(&mut first) {
@@ -2925,7 +3325,7 @@ mod tests {
 
     #[test]
     fn a_read_field_no_run_carries_fails_the_census() {
-        let d = run_from("claude-code", "tool-run-recorded", CC_SCENE);
+        let d = recorded("claude-code", "tool-run", CC_SCENE);
         edit_hooks(d.path(), |mut v| {
             if let Some(name) = v.as_object_mut().and_then(|o| o.remove("tool_name")) {
                 v["toolName"] = name;
@@ -3060,10 +3460,13 @@ mod tests {
     fn a_verdict_says_why_its_run_judged_no_new_types() {
         let d = recorded("codex", "tool-run", CX_SCENE);
         let v = verify(d.path()).expect("verify");
-        let scenario = profile("codex")
-            .and_then(|p| p.scenarios.iter().find(|s| s.shape == Shape::ToolRun))
+        let codex = profile("codex").expect("codex's profile");
+        let scenario = codex
+            .scenarios
+            .iter()
+            .find(|s| s.shape == Shape::ToolRun)
             .expect("codex's tool-run");
-        let want = match dropped::baseline_of(scenario).expect("baseline") {
+        let want = match dropped::baseline_of(codex, scenario).expect("baseline") {
             None => Some(Unjudged::NoBaseline),
             Some(b) if !b.judges_here() => Some(Unjudged::RecordedOn(b.os.to_string())),
             Some(_) => None,
@@ -3104,8 +3507,8 @@ mod tests {
             has(&v, Label::Stale, &format!("`{owed}`"))
         };
         // A codex turn end the strip keeps.
-        assert!(census("codex", &"web_search_end", &|d| {
-            respell(d, "\"task_complete\"", "\"web_search_end\"");
+        assert!(census("codex", &"turn_aborted", &|d| {
+            respell(d, "\"task_complete\"", "\"turn_aborted\"");
         }));
         // An agy step whose line decodes to nothing, which the strip blanks whole.
         assert!(!census("antigravity", &"USER_INPUT", &|d| {
@@ -3124,13 +3527,15 @@ mod tests {
 
     #[test]
     fn a_not_yet_field_a_run_carries_is_stale() {
-        // A billed capture's usage carries the cache tokens aimock's never does.
-        let d = run_from("claude-code", "tool-run-recorded", CC_SCENE);
-        let v = verify_source(
-            profile("claude-code").expect("profile"),
-            &[d.path().to_path_buf()],
-        )
-        .expect("verify");
+        // tool-run's script gives its reply a cache write.
+        let d = recorded("claude-code", "tool-run", CC_SCENE);
+        let owing = Profile {
+            not_yet_fields: &[("tx:assistant", "/message/usage/cache_creation_input_tokens")],
+            live: None,
+            daemon: None,
+            ..*profile("claude-code").expect("profile")
+        };
+        let v = verify_source(&owing, &[d.path().to_path_buf()]).expect("verify");
         assert!(
             has(
                 &v,
@@ -3234,9 +3639,9 @@ mod tests {
 
     #[test]
     fn a_committed_hook_the_profile_owes_needs_no_run() {
-        // fixtures/claude-code/permission-recorded fires it; a tool run doesn't.
+        // A permission run fires it; a tool run doesn't.
         let owed = ["hook:Notification"];
-        let d = run_from("claude-code", "tool-run-recorded", CC_SCENE);
+        let d = recorded("claude-code", "tool-run", CC_SCENE);
         let v = verify_source(&owing_notification(), &[d.path().to_path_buf()]).expect("verify");
         assert!(
             !v.findings()
@@ -3277,7 +3682,7 @@ mod tests {
     #[test]
     fn a_rollout_that_loses_its_cwd_fails_the_census() {
         // Every line: codex's head scan takes the first `payload.cwd` it finds.
-        let d = run_from("codex", "tool-run-recorded", CX_SCENE);
+        let d = recorded("codex", "tool-run", CX_SCENE);
         for t in jsonl_files_under(d.path())
             .into_iter()
             .filter(|f| !is_hook_envelope(f))

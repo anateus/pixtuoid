@@ -43,7 +43,7 @@ exclude_re = [
     'omp\.rs.*replace \|\| with && in parse_omp_env_line',
     # Untestable glue inside otherwise-mutated files: ZERO test call sites, so
     # nothing exists that could kill them. Delete a name the moment a test reaches it.
-    'tui/mod\.rs.*(run_tui|setup_terminal|teardown_terminal)',
+    'tui/mod\.rs.*(run_tui|setup_terminal)',
     'runtime/driver\.rs.*replace (run|run_async|headless_loop) ->',
     'runtime/driver\.rs.*replace reducer_task with',
     # Reached under test, but only on a branch where the mutation is unobservable.
@@ -53,14 +53,13 @@ exclude_re = [
     # `_resolved` core one line down. Keep them substitutions — logic added here
     # is unmeasurable, exactly as `ensure_owned_socket_dir` above.
     'hermes\.rs.*replace hermes_home ->',
-    'omp/native\.rs.*replace omp_probe_root ->',
     'grok/native\.rs.*replace grok_probe_root ->',
     # #828: the `from_open_fds` family — under test the proc walk finds nothing,
     # so `Some(empty)` is indistinguishable from the real answer. Pinned to the
     # `Some(Default` spelling: each fn's `-> None` twin IS killable and caught.
     'omp/native\.rs.*replace live_omp_session_ids -> Option<ProbeSnapshot> with Some\(Default',
     'codex/native\.rs.*replace live_codex_rollout_ids -> Option<ProbeSnapshot> with Some\(Default',
-    'mod\.rs.*replace codex_pid_for_session -> Option<i32> with None',
+    'codex/native\.rs.*replace pid_for_session -> Option<i32> with None',
     # #828: `cfg!(windows)` short-circuits this comparison to a constant `false`
     # off Windows, so the operator is unobservable there. Its `&&` sibling one
     # column left IS killable and is caught.

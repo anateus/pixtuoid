@@ -29,14 +29,52 @@ yq -o=json '.' .mergify.yml | jq -e --arg c "-head ~= ^$release_prefix" \
     '(.queue_rules | length > 0) and all(.queue_rules[]; any(.queue_conditions[]; . == $c))' >/dev/null ||
     fail ".mergify.yml has a queue that admits release-plz's ${release_prefix}* PRs"
 
-# ── release-plz.yml: the publish waits for its own commit's ci-gate ──
-release_workflow=.github/workflows/release-plz.yml
+# A `tools:` word that is no mise.toml key is dropped by MISE_ENABLE_TOOLS and
+# installs nothing, so the job runs whatever the runner has, or fails late. A computed value would escape that
+# check, and setup-tools writes it to GITHUB_ENV, so only setup-cargo-just's
+# own forwarding of its input may carry an expression.
+mise_keys="$(yq -p toml -o=json '.tools | keys | .[]' mise.toml | jq -r '.')" || fail "mise.toml has no [tools]"
+tools_words=""
+for f in .github/workflows/*.yml .github/actions/*/action.y*ml; do
+    values="$(yq -o=json '.' "$f" | jq -r '.. | objects | select((.uses // "") | test("/setup-(tools|cargo-just)$")) | (.with.tools // empty)')" ||
+        fail "cannot read the tools: values of $f"
+    while IFS= read -r value; do
+        [[ -n "$value" ]] || continue
+        # shellcheck disable=SC2016  # the literal GitHub expression syntax
+        if [[ "$value" == *'${{'* ]]; then
+            [[ "$f" == .github/actions/setup-cargo-just/action.yml && "$value" == '${{ inputs.tools }}' ]] ||
+                fail "$f passes a computed tools: $value"
+            continue
+        fi
+        tools_words+="${value// /$'\n'}"$'\n'
+    done <<<"$values"
+done
+[[ -n "$tools_words" ]] || fail "no setup-tools/setup-cargo-just caller passes tools"
+unknown_tools="$(comm -23 <(sort -u <<<"$tools_words") <(sort <<<"$mise_keys"))"
+[[ -z "$unknown_tools" ]] || fail "tools: words that are no mise.toml [tools] key: $unknown_tools"
+# The justfile reads `mise env` on every run, so a mise.toml that needs `mise
+# trust` (a `[tool_alias]` table does) breaks just in each fresh checkout.
+# A clean env: mise trusts every file under CI=true, and a caller's mise
+# config or state could trust it too.
+mise_untrusted() {
+    mkdir -p "$test_dir/$1/home" && cp "$2" "$test_dir/$1/mise.toml"
+    (cd "$test_dir/$1" && env -i PATH="$PATH" HOME="$test_dir/$1/home" MISE_OFFLINE=1 mise env --paths >/dev/null 2>&1)
+}
+mise_untrusted untrusted mise.toml ||
+    fail "mise.toml needs \`mise trust\`, so a fresh checkout's just fails"
+{ cat mise.toml && printf '\n[tool_alias]\nprobe = "aqua:jqlang/jq"\n'; } >"$test_dir/aliased.toml"
+! mise_untrusted aliased "$test_dir/aliased.toml" ||
+    fail "the untrusted-mise probe passes a [tool_alias] table, so it cannot fire"
+
+# ── wait-ci-gate.yml: both release paths wait for their own commit's ci-gate ──
+wait_workflow=.github/workflows/wait-ci-gate.yml
 wait_step="Wait for ci-gate on this commit"
-wait_script="$(workflow_step_script "$release_workflow" "$wait_step")"
-wait_check="$(STEP_NAME="$wait_step" yq -e -r '.jobs[].steps[] | select(.name == strenv(STEP_NAME)) | .env.CHECK_NAME' "$release_workflow")" ||
-    fail "\"$wait_step\" has no CHECK_NAME"
+wait_script="$(workflow_step_script "$wait_workflow" "$wait_step")"
+wait_env() { STEP_NAME="$wait_step" yq -e -r ".jobs[].steps[] | select(.name == strenv(STEP_NAME)) | .env.$1" "$wait_workflow"; }
+wait_check="$(wait_env CHECK_NAME)" || fail "\"$wait_step\" has no CHECK_NAME"
 [[ "$wait_check" == "$(yq -e -r '.jobs.gate.name' .github/workflows/ci.yml)" ]] ||
     fail "\"$wait_step\" waits for $wait_check, not ci.yml's gate"
+[[ "$(wait_env SHA)" == "\${{ github.sha }}" ]] || fail "\"$wait_step\" waits on another commit than its caller's"
 
 # Each call answers the next of FAKE_CHECK_PAGES, the last one repeating, and
 # logs its endpoint.
@@ -83,13 +121,15 @@ assert_wait() {
     fi
 }
 assert_wait pass "a ci-gate that passes after running" \
-    "$no_runs"$'\n'"$(check_page github-actions in_progress "")"$'\n'error$'\n'"$(check_page github-actions completed success)"
+    "$no_runs"$'\n'"$(check_page github-actions in_progress "")"$'\n'"$(check_page github-actions completed success)"
+assert_wait fail "an API failure" error
 assert_wait fail "a failed ci-gate" "$(check_page github-actions completed failure)"
 assert_wait fail "a cancelled ci-gate" "$(check_page github-actions completed cancelled)"
 assert_wait fail "a skipped ci-gate" "$(check_page github-actions completed skipped)"
 assert_wait fail "another app's passing check of that name" "$(check_page impostor completed success)"
 
 # ── release-plz.yml: only a merged release PR waits for CI and publishes ──
+release_workflow=.github/workflows/release-plz.yml
 detect_step="Detect a merged release PR; refuse a stale one"
 detect_script="$(workflow_step_script "$release_workflow" "$detect_step")"
 detect_prefix="$(STEP_NAME="$detect_step" yq -e -r '.jobs[].steps[] | select(.name == strenv(STEP_NAME)) | .env.PR_BRANCH_PREFIX' "$release_workflow")" ||
@@ -185,8 +225,8 @@ assert_brew() {
     if ((want == 0)); then
         [[ ! -s "$summary" ]] || fail "the homebrew step on $label wrote a summary: $(<"$summary")"
     else
-        [[ "$(grep -c '^### ' "$summary")" == 1 && "$(grep -c '^- ' "$summary")" == "$want" ]] ||
-            fail "the homebrew step on $label wanted one heading and $want items: $(<"$summary")"
+        [[ "$(grep -c '^### ' "$summary")" == 1 ]] ||
+            fail "the homebrew step on $label wanted one heading: $(<"$summary")"
     fi
 }
 assert_brew "a failed fetch" "" 1
@@ -226,17 +266,27 @@ mkdir -p "$apt_dir/bin"
 printf '%s\n' '#!/usr/bin/env bash' 'printf "timeout %s\n" "$*" >>"$APT_LOG"; while [[ "$1" == -* ]]; do shift 2; done; shift; "$@"' >"$apt_dir/bin/timeout"
 # shellcheck disable=SC2016
 printf '%s\n' '#!/usr/bin/env bash' '"$@"' >"$apt_dir/bin/sudo"
-# Fails the first APT_FAILS calls of the kind APT_FAIL_ON names.
-# shellcheck disable=SC2016
-printf '%s\n' '#!/usr/bin/env bash' 'printf "apt-get %s\n" "$*" >>"$APT_LOG"' \
-    'case " $* " in *" update "*) kind=update ;; *" --download-only "*) kind=download ;; *) exit 0 ;; esac' \
-    '[[ "$kind" == "$APT_FAIL_ON" ]] || exit 0' \
-    'n=$(($(cat "$APT_LOG.n" 2>/dev/null || echo 0) + 1)); echo $n >"$APT_LOG.n"; ((n > APT_FAILS))' >"$apt_dir/bin/apt-get"
+# Fails the first APT_FAILS calls of the kind APT_FAIL_ON names, and logs the
+# mirror each update leads with.
+cat >"$apt_dir/bin/apt-get" <<'STUB'
+#!/usr/bin/env bash
+printf 'apt-get %s\n' "$*" >>"$APT_LOG"
+case " $* " in *" update "*) kind=update ;; *" --download-only "*) kind=download ;; *) exit 0 ;; esac
+[[ "$kind" == update ]] && awk -F '\t' '$2 == "priority:1" { print "lead " $1 }' "$APT_MIRRORS" >>"$APT_LOG"
+[[ "$kind" == "$APT_FAIL_ON" ]] || exit 0
+n=$(($(cat "$APT_LOG.n" 2>/dev/null || echo 0) + 1))
+echo $n >"$APT_LOG.n"
+((n > APT_FAILS))
+STUB
 chmod +x "$apt_dir/bin/"*
+# The runner image's list (actions/runner-images configure-apt-sources.sh).
+printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://archive.ubuntu.com/ubuntu/\tpriority:2\nhttps://security.ubuntu.com/ubuntu/\tpriority:3\n' >"$apt_dir/mirrors.image"
 run_apt() {
     rm -f "$apt_dir/log" "$apt_dir/log.n"
+    cp "$apt_dir/mirrors.image" "$apt_dir/mirrors"
     PATH="$apt_dir/bin:$PATH" APT_LOG="$apt_dir/log" APT_FAIL_ON="$1" APT_FAILS="$2" PACKAGES="pkg-a pkg-b" \
-        RECOMMENDS="${3:-true}" ATTEMPTS="$apt_attempts" ATTEMPT_TIMEOUT="$apt_bound" bash -c "$apt_script" >/dev/null 2>&1
+        RECOMMENDS="${3:-true}" ATTEMPTS="$apt_attempts" ATTEMPT_TIMEOUT="$apt_bound" APT_MIRRORS="$apt_dir/mirrors" \
+        bash -c "$apt_script" >/dev/null 2>&1
 }
 apt_count() { grep -c -e "$1" "$apt_dir/log" || true; }
 run_apt none 0 || fail "apt-install failed with a healthy mirror"
@@ -254,6 +304,19 @@ for kind in update download; do
     run_apt "$kind" "$apt_attempts" && fail "apt-install passed after every $kind failed"
     [[ "$(apt_count '--no-download')" == 0 ]] || fail "apt-install installed after every $kind failed"
 done
+# Each attempt leads with the next mirror, and the rest of the list keeps its
+# place.
+run_apt update $((apt_attempts - 1)) || fail "apt-install did not recover from failed updates"
+want=""
+for ((i = 0; i < apt_attempts; i++)); do
+    if ((i % 2 == 0)); then want+="https://archive.ubuntu.com/ubuntu/ "; else want+="http://azure.archive.ubuntu.com/ubuntu/ "; fi
+done
+leads="$(grep '^lead ' "$apt_dir/log" | cut -d' ' -f2 | tr '\n' ' ')"
+[[ "$leads" == "$want" ]] || fail "apt-install's attempts led with \"$leads\", not \"$want\""
+if [[ "$(grep -c . "$apt_dir/mirrors")" != 3 ]] ||
+    ! grep -q $'^https://security\.ubuntu\.com/ubuntu/\tpriority:3$' "$apt_dir/mirrors"; then
+    fail "apt-install's rotation touched lines outside it: $(<"$apt_dir/mirrors")"
+fi
 run_apt none 0 false || fail "apt-install failed without recommends"
 [[ "$(apt_count '^apt-get .*install -y --no-install-recommends')" == 2 ]] ||
     fail "apt-install did not drop recommends from both the download and the install: $(<"$apt_dir/log")"
@@ -288,76 +351,100 @@ git init -q "$test_dir/no-parent" && echo a >"$test_dir/no-parent/lock" && git -
 grep -q 'bad revision' "$test_dir/no-parent.err" ||
     fail "the parentless repo's diff did not fail on its missing parent: $(<"$test_dir/no-parent.err")"
 
-# ── hermetic-nightly.yml: one issue, titled by every uploaded leg, each report on it ──
-file_script="$(workflow_step_script .github/workflows/hermetic-nightly.yml "Open or update tracking issue")"
+# ── hermetic-nightly.yml: the file job carries out the plan `hermetic::issues` made ──
+file_script="$(workflow_step_script .github/workflows/hermetic-nightly.yml "File the planned issues")"
 file_bin="$test_dir/file-bin"
 mkdir -p "$file_bin"
 cat >"$file_bin/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$GH_LOG"
-case "$1 $2" in
-"issue list") echo "${FAKE_OPEN:-}" ;;
-"issue create") echo "https://github.com/o/r/issues/9" ;;
-esac
+[[ "$*" != "${FAKE_FAIL:-}" ]] || exit 1
+if [ "$1 $2" = "issue list" ]; then
+    printf '%s' '[{"number":5,"body":"<!-- hermetic-source: hermes -->\nx"},{"number":7,"body":"y\n  <!-- hermetic-leg: macos-1 -->  "},{"number":8,"body":"<!-- hermetic-source: codex -->"},{"number":1658,"body":"hermetic: a pin bump failed"}]'
+fi
+while [ $# -gt 1 ]; do
+    if [ "$1" = --body-file ]; then cat "$2" >>"$GH_BODIES"; fi
+    shift
+done
 STUB
 chmod +x "$file_bin/gh"
-file_runs="$test_dir/file-runs"
-for os in macos windows; do
-    mkdir -p "$file_runs/hermetic-runs-1-1-$os"
-    printf '# hermetic, latest CLIs on %s: Fail\n\nbody %s\n' "$os" "$os" >"$file_runs/hermetic-runs-1-1-$os/report.md"
-done
-filed() {
+plans="$test_dir/file-plans"
+mkdir -p "$plans"
+# The step in a dir holding $1 as its plan.json, $2 the one gh call that fails: its status.
+file_plan() {
     : >"$test_dir/gh.log"
-    (cd "$file_runs" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" FAKE_OPEN="$1" GH_TOKEN=t GH_REPO=o/r \
-        bash -c "$file_script") >/dev/null 2>&1 || fail "the file step exited non-zero"
-    cat "$test_dir/gh.log"
+    : >"$test_dir/gh.bodies"
+    printf '%s' "$1" >"$plans/plan.json"
+    (cd "$plans" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" GH_BODIES="$test_dir/gh.bodies" FAKE_FAIL="$2" \
+        HERMETIC_LABEL=hermetic HERMETIC_LIMIT=1000 GH_TOKEN=t GH_REPO=o/r RUNNER_TEMP="$test_dir" \
+        bash -c "$file_script") >"$test_dir/file.out" 2>&1
 }
-title='hermetic, latest CLIs on macos: Fail; hermetic, latest CLIs on windows: Fail'
-log="$(filed '')"
-if ! { grep -qxF "issue create --title $title --label hermetic --body-file hermetic-runs-1-1-macos/report.md" <<<"$log" &&
-    grep -qxF "issue comment 9 --body-file hermetic-runs-1-1-windows/report.md" <<<"$log"; }; then
-    fail "a new issue is not titled by both legs' H1s with both reports on it: $log"
+opened='<!-- hermetic-source: hermes -->\nopened'
+plan='{"actions":[{"do":"open","title":"hermetic: hermes","body":"'"$opened"'"},{"do":"comment","number":7,"body":"commented"},{"do":"reopen","number":5,"body":"reopened"},{"do":"close","number":8,"body":"closed"}],"lost":[]}'
+file_plan "$plan" '' || fail "the file step failed a plan it could carry out: $(<"$test_dir/file.out")"
+listed="issue list --label hermetic --state all --limit 1000 --json number,body"
+created="issue create --title hermetic: hermes --label hermetic --body-file $test_dir/body.md"
+expected="$listed
+$created
+issue comment 7 --body-file $test_dir/body.md
+issue reopen 5
+issue comment 5 --body-file $test_dir/body.md
+issue comment 8 --body-file $test_dir/body.md
+issue close 8"
+[[ "$(<"$test_dir/gh.log")" == "$expected" ]] || fail "the plan's actions became other gh calls: $(<"$test_dir/gh.log")"
+[[ "$(<"$test_dir/gh.bodies")" == $'<!-- hermetic-source: hermes -->\nopened\ncommented\nreopened\nclosed' ]] ||
+    fail "an action's body did not reach its call: $(<"$test_dir/gh.bodies")"
+# One gh call that fails leaves the rest carried out, and the step red naming it.
+if file_plan "$plan" 'issue comment 7 --body-file '"$test_dir/body.md"; then
+    fail "the file step passed with an action it could not carry out"
 fi
-log="$(filed 7)"
-if ! { grep -qxF "issue edit 7 --title $title" <<<"$log" && [[ $(grep -c '^issue comment 7 --body-file' <<<"$log") == 2 ]]; }; then
-    fail "an open issue is not retitled with both legs' reports added: $log"
+grep -qxF 'issue close 8' "$test_dir/gh.log" || fail "a failed call stopped the actions after it: $(<"$test_dir/gh.log")"
+grep -qF '::error::could not comment issue 7' "$test_dir/file.out" || fail "the failed action is not named: $(<"$test_dir/file.out")"
+# An issue the planner never marks, and an open led by no marker, are refused, red and named.
+if file_plan '{"actions":[{"do":"close","number":1658,"body":"x"},{"do":"reopen","number":99,"body":"x"},{"do":"open","title":"t","body":"x\n<!-- hermetic-source: forged -->"},{"do":"comment","number":7,"body":"y"}],"lost":[]}' ''; then
+    fail "the file step passed acting on an issue the planner would never mark"
 fi
-# A leg whose run never finished uploads runs with no report.md: the others still file, and the step goes red.
-mkdir -p "$file_runs/hermetic-runs-1-1-linux"
-: >"$test_dir/gh.log"
-if (cd "$file_runs" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" FAKE_OPEN=7 GH_TOKEN=t GH_REPO=o/r \
-    bash -c "$file_script") >/dev/null 2>&1; then
-    fail "the file step passed with a leg that wrote no report"
+for refused in 'close issue 1658' 'reopen issue 99' 'open issue t'; do
+    grep -qF "::error::refused to $refused" "$test_dir/file.out" || fail "the refused $refused is not named: $(<"$test_dir/file.out")"
+done
+[[ "$(<"$test_dir/gh.log")" == "$listed"$'\n'"issue comment 7 --body-file $test_dir/body.md" ]] ||
+    fail "a refused action reached gh, or stopped the rest: $(<"$test_dir/gh.log")"
+# With no list of the hermetic issues, every number is refused, and an open still files.
+if file_plan "$plan" "$listed"; then
+    fail "the file step passed without the hermetic issues listed"
 fi
-[[ $(grep -c '^issue comment 7 --body-file' "$test_dir/gh.log") == 2 ]] ||
-    fail "a leg with no report kept the others' reports off the issue: $(<"$test_dir/gh.log")"
-# A lone uploaded leg lands flat: it files under its own H1.
-flat="$test_dir/file-flat"
-mkdir -p "$flat/copilot"
-printf '# hermetic, latest CLIs on macos, shard 1: New\n\nbody\n' >"$flat/report.md"
-: >"$test_dir/gh.log"
-(cd "$flat" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" FAKE_OPEN='' GH_TOKEN=t GH_REPO=o/r \
-    bash -c "$file_script") >/dev/null 2>&1 || fail "the file step failed a lone leg that landed flat"
-grep -qxF "issue create --title hermetic, latest CLIs on macos, shard 1: New --label hermetic --body-file report.md" "$test_dir/gh.log" ||
-    fail "a lone flat leg is not filed under its H1: $(<"$test_dir/gh.log")"
-# None uploaded: a green drift files nothing, and a failed one is red.
-empty="$test_dir/file-empty"
-mkdir -p "$empty"
-: >"$test_dir/gh.log"
-(cd "$empty" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" DRIFT=success GH_TOKEN=t GH_REPO=o/r \
-    bash -c "$file_script") >/dev/null 2>&1 || fail "the file step failed a night nothing uploaded on"
-[[ ! -s "$test_dir/gh.log" ]] || fail "a night nothing uploaded on filed something: $(<"$test_dir/gh.log")"
-if (cd "$empty" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" DRIFT=failure GH_TOKEN=t GH_REPO=o/r \
-    bash -c "$file_script") >/dev/null 2>&1; then
-    fail "the file step passed a failed drift that uploaded nothing"
+[[ "$(grep -c '^issue \(comment\|reopen\|close\)' "$test_dir/gh.log")" == 0 ]] ||
+    fail "an unlisted number reached gh: $(<"$test_dir/gh.log")"
+grep -qxF "$created" "$test_dir/gh.log" || fail "a failed list stopped the open: $(<"$test_dir/gh.log")"
+# A leg that reported no verdicts turns the step red once its actions are done.
+if file_plan '{"actions":[{"do":"comment","number":7,"body":"x"}],"lost":["macos, shard 1 reported no verdicts"]}' ''; then
+    fail "the file step passed with a lost leg"
 fi
-# Every uploaded leg failed before its report: red, and no issue retitled or opened.
-bare="$test_dir/file-bare"
-mkdir -p "$bare/hermetic-runs-1-1-linux"
-: >"$test_dir/gh.log"
-if (cd "$bare" && PATH="$file_bin:$PATH" GH_LOG="$test_dir/gh.log" FAKE_OPEN=7 GH_TOKEN=t GH_REPO=o/r \
-    bash -c "$file_script") >/dev/null 2>&1; then
-    fail "the file step passed with no uploaded leg holding a report"
-fi
-! grep -qE '^issue (edit|create)' "$test_dir/gh.log" ||
-    fail "a night with no report touched an issue: $(<"$test_dir/gh.log")"
+grep -qF '::error::macos, shard 1 reported no verdicts' "$test_dir/file.out" || fail "the lost leg is not named: $(<"$test_dir/file.out")"
+grep -qxF "issue comment 7 --body-file $test_dir/body.md" "$test_dir/gh.log" || fail "a lost leg stopped the actions: $(<"$test_dir/gh.log")"
+# Nothing to do: no call but the list, and green.
+file_plan '{"actions":[],"lost":[]}' '' || fail "the file step failed an empty plan: $(<"$test_dir/file.out")"
+[[ "$(<"$test_dir/gh.log")" == "$listed" ]] || fail "an empty plan made a gh call: $(<"$test_dir/gh.log")"
+
+# ── site.yml: Playwright's dry run hands apt-install exactly its missing
+# packages.
+pw_script="$(workflow_step_script .github/workflows/site.yml "Find Chromium's missing system packages")"
+pw_bin="$test_dir/pw-bin"
+mkdir -p "$pw_bin"
+cat >"$pw_bin/npx" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$FAKE_REPORT"
+exit "${FAKE_STATUS:-0}"
+STUB
+chmod +x "$pw_bin/npx"
+pw_run() {
+    : >"$test_dir/pw.out"
+    FAKE_REPORT="$1" FAKE_STATUS="$2" GITHUB_OUTPUT="$test_dir/pw.out" PATH="$pw_bin:$PATH" \
+        bash -c "$pw_script" >/dev/null 2>&1
+}
+pw_run 'All system dependencies are installed.' 0 || fail "the Playwright step failed with nothing missing"
+[[ "$(<"$test_dir/pw.out")" == "packages=" ]] || fail "nothing missing still asked apt-install for: $(<"$test_dir/pw.out")"
+pw_run $'Missing system dependencies (2):\n  libasound2t64\n  libnss3' 1 ||
+    fail "the Playwright step failed on a report naming missing packages"
+[[ "$(<"$test_dir/pw.out")" == "packages=libasound2t64 libnss3 " ]] ||
+    fail "the Playwright step handed apt-install: $(<"$test_dir/pw.out")"

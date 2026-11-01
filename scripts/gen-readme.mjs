@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 // Regenerate the README's marker-delimited blocks from the site's single-source
 // JSON (features.json, sources.json, install.json) — the same files
-// Showcase/SupportedTools/Install read, so README and site can't drift.
+// Showcase/SupportedTools/Install read, so README and site can't drift — and
+// its captioned images from scripts/media.json's jobs.
 // `--check` writes nothing and exits non-zero on drift.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import process from 'node:process';
+import features from '../site/src/features.json' with { type: 'json' };
+import sources from '../site/src/sources.json' with { type: 'json' };
+import install from '../site/src/install.json' with { type: 'json' };
+import media from './media.json' with { type: 'json' };
+import { featureText } from '../site/config/feature-text.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const readmePath = join(root, 'README.md');
-const features = JSON.parse(readFileSync(join(root, 'site', 'src', 'features.json'), 'utf8'));
-const sources = JSON.parse(readFileSync(join(root, 'site', 'src', 'sources.json'), 'utf8'));
-const install = JSON.parse(readFileSync(join(root, 'site', 'src', 'install.json'), 'utf8'));
 
 // MUST match `site` in site/astro.config.mjs — a hand-kept copy (importing the
 // astro config here would pull @astrojs/*), and nothing gates the two.
@@ -37,12 +40,18 @@ for (const f of features) {
 // Neutralize only what breaks a GFM table row. `|` uses the HTML entity —
 // backslash-escaping would itself need backslash escaping first (CodeQL
 // js/incomplete-sanitization). Cell text is intentionally markdown-bearing.
-const cell = (s) => String(s).replace(/\|/g, '&#124;').replace(/\r?\n/g, ' ');
+const cell = (/** @type {unknown} */ s) => String(s).replace(/\|/g, '&#124;').replace(/\r?\n/g, ' ');
 
 // The `() => block` replacer must stay a FUNCTION: it inserts the value
 // literally, where a plain string would expand `$`-patterns ($$, $&, $') in the
 // text and corrupt the README in a way --check can't see (both sides of its
 // comparison would go through the same mangling).
+/**
+ * @param {string} label
+ * @param {string} start
+ * @param {string} end
+ * @param {string} body
+ */
 function regenSection(label, start, end, body) {
   const block = `${start}\n${body}\n${end}`;
   const re = new RegExp(`${escapeRe(start)}[\\s\\S]*?${escapeRe(end)}`);
@@ -71,21 +80,22 @@ function regenSection(label, start, end, body) {
 // collapses to an illegible blob; pin width/height from the SVG's own.
 // Returns null if the SVG is missing — the existsSync guard above already
 // reports that with an actionable message, so don't pre-empt it with an ENOENT.
-const svgWH = (pix) => {
+const svgWH = (/** @type {string} */ pix) => {
   const p = join(root, 'docs', 'images', 'pix-icons', `${pix}.svg`);
   if (!existsSync(p)) return null;
   const m = readFileSync(p, 'utf8').match(/<svg[^>]* width="(\d+)" height="(\d+)"/);
   return m && [Number(m[1]), Number(m[2])];
 };
-const pixDims = (pix) => {
+const pixDims = (/** @type {string} */ pix) => {
   const wh = svgWH(pix);
   return wh ? ` width="${wh[0]}" height="${wh[1]}"` : '';
 };
+/** @param {(typeof features)[number]} f */
 const iconCell = (f) =>
   f.pix ? `<img src="docs/images/pix-icons/${cell(f.pix)}.svg" alt=""${pixDims(f.pix)}>` : cell(f.icon);
 const featuredFeatures = features.filter((f) => f.featured !== false);
 const featureRows = featuredFeatures.map(
-  (f) => `| ${iconCell(f)} | **${cell(f.name)}** | ${cell(f.desc)} |`
+  (f) => `| ${iconCell(f)} | **${cell(f.name)}** | ${cell(featureText(f.desc, f))} |`
 );
 // GitHub ignores an <img>'s width/height when its table cell is "shorter" than
 // the image and collapses the column — hard in Safari, where the injected
@@ -93,7 +103,7 @@ const featureRows = featuredFeatures.map(
 // non-breaking-space "glue": real, text-measured content the collapse can't
 // undo. Pad the icon HEADER only, so it doesn't inflate each row's max-content.
 const NBSP_PX = 4; // a README-font &nbsp; ≈ 4px
-const maxIconW = Math.max(...featuredFeatures.map((f) => svgWH(f.pix)?.[0] ?? 0));
+const maxIconW = Math.max(...featuredFeatures.map((f) => (f.pix ? (svgWH(f.pix)?.[0] ?? 0) : 0)));
 const iconHeader = '&nbsp;'.repeat(Math.ceil(maxIconW / NBSP_PX) + 2);
 regenSection(
   'Features table',
@@ -104,7 +114,7 @@ regenSection(
 
 const supported = sources.filter((s) => s.status === 'supported');
 const planned = sources.filter((s) => s.status === 'planned');
-const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const esc = (/** @type {unknown} */ s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 // Two per row: a third column squeezes the longer names on a phone-width page.
 const TOOL_COLUMNS = 2;
 const toolRows = [];
@@ -116,8 +126,12 @@ for (let i = 0; i < supported.length; i += TOOL_COLUMNS) {
 }
 // The grid names no OS, so an OS any supported tool runs on only experimentally
 // gets its caveat here: a Windows user installs from this page.
-const OS_LABELS = { macos: 'macOS', linux: 'Linux', windows: 'Windows' };
-const experimentalNotes = Object.entries(OS_LABELS).flatMap(([os, label]) => {
+const OS_LABELS = /** @type {const} */ ([
+  ['macos', 'macOS'],
+  ['linux', 'Linux'],
+  ['windows', 'Windows'],
+]);
+const experimentalNotes = OS_LABELS.flatMap(([os, label]) => {
   const n = supported.filter((s) => s.platforms?.[os] === 'experimental').length;
   if (!n) return [];
   const scope = n === supported.length ? '' : ' for some tools';
@@ -137,6 +151,42 @@ regenSection(
     ...experimentalNotes.map((n) => `\n${n}`),
   ].join('\n')
 );
+
+// Half the docs jobs' render width, so a 2x screen draws each pixel.
+const README_IMAGE_WIDTH = 768;
+// A docs image with a `caption`, the caption under it and an `href` (a site
+// path) around it. Its file must be committed: media-regen.yml renders
+// docs/images from main, so a new image's README PR follows the bot PR that
+// commits it.
+const codeSpans = (/** @type {string} */ s) => esc(s).replace(/`([^`]+)`/g, '<code>$1</code>');
+const captioned = media.filter((j) => 'caption' in j && j.targets.includes('docs'));
+for (const job of captioned) {
+  const file = `docs/images/${job.id}.${job.kind === 'gif' ? 'gif' : 'png'}`;
+  if (!existsSync(join(root, file))) {
+    errors.push(`media.json "${job.id}" has a caption but ${file} isn't committed yet — wait for media-regen.yml.`);
+    continue;
+  }
+  // A linked image names where it goes
+  // (https://www.w3.org/WAI/tutorials/images/functional/, Example 1); an
+  // unlinked one takes `alt=""`, its caption already describing it
+  // (https://www.w3.org/WAI/tutorials/images/decorative/, Example 3).
+  const href = 'href' in job ? new URL(String(job.href), SITE) : null;
+  const alt = href ? `${href.host}${href.pathname}`.replace(/\/$/, '') : '';
+  const img = `<img src="${file}" alt="${esc(alt)}" width="${README_IMAGE_WIDTH}" />`;
+  const linked = href ? `<a href="${esc(href)}">${img}</a>` : img;
+  regenSection(
+    `${job.id} image`,
+    `<!-- media:${job.id}:start · generated from scripts/media.json by \`just gen-readme\` — edit the JSON, not this block -->`,
+    `<!-- media:${job.id}:end -->`,
+    `<p align="center">${linked}<br /><sub>${codeSpans(String(job.caption))}</sub></p>`
+  );
+}
+// A block no captioned job renders would go stale unseen.
+for (const [, id] of readme.matchAll(/<!-- media:(\S+):start/g)) {
+  if (!captioned.some((j) => j.id === id)) {
+    errors.push(`README.md has a media:${id} block but scripts/media.json has no captioned docs job "${id}".`);
+  }
+}
 
 const installBody = install
   .filter((m) => m.readme)
@@ -158,10 +208,11 @@ if (errors.length) {
 }
 console.log(
   check
-    ? 'README is in sync with features.json + sources.json + install.json ✓'
-    : 'README regenerated from features.json + sources.json + install.json ✓'
+    ? 'README is in sync with features.json + sources.json + install.json + media.json ✓'
+    : 'README regenerated from features.json + sources.json + install.json + media.json ✓'
 );
 
+/** @param {string} s */
 function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

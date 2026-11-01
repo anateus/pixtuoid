@@ -1,0 +1,17 @@
+{
+  "origin": "recorded",
+  "cli": "openclaw",
+  "version": "OpenClaw 2026.10.9 (8b18b55)",
+  "captured": "2026-10-31",
+  "command": "just hermetic --record openclaw",
+  "deidentified": {
+    "method": "decoder-allowlist",
+    "blanked": 4
+  },
+  "aimock": "1.47.0",
+  "script": "tests/sources/openclaw/hermetic/model-error.json",
+  "dropped": {
+    "os": "macos",
+    "at": {}
+  }
+}

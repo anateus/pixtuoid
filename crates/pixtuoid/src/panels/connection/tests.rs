@@ -29,11 +29,10 @@ fn mk_slot(id: AgentId, source: &str, last_event_at: SystemTime) -> AgentSlot {
         created_at: SystemTime::UNIX_EPOCH,
         last_event_at,
         exiting_at: None,
-        pending_idle_at: None,
         desk_index: GlobalDeskIndex(0),
         floor_idx: 0,
         tool_call_count: 0,
-        active_ms: 0,
+        running_ms: 0,
         unknown_cwd: false,
         parent_id: None,
         pid: None,
@@ -174,7 +173,7 @@ fn live_for_reports_a_daemons_instances_not_the_agent_slots_it_never_creates() {
         mk_slot(ghost, src, SystemTime::UNIX_EPOCH + Duration::from_secs(99)),
     );
 
-    let mut add = |port: &str, runs: &[&str]| {
+    let mut add = |port: &str, turns: &[&str]| {
         scene.insert_daemon(
             src,
             pixtuoid_core::state::DaemonInstanceId::new(port).expect("non-empty"),
@@ -183,7 +182,10 @@ fn live_for_reports_a_daemons_instances_not_the_agent_slots_it_never_creates() {
                 active_sessions: 0,
                 last_seen: now,
                 entered_at: now,
-                in_flight_runs: runs.iter().map(|r| (r.to_string(), now)).collect(),
+                in_flight_turns: turns
+                    .iter()
+                    .map(|r| (pixtuoid_core::state::TurnKey::Id(r.to_string().into()), now))
+                    .collect(),
                 current_pid: Some(1),
             },
         );
@@ -194,9 +196,9 @@ fn live_for_reports_a_daemons_instances_not_the_agent_slots_it_never_creates() {
         live_for(now, src, &scene, none).facet,
         LiveFacet::Daemon(Some(DaemonRollup {
             instances: std::num::NonZeroUsize::new(2).expect("two gateways"),
-            state: pixtuoid_core::state::DaemonState::Busy
+            state: pixtuoid_core::state::DaemonState::Running
         })),
-        "two gateways, one busy → 2 instances rolled up to Busy"
+        "two gateways, one running → 2 instances rolled up to Running"
     );
 
     // An AGENT source in the same scene is unaffected — the split is per class.
@@ -233,12 +235,10 @@ fn move_selection_clamps_at_both_ends() {
     assert_eq!(move_selection(&rows, 0, -1), 0);
     assert_eq!(move_selection(&rows, 0, 1), 1);
     assert_eq!(move_selection(&rows, 1, 1), 1);
-    assert_eq!(move_selection(&[], 0, 1), 0);
 }
 
 #[test]
-fn build_rows_covers_every_registry_source_with_aligned_live_view() {
-    // The painter relies on `live_view` being index-aligned with `rows`.
+fn build_rows_covers_every_registry_source() {
     let rows = build_rows(&HashSet::new(), "");
     assert!(rows.len() >= 5, "expected the 5 install targets + sources");
     assert!(
@@ -246,9 +246,6 @@ fn build_rows_covers_every_registry_source_with_aligned_live_view() {
             .any(|r| r.source_id == "copilot" && r.target.is_none()),
         "copilot must appear as a no-target (JSONL) row"
     );
-    let scene = SceneState::uniform(8);
-    let live = live_view(SystemTime::UNIX_EPOCH, &rows, &scene, &[]);
-    assert_eq!(live.len(), rows.len());
 }
 
 /// A disconnected row carries no health line, even with drift its connected

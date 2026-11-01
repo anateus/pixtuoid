@@ -61,7 +61,7 @@ async fn watcher_emits_proof_of_life_for_probe_live_ids() {
     handle.abort();
 }
 
-/// The probe starts EMPTY so the initial seed + 250ms rescan gate the stale
+/// The probe starts EMPTY so the initial seed gates the stale
 /// file; the id becomes probe-live only afterwards, so the SessionStart can
 /// ONLY come from a poll-arm snapshot refresh and the ProofOfLife only from
 /// the poll-arm emission. `with_poll_interval` is the test seam — the
@@ -360,7 +360,7 @@ async fn probe_failure_changes_nothing() {
     let mut got_activity = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some((_, AgentEvent::ActivityStart { agent_id, .. }))) =
+        if let Ok(Some((_, AgentEvent::ToolUseStart { agent_id, .. }))) =
             tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
             && agent_id == expected
         {

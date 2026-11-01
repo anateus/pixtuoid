@@ -6,7 +6,7 @@
 //! policy for its origin (openclaw `docs/cli/plugins/install.md:318-320` @
 //! v2026.10.1), while `plugins install --link` creates a managed install record that
 //! requires capability consent (`docs/plugins/manage-plugins.md:216-218`). The
-//! `allowConversationAccess` grant un-gates `before_agent_run`/`agent_end` (the busy
+//! `allowConversationAccess` grant un-gates `before_agent_run`/`agent_end` (the running
 //! tell) and UNINSTALL REVOKES it; the plugin FILES are left in place (the config
 //! un-merge stops the gateway loading them).
 
@@ -28,13 +28,11 @@ const STATE_DIRS: [&str; 2] = [".openclaw", ".clawdbot"];
 const CONFIG_FILES: [&str; 2] = ["openclaw.json", "clawdbot.json"];
 #[cfg(test)]
 const SENTINEL: &str = "@pixtuoid-openclaw-plugin";
-const HOOK_PLACEHOLDER: &str = "\"{{HOOK_PATH_JSON}}\"";
 pub(crate) const PLUGIN_TEMPLATE: &str = include_str!("openclaw_plugin.js");
 
-/// The OpenClaw gateway hook events the plugin FORWARDS, pinned to its `HOOKS`
-/// array and `decode_openclaw_hook_payload`'s arms by the consistency test below.
-/// A rename upstream makes that hook silently stop firing, since the plugin
-/// registers by name.
+/// The OpenClaw gateway hook events the plugin FORWARDS, pinned to what it
+/// registers by its selftest and to `decode_openclaw_hook_payload`'s arms by the
+/// test below.
 #[cfg(test)]
 pub(crate) const OPENCLAW_EVENTS: &[&str] = &[
     "gateway_start",
@@ -45,8 +43,7 @@ pub(crate) const OPENCLAW_EVENTS: &[&str] = &[
     "agent_end",
 ];
 
-/// The hooks the plugin registers only to stamp `agent_end`'s verdict, pinned to its
-/// `VERDICT_HOOKS`.
+/// The hooks the plugin registers only to stamp `agent_end`'s verdict.
 #[cfg(test)]
 pub(crate) const OPENCLAW_VERDICT_EVENTS: &[&str] = &["model_call_ended"];
 
@@ -238,7 +235,7 @@ pub(crate) fn plugin_artifacts(hook_path: &str) -> Result<Vec<(PathBuf, String)>
 }
 
 fn render_plugin(hook_path: &str) -> Result<String> {
-    crate::install::merge::bake_hook_path(PLUGIN_TEMPLATE, HOOK_PLACEHOLDER, hook_path, "openclaw")
+    crate::install::merge::bake_hook_path(PLUGIN_TEMPLATE, hook_path, "openclaw")
 }
 
 /// The advice the JSON5 refusal and the schema notes point at.
@@ -446,7 +443,7 @@ pub(crate) fn verify_schema(content: &str) -> crate::install::verify::SchemaPars
     if entry["hooks"]["allowConversationAccess"] != json!(true) {
         issues.push(
             "openclaw.json `plugins.entries.pixtuoid.hooks.allowConversationAccess` is not true \
-             — the gateway fires no run hooks, so the lobster never shows busy"
+             — the gateway fires no run hooks, so the lobster never shows running"
                 .into(),
         );
     }
@@ -665,47 +662,14 @@ mod tests {
         );
     }
 
+    /// The plugin's selftest holds what it registers to these consts
+    /// (`plugin-contract.json`); each must decode.
     #[test]
-    fn openclaw_events_plugin_decoder_and_const_agree() {
+    fn every_registered_openclaw_event_decodes_to_its_gateway() {
         use pixtuoid_core::source::openclaw::decode_openclaw_hook_payload;
         for ev in OPENCLAW_EVENTS {
-            assert!(
-                PLUGIN_TEMPLATE.contains(&format!("\"{ev}\"")),
-                "plugin HOOKS is missing the registered event `{ev}`"
-            );
-        }
-        // The names of the array `[…]` or object `{ name: handler, … }` `name` binds.
-        let names =
-            |name: &str, open: &str, close: &str| -> std::collections::HashSet<&'static str> {
-                PLUGIN_TEMPLATE
-                    .split_once(&format!("const {name} = {open}"))
-                    .and_then(|(_, rest)| rest.split_once(close))
-                    .map(|(inner, _)| inner)
-                    .unwrap_or_else(|| panic!("plugin defines {name}"))
-                    .split(',')
-                    .map(|s| {
-                        s.split(':')
-                            .next()
-                            .unwrap_or_default()
-                            .trim()
-                            .trim_matches('"')
-                    })
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
-        assert_eq!(
-            names("HOOKS", "[", "];"),
-            OPENCLAW_EVENTS.iter().copied().collect(),
-            "plugin HOOKS drifted from OPENCLAW_EVENTS"
-        );
-        assert_eq!(
-            names("VERDICT_HOOKS", "{", "};"),
-            OPENCLAW_VERDICT_EVENTS.iter().copied().collect(),
-            "plugin VERDICT_HOOKS drifted from OPENCLAW_VERDICT_EVENTS"
-        );
-        for ev in OPENCLAW_EVENTS {
             let payload = json!({ "type": ev, "gatewayPort": 18789 });
-            let decoded = decode_openclaw_hook_payload(&payload).unwrap();
+            let decoded = decode_openclaw_hook_payload(payload.as_object().unwrap()).unwrap();
             assert!(
                 !decoded.updates.is_empty(),
                 "decode_openclaw_hook_payload has no arm for registered event `{ev}`"
@@ -738,7 +702,10 @@ mod tests {
                 index.contains("\"/opt/bin/pixtuoid-hook\""),
                 "shim path baked JSON-escaped"
             );
-            assert!(!index.contains(HOOK_PLACEHOLDER), "placeholder replaced");
+            assert!(
+                !index.contains(crate::install::merge::HOOK_PLACEHOLDER),
+                "placeholder replaced"
+            );
             assert!(
                 index.contains("--source"),
                 "spawns the shim with --source openclaw"
@@ -779,7 +746,7 @@ mod tests {
             assert_eq!(
                 entry["hooks"]["allowConversationAccess"],
                 json!(true),
-                "the busy-tell grant"
+                "the running-tell grant"
             );
             let paths = v["plugins"]["load"]["paths"].as_array().unwrap();
             assert!(

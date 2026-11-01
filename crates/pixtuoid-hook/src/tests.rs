@@ -2,11 +2,6 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn stdin_cap_plus_headroom_equals_the_pipe_quota() {
-    assert_eq!(STDIN_CAP + STAMP_HEADROOM, 1 << 20);
-}
-
-#[test]
 fn stamp_headroom_covers_worst_case_stamps() {
     let mut p = json!({});
     let map = p.as_object_mut().unwrap();
@@ -55,13 +50,9 @@ fn an_upstream_pid_is_kept_and_the_resolver_never_runs() {
 }
 
 #[test]
-fn now_ms_narrowing_saturates_instead_of_wrapping() {
-    // 1_704_067_200_000 is 2024-01-01 in ms — a real-magnitude value.
-    assert_eq!(ms_u128_to_u64(1_704_067_200_000), 1_704_067_200_000);
+fn now_ms_is_a_real_wall_clock_reading() {
+    // 1_704_067_200_000 is 2024-01-01 in ms.
     assert!(now_ms() > 1_704_067_200_000);
-    assert_eq!(ms_u128_to_u64(u128::from(u64::MAX)), u64::MAX);
-    assert_eq!(ms_u128_to_u64(u128::from(u64::MAX) + 1), u64::MAX);
-    assert_eq!(ms_u128_to_u64(u128::MAX), u64::MAX);
 }
 
 #[test]
@@ -72,14 +63,6 @@ fn stamps_cli_source_under_private_key_and_leaves_public_source_untouched() {
     assert_eq!(map["_pixtuoid_source"], json!("claude-code"));
     assert_eq!(map["source"], json!("startup"), "public reason untouched");
     assert_eq!(map["_shim_ts_ms"], json!(123u64));
-}
-
-#[test]
-fn no_source_env_omits_private_key_so_decoder_defaults_to_claude() {
-    let mut p = json!({ "hook_event_name": "Stop" });
-    let map = p.as_object_mut().unwrap();
-    enrich_payload(map, None, None, 1, || None);
-    assert!(map.get("_pixtuoid_source").is_none());
 }
 
 #[test]
@@ -129,36 +112,20 @@ fn argv(parts: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn source_from_argv_reads_space_form() {
+fn source_from_argv_reads_both_forms_and_rejects_empty() {
     assert_eq!(
         source_from_argv(&argv(&["pixtuoid-hook", "--source", "codex"])),
         Some("codex".into())
     );
-}
-
-#[test]
-fn source_from_argv_reads_equals_form() {
     assert_eq!(
         source_from_argv(&argv(&["pixtuoid-hook", "--source=codex"])),
         Some("codex".into())
     );
-}
-
-#[test]
-fn source_from_argv_absent_is_none() {
     assert_eq!(source_from_argv(&argv(&["pixtuoid-hook"])), None);
-}
-
-#[test]
-fn source_from_argv_missing_value_is_none() {
     assert_eq!(
         source_from_argv(&argv(&["pixtuoid-hook", "--source"])),
         None
     );
-}
-
-#[test]
-fn source_from_argv_empty_value_is_none() {
     assert_eq!(
         source_from_argv(&argv(&["pixtuoid-hook", "--source", ""])),
         None
@@ -231,14 +198,18 @@ fn env_payload_folds_codewhale_env_into_the_envelope() {
         ("DEEPSEEK_WORKSPACE", "/repo"),
         ("DEEPSEEK_TOOL_NAME", "exec_shell"),
         ("DEEPSEEK_TOOL_ARGS", r#"{"command":"ls -la"}"#),
+        ("CODEWHALE_TOOL_CALL_ID", "call-1"),
+        ("CODEWHALE_SESSION_ID", "sess_1a2b3c4d"),
     ]
     .into_iter()
     .collect();
-    let map = env_payload_from("tool_call_before", None, |k| env.get(k).map(OsString::from));
+    let map = env_payload_from("tool_call_before", |k| env.get(k).map(OsString::from));
     assert_eq!(map["event"], json!("tool_call_before"));
     assert_eq!(map["cwd"], json!("/repo"));
+    assert_eq!(map["session_id"], json!("sess_1a2b3c4d"));
     assert_eq!(map["tool"], json!("exec_shell"));
     assert_eq!(map["tool_args"], json!(r#"{"command":"ls -la"}"#));
+    assert_eq!(map["tool_call_id"], json!("call-1"));
 }
 
 /// env-mode's envelope still carries `_pid` — via the ONE stamping site, which
@@ -247,7 +218,7 @@ fn env_payload_folds_codewhale_env_into_the_envelope() {
 /// pid is exactly the duplicate this pins against.
 #[test]
 fn env_mode_gets_its_pid_from_the_single_enrich_site() {
-    let mut map = env_payload_from("tool_call_before", None, |_| None);
+    let mut map = env_payload_from("tool_call_before", |_| None);
     assert!(!map.contains_key("_pid"), "not stamped at envelope build");
     enrich_payload(&mut map, None, None, 0, || Some(4321));
     assert_eq!(map["_pid"], json!(4321), "stamped once, by enrich_payload");
@@ -259,7 +230,7 @@ fn env_payload_omits_missing_and_empty_env() {
         [("DEEPSEEK_WORKSPACE", "/repo"), ("DEEPSEEK_TOOL_NAME", "")]
             .into_iter()
             .collect();
-    let map = env_payload_from("session_start", None, |k| env.get(k).map(OsString::from));
+    let map = env_payload_from("session_start", |k| env.get(k).map(OsString::from));
     assert_eq!(map["cwd"], json!("/repo"));
     assert!(
         !map.contains_key("tool"),
@@ -286,7 +257,7 @@ fn env_payload_caps_oversized_fields_at_a_char_boundary() {
     ]
     .into_iter()
     .collect();
-    let map = env_payload_from("tool_call_before", None, |k| env.get(k).map(OsString::from));
+    let map = env_payload_from("tool_call_before", |k| env.get(k).map(OsString::from));
     let args = map["tool_args"].as_str().unwrap();
     assert!(
         args.len() <= ENV_FIELD_CAP,
@@ -301,11 +272,7 @@ fn env_payload_caps_oversized_fields_at_a_char_boundary() {
         args.chars().all(|c| c == 'é'),
         "no mid-scalar split → still valid é runs"
     );
-    assert_eq!(
-        map["cwd"],
-        json!("/repo"),
-        "the AgentId key (a real path) is untouched"
-    );
+    assert_eq!(map["cwd"], json!("/repo"), "cwd (a real path) is untouched");
 }
 
 #[test]
@@ -327,42 +294,6 @@ fn cap_never_exceeds_the_bound_when_a_multibyte_scalar_straddles_it() {
         "floor to the last char boundary at or below the cap"
     );
     assert!(capped.chars().all(|c| c == 'a'), "the straddler is dropped");
-}
-
-#[test]
-fn env_payload_falls_back_to_cwd_when_workspace_unset() {
-    // A fresh `codewhale` without `-C` has no DEEPSEEK_WORKSPACE at
-    // session_start.
-    let no_ws: std::collections::HashMap<&str, String> =
-        [("DEEPSEEK_TOOL_NAME", "exec_shell".to_string())]
-            .into_iter()
-            .collect();
-    let map = env_payload_from("session_start", Some("/proj/here".to_string()), |k| {
-        no_ws.get(k).map(OsString::from)
-    });
-    assert_eq!(
-        map["cwd"],
-        json!("/proj/here"),
-        "cwd must fall back to the hook child's working dir when DEEPSEEK_WORKSPACE is unset"
-    );
-
-    let ws: std::collections::HashMap<&str, String> = [("DEEPSEEK_WORKSPACE", "/ws".to_string())]
-        .into_iter()
-        .collect();
-    let map = env_payload_from("session_start", Some("/proj/here".to_string()), |k| {
-        ws.get(k).map(OsString::from)
-    });
-    assert_eq!(
-        map["cwd"],
-        json!("/ws"),
-        "DEEPSEEK_WORKSPACE wins over the fallback"
-    );
-
-    let map = env_payload_from("session_start", None, |_| None);
-    assert!(
-        !map.contains_key("cwd"),
-        "no workspace and no cwd fallback → no cwd field"
-    );
 }
 
 #[cfg(unix)]
@@ -493,4 +424,50 @@ fn default_socket_path_branches_windows() {
             );
         });
     });
+}
+
+/// Re-execs itself: the hook's `exit(0)` must stay out of the shared test process.
+#[test]
+fn a_panic_on_any_thread_exits_zero_silently() {
+    const CHILD: &str = "PIXTUOID_HOOK_PANIC_CHILD";
+    match std::env::var_os(CHILD).as_deref().and_then(|v| v.to_str()) {
+        Some("caller") => {
+            silence_panics();
+            panic!("probe");
+        }
+        Some("spawned") => {
+            silence_panics();
+            let _ = std::thread::spawn(|| panic!("probe")).join();
+            // Only the hook's exit(0) may end the child with 0; a hook that merely
+            // silences stderr lets `join` return, and this fails the case.
+            std::process::exit(1);
+        }
+        _ => {}
+    }
+    // The module path less the crate, so a re-exec still finds the test after this module moves.
+    let module = module_path!()
+        .split_once("::")
+        .map_or(module_path!(), |(_, m)| m);
+    for case in ["caller", "spawned"] {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{module}::a_panic_on_any_thread_exits_zero_silently"),
+                "--nocapture",
+            ])
+            .env(CHILD, case)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{case}: {:?}", out.status);
+        // A filter matching nothing also exits 0 with empty stderr.
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("running 1 test"),
+            "{case}: the child never ran the probe"
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{case}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

@@ -3,6 +3,8 @@
 //!
 //! - `plan <taken.json> <drift.json>`: the proposals, as JSON, given the titles
 //!   `gh pr list --json title` names and the drift job's outputs.
+//! - `plugin-types`: every plugin host's npm packages at its source's
+//!   `verified_version`, one `name@version` per line, for `just plugin-types`.
 //! - `patch <source> <out>`: the tree's bump of `source` as a patch at `out`;
 //!   nothing is written when the tree is unchanged.
 //! - `check <proposals.json> <patches>`: each proposal's patch in `patches`,
@@ -17,10 +19,12 @@ use std::process::Command;
 
 use pixtuoid_core::harness::hermetic::bump::{self, Proposal};
 use pixtuoid_core::harness::hermetic::{self, Profile, pin};
+use pixtuoid_core::harness::read_json;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
 const USAGE: &str = "usage: bump plan <taken.json> <drift.json>\n       \
+                     bump plugin-types\n       \
                      bump patch <source> <out>\n       \
                      bump check <proposals.json> <patches>";
 
@@ -28,6 +32,14 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let done = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["plan", taken, drift] => plan(Path::new(taken), Path::new(drift)),
+        ["plugin-types"] => {
+            for p in hermetic::PROFILES {
+                for package in p.plugin_types {
+                    println!("{package}@{}", p.descriptor().verified_version);
+                }
+            }
+            Ok(())
+        }
         ["patch", source, out] => patch(source, Path::new(out)),
         ["check", proposals, patches] => check(Path::new(proposals), Path::new(patches)),
         _ => {
@@ -46,17 +58,13 @@ struct Titled {
     title: String,
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{path:?}: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("{path:?}: {e}"))
-}
-
 fn plan(taken: &Path, drift: &Path) -> Result<(), String> {
-    let taken: Vec<String> = read_json::<Vec<Titled>>(taken)?
+    let taken: Vec<String> = read_json::<Vec<Titled>>(taken)
+        .map_err(|e| e.to_string())?
         .into_iter()
         .map(|t| t.title)
         .collect();
-    let proposals = bump::plan(&read_json(drift)?, &taken)?;
+    let proposals = bump::plan(&read_json(drift).map_err(|e| e.to_string())?, &taken)?;
     println!(
         "{}",
         serde_json::to_string(&proposals).map_err(|e| e.to_string())?
@@ -160,9 +168,8 @@ fn check(proposals: &Path, patches: &Path) -> Result<(), String> {
     if !git(&["status", "--porcelain"])?.is_empty() {
         return Err("check needs a clean tree".into());
     }
-    let registry = std::fs::read_to_string(pin::registry_path()).map_err(|e| e.to_string())?;
     let mut admitted = Vec::new();
-    for proposal in read_json::<Vec<Proposal>>(proposals)? {
+    for proposal in read_json::<Vec<Proposal>>(proposals).map_err(|e| e.to_string())? {
         let file = patches.join(bump::patch_name(&proposal.source));
         if !file.is_file() {
             eprintln!("{}: no patch, so its bump leg failed", proposal.source);
@@ -174,13 +181,15 @@ fn check(proposals: &Path, patches: &Path) -> Result<(), String> {
         let file = file
             .to_str()
             .ok_or_else(|| format!("{file:?} is not UTF-8"))?;
+        let before =
+            std::fs::read_to_string(pin::descriptor_path(p.source)).map_err(|e| e.to_string())?;
         git(&["apply", file])?;
         let judged = git(&["add", "--intent-to-add", "--all"])
             .and_then(|_| changed())
             .and_then(|changed| {
-                let after =
-                    std::fs::read_to_string(pin::registry_path()).map_err(|e| e.to_string())?;
-                bump::judge(p, &version, &registry, &after, &changed)?;
+                let after = std::fs::read_to_string(pin::descriptor_path(p.source))
+                    .map_err(|e| e.to_string())?;
+                bump::judge(p, &version, &before, &after, &changed)?;
                 Ok(changed)
             });
         git(&["reset", "-q", "--hard", "HEAD"])?;

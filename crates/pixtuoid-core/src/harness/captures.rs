@@ -4,6 +4,7 @@
 //! callers: its workspace, raw record, flag spellings and the wait on a
 //! server either starts.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -188,6 +189,79 @@ pub const PROVENANCE: &str = "provenance.json";
 /// A raw capture's [`CaptureRecord`].
 pub const CAPTURE_RECORD: &str = "capture.json";
 
+/// Where the recorder names the dir a driver keeps its own logs and homes in:
+/// gone with a capture that worked, or whose whole redacted copy is in the run
+/// dir; kept, and named, for one that did not work and has no whole copy,
+/// since only the recorder knows which.
+pub const DRIVER_DIR_ENV: &str = "PIXTUOID_CAPTURE_DRIVER_DIR";
+
+/// The file in its [`DRIVER_DIR_ENV`] dir where a driver that gave up on its
+/// turn says why, for [`CaptureRecord::give_up_reason`].
+pub const GAVE_UP_NOTE: &str = "gave-up.txt";
+
+/// How the CLI process the recorder ran for a turn exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessExit {
+    /// It exited with this code.
+    Exited(i32),
+    /// A signal ended it.
+    Signalled,
+    /// The recorder's [`crate::harness::hermetic::TURN_BUDGET`] killed it.
+    OutOfTime,
+}
+
+impl From<std::process::ExitStatus> for ProcessExit {
+    fn from(status: std::process::ExitStatus) -> Self {
+        status.code().map_or(Self::Signalled, Self::Exited)
+    }
+}
+
+impl std::fmt::Display for ProcessExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited(code) => write!(f, "exit {code}"),
+            Self::Signalled => f.write_str("killed by a signal"),
+            Self::OutOfTime => f.write_str("killed at its budget"),
+        }
+    }
+}
+
+/// How the step that stops a CLI's server ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerStop {
+    /// How the stop exited.
+    pub exit: ProcessExit,
+    /// The pids the run's payloads stamped that still ran once the stop's grace
+    /// ran out: a stop can exit 0 with its server up
+    /// (`hermes_cli/gateway.py:2025-2040` at hermes v0.22.5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outlived: Vec<i32>,
+}
+
+/// The pids the hook `payloads` stamped that still run once `grace` ran out,
+/// waiting no longer than the last of them takes to exit.
+#[cfg(feature = "native")]
+pub fn outlived(payloads: &[String], grace: Duration) -> Vec<i32> {
+    use crate::source::decoder::{PID_STAMP, checked_pid};
+    let pids: std::collections::BTreeSet<i32> = payloads
+        .iter()
+        .filter_map(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .filter_map(|v| v.get(PID_STAMP)?.as_i64().and_then(checked_pid))
+        .collect();
+    let running = || {
+        pids.iter()
+            .copied()
+            .filter(|&p| crate::source::cc_probe::pid_alive(p))
+            .collect::<Vec<_>>()
+    };
+    // Its one error is the grace running out, which `running` then reports.
+    let _ = wait_until("the stamped processes' exit", grace, || {
+        Ok(running().is_empty())
+    });
+    running()
+}
+
 /// What only the recorder knows about a raw (`--out`) capture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureRecord {
@@ -197,11 +271,20 @@ pub struct CaptureRecord {
     pub cli: String,
     /// Its `--version`.
     pub version: String,
-    /// Its exit code; `None` when a signal ended it.
-    pub exit_code: Option<i32>,
+    /// How its turn's process exited.
+    pub end: ProcessExit,
+    /// Why the turn's driver gave up on it, in its own words, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub give_up_reason: Option<String>,
+    /// Why the recorder could not complete the capture, in one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<String>,
     /// Its second turn, for a run that had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub second_turn: Option<SecondTurn>,
+    /// How the step that stops the CLI's server ended, for a run that had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_stop: Option<ServerStop>,
     /// Whether the note the recorder planted was still there, unchanged, once
     /// every turn exited: a refused call that deletes it did not stay refused.
     #[serde(default)]
@@ -209,26 +292,75 @@ pub struct CaptureRecord {
 }
 
 impl CaptureRecord {
+    /// Which of its turns the recorder's budget killed, if one did.
+    pub fn killed_turn(&self) -> Option<&'static str> {
+        if self.end == ProcessExit::OutOfTime {
+            Some("turn")
+        } else if self
+            .second_turn
+            .as_ref()
+            .is_some_and(|r| r.end == ProcessExit::OutOfTime)
+        {
+            Some("second turn")
+        } else {
+            None
+        }
+    }
+
     /// Whether the CLI ran `shape`'s turn as scripted, and its second turn
     /// where one ran.
     pub fn exited_as_scripted(&self, shape: crate::harness::hermetic::Shape) -> bool {
-        shape.exits_as_scripted(self.exit_code)
+        shape.exits_as_scripted(self.end)
             && self
                 .second_turn
                 .as_ref()
-                .is_none_or(|r| shape.exits_as_scripted(r.exit_code))
+                .is_none_or(|r| shape.exits_as_scripted(r.end))
     }
 }
 
 /// A second turn, as the recorder ran it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecondTurn {
-    /// Its exit code; `None` when a signal ended it.
-    pub exit_code: Option<i32>,
+    /// How its process exited.
+    pub end: ProcessExit,
 }
 
-/// Module dirs whose name is NOT the registered source id.
-const MODULE_TO_SOURCE: &[(&str, &str)] = &[("claude", "claude-code")];
+/// The captures a module test drives itself, as `(source, scenario)`, which no
+/// conformance golden can hold: omp's hook keys fold per platform, and every
+/// other row is a delegation, a second sprite the one-AgentId rule refuses.
+/// Exact, so a capture leaves conformance only by a reviewed line here.
+pub const OUTSIDE_CONFORMANCE: &[(&str, &str)] = &[
+    ("claude-code", "subagent-hermetic"),
+    ("codewhale", "child-error-hermetic"),
+    ("codex", "subagent-hermetic"),
+    ("copilot", "child-error-hermetic"),
+    ("copilot", "subagent-hermetic"),
+    ("cursor", "delegation"),
+    ("dsh", "subagent-hermetic"),
+    ("grok", "subagent-hermetic"),
+    ("omp", "approve-hermetic"),
+    ("omp", "ask-hermetic"),
+    ("omp", "new-session-hermetic"),
+    ("omp", "permission-hermetic"),
+    ("omp", "resume-hermetic"),
+    ("omp", "subagent-hermetic"),
+    ("omp", "tool-run-hermetic"),
+    ("opencode", "subagent-hermetic"),
+    ("reasonix", "explore-hermetic"),
+    ("reasonix", "subagent-hermetic"),
+];
+
+/// The home of `source`'s captures, scripts and screens under the corpus.
+pub(crate) fn source_home(source: &str) -> PathBuf {
+    crate::harness::sources_root().join(crate::harness::module_of(source))
+}
+
+/// Where `source`'s captures sit in the corpus at `root`: the walk, the
+/// recorder and the hermetic tier's derived fixtures all spell it here.
+pub fn fixtures_dir(root: &Path, source: &str) -> PathBuf {
+    root.join(crate::harness::module_of(source))
+        .join("fixtures")
+}
 
 /// A committed capture: the directory holding its bytes and the registered
 /// source the LAYOUT says owns them — never the provenance, which could lie.
@@ -251,6 +383,12 @@ impl Capture {
     /// Its `provenance.json`.
     pub fn provenance_path(&self) -> PathBuf {
         self.dir.join(PROVENANCE)
+    }
+
+    /// Whether the conformance golden snapshots it: all but [`OUTSIDE_CONFORMANCE`].
+    pub fn in_conformance(&self) -> bool {
+        let scenario = self.dir.file_name().unwrap_or_default().to_string_lossy();
+        !OUTSIDE_CONFORMANCE.contains(&(self.source.as_str(), scenario.as_ref()))
     }
 }
 
@@ -321,7 +459,7 @@ const ID_FAMILIES: &[IdFamily] = &[
     IdFamily {
         name: "uuid",
         pattern: r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        seen_in: "fixtures/claude-code/tool-run-hermetic",
+        seen_in: "claude_code/fixtures/tool-run-hermetic",
         renamed: &[(
             "3a94538f-09fe-4231-8195-8e5277ac55fe",
             "5c268a10-f98f-494a-b750-92a110ad30a9",
@@ -330,7 +468,7 @@ const ID_FAMILIES: &[IdFamily] = &[
     IdFamily {
         name: "anthropic-tool-use",
         pattern: r"toolu_[0-9A-Za-z_-]+",
-        seen_in: "fixtures/claude-code/tool-run-hermetic",
+        seen_in: "claude_code/fixtures/tool-run-hermetic",
         renamed: &[("toolu_whFwVaQVHr-tJpiG", "toolu_dft8jZ_PBInjS87R")],
     },
     // Not the wire names that hold it (`call_id`, `function_call_output`): a
@@ -338,7 +476,7 @@ const ID_FAMILIES: &[IdFamily] = &[
     IdFamily {
         name: "openai-tool-call",
         pattern: r"\bcall_[0-9A-Za-z_-]{16,}",
-        seen_in: "fixtures/kimi/tool-run-hermetic",
+        seen_in: "kimi/fixtures/tool-run-hermetic",
         renamed: &[
             ("call_orvKmWb1fXgIDLfw", "call_2Xs85giJlWCQx58K"),
             (
@@ -350,17 +488,29 @@ const ID_FAMILIES: &[IdFamily] = &[
     IdFamily {
         name: "claude-code-subagent",
         pattern: r"\ba[0-9a-f]{16}\b",
-        seen_in: "claude/fixtures/subagent-hermetic",
+        seen_in: "claude_code/fixtures/subagent-hermetic",
         renamed: &[("agent-a8074a27caeedb715", "agent-a615cb511b5899d39")],
     },
     IdFamily {
         name: "opencode-session",
         pattern: r"ses_[0-9A-Za-z]{26}",
-        seen_in: "fixtures/opencode/tool-run-hermetic",
+        seen_in: "opencode/fixtures/tool-run-hermetic",
         renamed: &[(
             "ses_eabb87c3cffeVHXkPkR0sAM6MD",
             "ses_eab5376a1ffezRy0f5TzOmUH7a",
         )],
+    },
+    IdFamily {
+        name: "codewhale-session",
+        pattern: r"\bsess_[0-9a-f]{8}\b",
+        seen_in: "codewhale/fixtures/tool-run-hermetic",
+        renamed: &[("sess_45ce9c9f", "sess_411948cd")],
+    },
+    IdFamily {
+        name: "codewhale-subagent",
+        pattern: r"\bagent_[0-9a-f]{8}\b",
+        seen_in: "codewhale/fixtures/child-error-hermetic",
+        renamed: &[("agent_7ca434ad", "agent_66a9c2b8")],
     },
     IdFamily {
         name: "reasonix-subagent",
@@ -374,7 +524,7 @@ const ID_FAMILIES: &[IdFamily] = &[
     IdFamily {
         name: "reasonix-session-start",
         pattern: r"\d{8}-\d{6}\.\d{9}",
-        seen_in: "fixtures/reasonix/tool-run-hermetic",
+        seen_in: "reasonix/fixtures/tool-run-hermetic",
         renamed: &[(
             "20261019-063638.389045000-deepseek-v4-flash",
             "20261019-162745.781162000-deepseek-v4-flash",
@@ -382,9 +532,12 @@ const ID_FAMILIES: &[IdFamily] = &[
     },
     IdFamily {
         name: "hermes-session",
-        pattern: r"\d{8}_\d{6}_[0-9a-f]{6}",
-        seen_in: "fixtures/hermes/tool-run-hermetic",
-        renamed: &[("20261020_005102_5e501b", "20261020_005045_5564c8")],
+        pattern: r"\blocal-[0-9a-f]{64}\b",
+        seen_in: "hermes/fixtures/tool-run-hermetic",
+        renamed: &[(
+            "local-b65b0c6b008cbf991f9bba7c89ed68d89e5aefca3f897033db205cca4ca90bcf",
+            "local-33495004b27dda4f734c247e04b46ed7abebc24f60b73816ea6120625359848e",
+        )],
     },
     // Codex's and omp's.
     IdFamily {
@@ -402,39 +555,56 @@ const ID_FAMILIES: &[IdFamily] = &[
     IdFamily {
         name: "recorder-sandbox",
         pattern: r"\.tmp[0-9A-Za-z]{6}",
-        seen_in: "delegation/fixtures/omp",
+        seen_in: "omp/fixtures/subagent-hermetic",
         renamed: &[("/T/.tmpbelEXY/homes", "/T/.tmpLZD2ds/homes")],
     },
     IdFamily {
         name: "shim-pid",
         pattern: r#""_pid":(\d+)"#,
-        seen_in: "fixtures/dsh/tool-run-recorded",
+        seen_in: "dsh/fixtures/tool-run-hermetic",
         renamed: &[(r#"{"_pid":56875}"#, r#"{"_pid":42895}"#)],
     },
     IdFamily {
         name: "shim-clock",
         pattern: r#""_shim_ts_ms":(\d+)"#,
-        seen_in: "fixtures/dsh/tool-run-recorded",
+        seen_in: "dsh/fixtures/tool-run-hermetic",
         renamed: &[(
             r#"{"_shim_ts_ms":1792464600287}"#,
             r#"{"_shim_ts_ms":1792482405228}"#,
         )],
     },
+    // A transcript's write stamps, which the strip keeps for the merge test
+    // (`reads::WRITE_STAMPS`): codex's RFC 3339, grok's epoch seconds.
+    IdFamily {
+        name: "transcript-clock",
+        pattern: r#""timestamp":"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z)""#,
+        seen_in: "codex/fixtures/tool-run-hermetic",
+        renamed: &[(
+            r#"{"timestamp":"2026-10-27T04:47:02.476Z"}"#,
+            r#"{"timestamp":"2026-10-27T06:40:52.169Z"}"#,
+        )],
+    },
+    IdFamily {
+        name: "transcript-epoch-clock",
+        pattern: r#""timestamp":(\d{10})\b"#,
+        seen_in: "grok/fixtures/tool-run-hermetic",
+        renamed: &[(r#"{"timestamp":1793078269}"#, r#"{"timestamp":1793083460}"#)],
+    },
     // A port the orchestrator picks free.
     IdFamily {
         name: "openclaw-gateway-port",
         pattern: r#""gatewayPort":(\d+)"#,
-        seen_in: "fixtures/openclaw/tool-run-hermetic",
+        seen_in: "openclaw/fixtures/tool-run-hermetic",
         renamed: &[(r#"{"gatewayPort":55736}"#, r#"{"gatewayPort":63297}"#)],
     },
 ];
 
-fn id_patterns() -> std::io::Result<Vec<regex::Regex>> {
+static ID_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> = std::sync::LazyLock::new(|| {
     ID_FAMILIES
         .iter()
-        .map(|f| regex::Regex::new(f.pattern).map_err(std::io::Error::other))
+        .map(|f| regex::Regex::new(f.pattern).expect("every ID_FAMILIES pattern compiles"))
         .collect()
-}
+});
 
 /// `text` with each of its minted ids replaced by what `name` makes of its
 /// family's row and the token.
@@ -473,15 +643,20 @@ fn with_ids_named(
 /// so one numbering is the one bijection two recordings must share. Files are
 /// walked in the order of their paths, then their texts, with ids masked, as
 /// a raw sort would order two id-named session dirs at random; none when two
-/// files tie there, as only their ids tell them apart.
+/// files tie there, as only their ids tell them apart. Then `reads`, a
+/// record's reads keyed by each file's path from `dir`
+/// ([`Recorded::sentinel_reads`](super::provenance::Recorded::sentinel_reads)),
+/// rekeyed by that file's numbered path; a key naming no file stays as it is.
 ///
 /// # Errors
 ///
-/// If a file cannot be read, or a family's pattern does not compile.
-pub fn canonical_capture(dir: &Path) -> std::io::Result<Option<Vec<(String, String)>>> {
-    let patterns = id_patterns()?;
+/// If a file cannot be read.
+pub fn canonical_capture(
+    dir: &Path,
+    reads: &BTreeMap<String, BTreeSet<String>>,
+) -> std::io::Result<Option<Canonical>> {
     let masked = |text: &str| {
-        with_ids_named(text, &patterns, |row, _| {
+        with_ids_named(text, &ID_PATTERNS, |row, _| {
             format!("⟨{}⟩", ID_FAMILIES[row].name)
         })
     };
@@ -498,19 +673,30 @@ pub fn canonical_capture(dir: &Path) -> std::io::Result<Option<Vec<(String, Stri
     let mut seen: Vec<std::collections::HashMap<String, usize>> =
         ID_FAMILIES.iter().map(|_| Default::default()).collect();
     let mut numbered = |text: &str| {
-        with_ids_named(text, &patterns, |row, token| {
+        with_ids_named(text, &ID_PATTERNS, |row, token| {
             let next = seen[row].len();
             let n = *seen[row].entry(token.to_owned()).or_insert(next);
             format!("⟨{}#{n}⟩", ID_FAMILIES[row].name)
         })
     };
-    Ok(Some(
-        files
-            .into_iter()
-            .map(|(_, (path, text))| (numbered(&path), numbered(&text)))
-            .collect(),
-    ))
+    let mut names = BTreeMap::new();
+    let files = files
+        .into_iter()
+        .map(|(_, (path, text))| {
+            let named = numbered(&path);
+            names.insert(path, named.clone());
+            (named, numbered(&text))
+        })
+        .collect();
+    let reads = reads
+        .iter()
+        .map(|(file, read)| (names.get(file).unwrap_or(file).clone(), read.clone()))
+        .collect();
+    Ok(Some((files, reads)))
 }
+
+/// [`canonical_capture`]'s answer: each file's path and text, then the reads.
+pub type Canonical = (Vec<(String, String)>, BTreeMap<String, BTreeSet<String>>);
 
 /// `path` from `base`, its components `/`-joined as every host's checkout
 /// spells them.
@@ -534,14 +720,10 @@ pub fn slashed_under(base: &Path, path: &Path) -> std::io::Result<String> {
 }
 
 /// THE enumeration of committed captures under a `tests/sources` tree, from the
-/// layout alone: the provenance gates walk it and the recorder re-strips it, so
-/// a fix lands on the whole population. Three shapes: `fixtures/<source>/<scenario>/`;
-/// `<module>/fixtures/` declaring at its root; `<module>/fixtures/<sub>/`, owned by
-/// the module when its `MODULE_TO_SOURCE` id is registered (omp's, claude's), else
-/// by the sub (delegation's per-source rule families). `decode/` holds hand-built
-/// decoder inputs, not captures. A module `fixtures/` that declares nothing at
-/// its root and holds no sub-tree is returned as a capture, so the provenance
-/// gate names it rather than the walk losing it.
+/// layout alone: every `<module>/fixtures/<scenario>/`, owned by the source the
+/// module spells (the inverse of [`crate::harness::module_of`]). The provenance
+/// gates walk it and the recorder re-strips it, so a fix lands on the whole
+/// population. `decode/` holds hand-built decoder inputs, not captures.
 pub fn captures(root: &Path) -> Vec<Capture> {
     fn dirs(dir: &Path) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -554,54 +736,21 @@ pub fn captures(root: &Path) -> Vec<Capture> {
         out.sort();
         out
     }
-    fn name(p: &Path) -> String {
-        p.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
-    }
-    fn source_id(raw: &str) -> String {
-        MODULE_TO_SOURCE
-            .iter()
-            .find(|(from, _)| *from == raw)
-            .map_or(raw, |(_, to)| *to)
-            .to_string()
-    }
     let mut out = Vec::new();
-    for source_dir in dirs(&root.join("fixtures")) {
-        let source = source_id(&name(&source_dir));
-        out.extend(dirs(&source_dir).into_iter().map(|dir| Capture {
-            dir,
-            source: source.clone(),
-        }));
-    }
-    for module in dirs(root) {
-        let module_name = name(&module);
-        if module_name == "decode" || module_name == "fixtures" {
+    for home in dirs(root) {
+        let module = home.file_name().unwrap_or_default().to_string_lossy();
+        if module == "decode" {
             continue;
         }
-        let fixtures = module.join("fixtures");
-        if !fixtures.is_dir() {
-            continue;
-        }
-        let subs = dirs(&fixtures);
-        if fixtures.join(PROVENANCE).is_file() || subs.is_empty() {
-            out.push(Capture {
-                dir: fixtures,
-                source: source_id(&module_name),
-            });
-            continue;
-        }
-        let module_source = source_id(&module_name);
-        let module_is_source = registry::descriptor_for(&module_source).is_some();
-        out.extend(subs.into_iter().map(|sub| Capture {
-            source: if module_is_source {
-                module_source.clone()
-            } else {
-                source_id(&name(&sub))
-            },
-            dir: sub,
-        }));
+        let source = crate::harness::source_of(&module);
+        out.extend(
+            dirs(&fixtures_dir(root, &source))
+                .into_iter()
+                .map(|dir| Capture {
+                    dir,
+                    source: source.clone(),
+                }),
+        );
     }
     out.sort_by(|a, b| a.dir.cmp(&b.dir));
     out
@@ -611,6 +760,33 @@ pub fn captures(root: &Path) -> Vec<Capture> {
 mod tests {
     use super::*;
 
+    /// `sort` reads its stdin to the end before it writes, on every host.
+    #[cfg(feature = "native")]
+    #[test]
+    fn only_a_stamped_process_still_running_outlives_its_grace() {
+        let mut child = std::process::Command::new("sort")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("sort runs");
+        let pid = child.id();
+        let payloads = [
+            format!(r#"{{"hook_event_name":"a","_pid":{pid}}}"#),
+            format!(r#"{{"hook_event_name":"b","_pid":{pid}}}"#),
+            r#"{"hook_event_name":"c","_pid":0}"#.to_owned(),
+            r#"{"hook_event_name":"d"}"#.to_owned(),
+            "not json".to_owned(),
+        ];
+        let pid = i32::try_from(pid).expect("a pid");
+        assert_eq!(outlived(&payloads, Duration::ZERO), [pid]);
+        drop(child.stdin.take());
+        child.wait().expect("sort exits");
+        assert_eq!(
+            outlived(&payloads, Duration::from_secs(5)),
+            Vec::<i32>::new()
+        );
+    }
+
     /// A capture of `files`, each `(path, text)`, read canonical.
     fn canonical(files: &[(&str, &str)]) -> Option<Vec<(String, String)>> {
         let d = tempfile::tempdir().expect("tempdir");
@@ -619,7 +795,9 @@ mod tests {
             std::fs::create_dir_all(to.parent().expect("parent")).expect("mkdir");
             std::fs::write(to, text).expect("write");
         }
-        canonical_capture(d.path()).expect("readable")
+        canonical_capture(d.path(), &BTreeMap::new())
+            .expect("readable")
+            .map(|(files, _)| files)
     }
 
     fn same_up_to_ids(old: &[(&str, &str)], new: &[(&str, &str)]) -> bool {
@@ -637,6 +815,25 @@ mod tests {
     const U1: &str = "3e335f66-3b4f-473b-abf2-5b7cb52d7a0d";
     const U2: &str = "4f446a77-4c5a-584c-bca3-6c8dc63e8b1e";
     const U3: &str = "5a557b88-5d6b-695d-cdb4-7d9ed74f9c2f";
+
+    /// A record's read keyed by an id-named file: two runs name it apart, and
+    /// up to ids it is one read.
+    #[test]
+    fn a_read_renames_with_the_file_it_names() {
+        let canonical_with_read = |id: &str| {
+            let d = tempfile::tempdir().expect("tempdir");
+            let file = format!("s/{id}.jsonl");
+            std::fs::create_dir_all(d.path().join("s")).expect("mkdir");
+            std::fs::write(d.path().join(&file), format!(r#"{{"id":"{id}"}}"#)).expect("write");
+            let reads = BTreeMap::from([(file, BTreeSet::from(["1:/x".to_owned()]))]);
+            canonical_capture(d.path(), &reads)
+                .expect("readable")
+                .expect("canonical")
+        };
+        let (files, reads) = canonical_with_read(U1);
+        assert_eq!((files, reads.clone()), canonical_with_read(U2));
+        assert!(!reads.keys().any(|k| k.contains(U1)), "{reads:?}");
+    }
 
     #[test]
     fn a_file_name_renames_with_the_ids_inside_it() {
@@ -772,8 +969,7 @@ mod tests {
 
     #[test]
     fn each_family_renames_what_two_recordings_minted() {
-        let patterns = id_patterns().expect("every pattern compiles");
-        for (family, pattern) in ID_FAMILIES.iter().zip(&patterns) {
+        for (family, pattern) in ID_FAMILIES.iter().zip(ID_PATTERNS.iter()) {
             assert!(!family.renamed.is_empty(), "{}: no pair", family.name);
             for (was, now) in family.renamed {
                 assert!(
@@ -792,8 +988,7 @@ mod tests {
 
     #[test]
     fn every_id_family_is_carried_by_the_capture_it_cites() {
-        let patterns = id_patterns().expect("every pattern compiles");
-        for (family, pattern) in ID_FAMILIES.iter().zip(&patterns) {
+        for (family, pattern) in ID_FAMILIES.iter().zip(ID_PATTERNS.iter()) {
             let capture = crate::harness::sources_root().join(family.seen_in);
             let carried = jsonl_files_under(&capture).iter().any(|f| {
                 pattern.is_match(&slashed_under(&capture, f).expect("under"))

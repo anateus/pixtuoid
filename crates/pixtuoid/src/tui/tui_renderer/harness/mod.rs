@@ -3,7 +3,9 @@
 use super::*;
 use crate::panels::ui_state::RenderFrames;
 use pixtuoid_core::AgentId;
-use pixtuoid_core::state::{ActivityState, AgentSlot, GlobalDeskIndex, SceneState, ToolKind};
+use pixtuoid_core::state::{
+    ActivityState, AgentSlot, GlobalDeskIndex, SceneState, ToolKind, ToolUse,
+};
 use pixtuoid_scene::anim::PAINT_FRAME_MS;
 use pixtuoid_scene::display::PetHover;
 use pixtuoid_scene::pet::PetKind;
@@ -30,11 +32,10 @@ pub(super) fn slot(
         created_at: started,
         last_event_at: started,
         exiting_at: None,
-        pending_idle_at: None,
         desk_index: GlobalDeskIndex(desk_index),
         floor_idx,
         tool_call_count: 0,
-        active_ms: 0,
+        running_ms: 0,
         unknown_cwd: false,
         parent_id: None,
         pid: None,
@@ -48,13 +49,12 @@ pub(super) fn slot(
 pub(super) fn render_until_settled<B: Backend<Error: Send + Sync + 'static>>(
     r: &mut TuiRenderer<B>,
     scene: &SceneState,
-    pack: &OfficeArt,
     now: &mut SystemTime,
     target_floor: usize,
 ) {
     for _ in 0..60 {
         *now += Duration::from_millis(PAINT_FRAME_MS);
-        r.render(scene, pack, *now).expect("render");
+        r.render(scene, *now).expect("render");
         if r.current_floor() == target_floor && r.transition().is_none() {
             return;
         }
@@ -107,12 +107,14 @@ pub(super) fn build_pets(
 pub(super) fn idle(id: &str, desk: usize, started: SystemTime) -> AgentSlot {
     slot(AgentId::from_transcript_path(id), 0, desk, started)
 }
-pub(super) fn active(id: &str, desk: usize, detail: &str, started: SystemTime) -> AgentSlot {
+pub(super) fn running(id: &str, desk: usize, detail: &str, started: SystemTime) -> AgentSlot {
     let mut s = idle(id, desk, started);
-    s.state = ActivityState::Active {
-        tool_use_id: Some(Arc::from("t")),
-        detail: Some(Arc::from(detail)),
-        kind: ToolKind::from_display(detail),
+    s.state = ActivityState::Running {
+        item: Some(ToolUse {
+            tool_use_id: Some(Arc::from("t")),
+            detail: Some(Arc::from(detail)),
+            kind: ToolKind::from_display(detail),
+        }),
     };
     s.last_event_at = started;
     s
@@ -166,9 +168,6 @@ pub(super) fn region_diff(a: &RgbBuffer, b: &RgbBuffer, x0: u16, y0: u16, w: u16
     d
 }
 
-/// A backend that forwards every call to `inner`, its [`Tap`] seeing each
-/// draw's cells, and answering the window's pixel size.
-/// `append_lines` is forwarded too: ratatui defaults it to a no-op.
 pub(super) struct Tapped<B, T> {
     pub(super) inner: B,
     pub(super) tap: T,
@@ -182,6 +181,9 @@ pub(super) trait Tap<B: Backend> {
     fn window_size(&mut self, inner: &mut B) -> Result<ratatui::backend::WindowSize, B::Error> {
         inner.window_size()
     }
+    fn cursor_position(&mut self, inner: &mut B) -> Result<ratatui::layout::Position, B::Error> {
+        inner.get_cursor_position()
+    }
 }
 
 impl<B: Backend, T: Tap<B>> Backend for Tapped<B, T> {
@@ -194,6 +196,7 @@ impl<B: Backend, T: Tap<B>> Backend for Tapped<B, T> {
         self.tap.on_draw(&cells);
         self.inner.draw(cells.into_iter())
     }
+    // Forwarded explicitly: ratatui defaults it to a no-op.
     fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
         self.inner.append_lines(n)
     }
@@ -204,7 +207,7 @@ impl<B: Backend, T: Tap<B>> Backend for Tapped<B, T> {
         self.inner.show_cursor()
     }
     fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
-        self.inner.get_cursor_position()
+        self.tap.cursor_position(&mut self.inner)
     }
     fn set_cursor_position<P: Into<ratatui::layout::Position>>(
         &mut self,
@@ -248,8 +251,8 @@ impl Latency {
 }
 
 /// The terminal's side of a [`FrameOut`](crate::tui::FrameOut); set `fail` to
-/// make it refuse writes as a full terminal does (`WouldBlock`), or `slow` to
-/// make a flush land late.
+/// make its writes fail as a terminal that left does, or `slow` to make a
+/// flush land late.
 #[derive(Clone, Default)]
 pub(super) struct Wire {
     pub(super) bytes: Arc<std::sync::Mutex<Vec<u8>>>,
@@ -260,7 +263,7 @@ pub(super) struct Wire {
 impl std::io::Write for Wire {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(std::io::ErrorKind::WouldBlock.into());
+            return Err(std::io::ErrorKind::BrokenPipe.into());
         }
         self.bytes.lock().expect("lock").extend_from_slice(buf);
         Ok(buf.len())
@@ -292,7 +295,6 @@ pub(super) fn half_blocks_on_screen(
         pack_arc(),
     );
     let wire = Wire::default();
-    // Synchronized, so every frame writes, and a refusing wire refuses it.
     r.present_through(crate::tui::FrameOut::new(wire.clone(), true));
     r.screen = pixtuoid_scene::screen::Screen::on(screen.clock());
     (r, screen, wire)

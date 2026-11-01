@@ -7,18 +7,18 @@
 //!
 //! It REPORTS rather than asserts. Corpus content is unbounded and partly
 //! historical, so a failing file is not automatically a bug — the value is the
-//! census: decode errors and panics (which ARE bugs, always), how many
-//! transcripts register, how many render, and the provenance spread.
+//! census: how many transcripts register, how many render, and the provenance
+//! spread. A decoder panic aborts the run.
 //!
-//! Usage: `corpus_check <source> [root] [--json]`, plus `--roster` — the
-//! id/kind rows `just corpus-all` reads instead of keeping a second copy of the
-//! roster.
+//! Usage: `corpus_check <source> [root]`, plus `--roster` — the
+//! transcript-bearing ids `just corpus-all` reads instead of keeping a second
+//! copy of the roster.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use pixtuoid_core::harness::{Drive, LineFailure};
+use pixtuoid_core::harness::Drive;
 use pixtuoid_core::source::decoder::TailActivity;
 use pixtuoid_core::source::registry;
 use pixtuoid_scene::floor::{FloorMeta, FloorSession};
@@ -35,13 +35,8 @@ fn now() -> SystemTime {
 #[derive(Default)]
 struct Verdict {
     lines: usize,
-    /// Lines that were not valid JSON at all — a torn write, not our problem.
+    /// Lines the watcher skips: not UTF-8, or not JSON.
     unparseable: usize,
-    /// The decoder returned Err. ALWAYS a defect: the contract is
-    /// log-and-continue, never a hard error on a line the source wrote.
-    decode_errors: usize,
-    /// The decoder PANICKED — the never-panic contract violated.
-    panics: Vec<LineFailure>,
     /// Events the WIRE produced — the first-sight seed is NOT counted.
     events: usize,
     /// Slots on the floor, reported only when the wire produced events — the
@@ -89,27 +84,25 @@ fn check_file(source: &str, path: &Path, pack: &std::sync::Arc<OfficeArt>) -> Ve
         ..Verdict::default()
     };
 
-    let Ok(body) = std::fs::read_to_string(path) else {
+    let Ok(body) = std::fs::read(path) else {
         return v;
     };
-    v.newest_activity = newest_activity(source, body.as_bytes());
+    v.newest_activity = newest_activity(source, &body);
 
-    let Some(drive) = Drive::transcript_at(source, path) else {
-        return v;
-    };
-    let driven = drive.seeded().at(now()).lines(body.lines());
+    let driven = Drive::transcript_at(source, path)
+        .expect("main admits only a transcript-bearing source")
+        .seeded()
+        .at(now())
+        .body(&body);
 
     v.lines = driven.lines;
     v.unparseable = driven.unparseable;
-    v.decode_errors = driven.decode_errors.len();
     v.events = driven.wire_events();
     if v.events == 0 {
-        v.panics = driven.panics;
         return v;
     }
     v.registered = driven.registered();
     v.drove = !driven.reaches.is_empty();
-    v.panics = driven.panics.clone();
     if v.registered == 0 {
         return v;
     }
@@ -121,7 +114,6 @@ fn check_file(source: &str, path: &Path, pack: &std::sync::Arc<OfficeArt>) -> Ve
         .step(
             pixtuoid_scene::floor::FloorInputs {
                 scene: &driven.scene,
-                pack,
                 now: now(),
                 floor: FloorMeta::ground(),
                 pets: pixtuoid_scene::floor::PetInputs::default(),
@@ -147,19 +139,11 @@ fn newest_activity(source: &str, body: &[u8]) -> Option<u64> {
     }
 }
 
-/// The `--roster` rows, `id \t kind`, which `just corpus-all` reads by column:
-/// `the_whole_roster_is_pinned_row_by_row` is the pin AGENTS.md's magic-number
-/// rule asks for at that cross-language boundary.
-fn roster() -> Vec<String> {
+/// The `--roster` rows, one transcript-bearing source id each, which
+/// `just corpus-all` reads.
+fn roster() -> Vec<&'static str> {
     registry::registered_source_names()
-        .map(|name| {
-            let kind = if Drive::transcript(name, "/probe.jsonl").is_some() {
-                "transcript"
-            } else {
-                "hook"
-            };
-            format!("{name}\t{kind}")
-        })
+        .filter(|name| Drive::transcript(name, "/probe.jsonl").is_some())
         .collect()
 }
 
@@ -171,10 +155,9 @@ fn main() {
         }
         return;
     }
-    let json = args.iter().any(|a| a == "--json");
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if positional.is_empty() {
-        eprintln!("usage: corpus_check <source> [root] [--json]  |  --roster");
+        eprintln!("usage: corpus_check <source> [root]  |  --roster");
         std::process::exit(2);
     }
     let source = positional[0].as_str();
@@ -216,14 +199,11 @@ fn main() {
     let mut drove_files = 0usize;
     let mut drawn_files = 0usize;
     let mut gap_buckets: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut error_files: Vec<(PathBuf, usize)> = Vec::new();
-    let mut panic_files: Vec<(PathBuf, LineFailure)> = Vec::new();
 
     for f in &files {
         let v = check_file(source, f, &pack);
         totals.lines += v.lines;
         totals.unparseable += v.unparseable;
-        totals.decode_errors += v.decode_errors;
         totals.events += v.events;
         if v.registered > 0 {
             registered_files += 1;
@@ -234,13 +214,6 @@ fn main() {
         if v.drawn > 0 {
             drawn_files += 1;
         }
-        if v.decode_errors > 0 {
-            error_files.push((f.clone(), v.decode_errors));
-        }
-        if let Some(p) = v.panics.first() {
-            panic_files.push((f.clone(), p.clone()));
-        }
-        totals.panics.extend(v.panics.iter().cloned());
         let bucket = match v.provenance_gap_secs() {
             None => "no-stamp",
             Some(s) if s < 3600 => "<1h",
@@ -251,89 +224,58 @@ fn main() {
         *gap_buckets.entry(bucket).or_default() += 1;
     }
 
-    if json {
-        println!(
-            r#"{{"source":"{source}","files":{},"lines":{},"unparseable":{},"decode_errors":{},"panics":{},"events":{},"registered_files":{registered_files},"drove_files":{drove_files},"drawn_files":{drawn_files}}}"#,
-            files.len(),
-            totals.lines,
-            totals.unparseable,
-            totals.decode_errors,
-            totals.panics.len(),
-            totals.events
-        );
-    } else {
-        println!("corpus: {source}  root={}", root.display());
-        println!("  files             {}", files.len());
-        println!("  lines             {}", totals.lines);
-        println!(
-            "  unparseable       {} (torn writes; not ours)",
-            totals.unparseable
-        );
-        println!("  DECODE ERRORS     {}  <- must be 0", totals.decode_errors);
-        println!("  PANICS            {}  <- must be 0", totals.panics.len());
-        println!(
-            "  events decoded    {} (the wire's own; first-sight seeds excluded)",
-            totals.events
-        );
-        println!(
-            "  registered        {registered_files}/{} files with >=1 wire event AND a slot on the floor",
-            files.len()
-        );
-        println!(
-            "  drove the slot    {drove_files}/{registered_files} reached >=1 lifecycle class (Active/Waiting/Delegating)"
-        );
-        println!(
-            "  reached the UI    {drawn_files}/{registered_files} registered files would paint a sprite"
-        );
-        println!("  provenance (mtime ahead of the newest turn):");
-        for (k, n) in &gap_buckets {
-            println!("      {k:<9} {n}");
-        }
-        // Paths + line SHAPES only — a transcript line carries real prose/code.
-        for (p, n) in error_files.iter().take(10) {
-            println!("  decode error x{n}: {}", p.display());
-        }
-        for (p, f) in panic_files.iter().take(10) {
-            println!("  PANIC {}: {f}", p.display());
-        }
-    }
-
-    // The ONLY hard failures: a decoder that PANICS on bytes its own source
-    // wrote (it would take the whole watcher down), or one that returns Err
-    // there (the contract is log-and-continue).
-    if totals.decode_errors > 0 || !totals.panics.is_empty() {
-        std::process::exit(1);
+    println!("corpus: {source}  root={}", root.display());
+    println!("  files             {}", files.len());
+    println!("  lines             {}", totals.lines);
+    println!(
+        "  unparseable       {} (not UTF-8 or not JSON; the watcher skips them)",
+        totals.unparseable
+    );
+    println!(
+        "  events decoded    {} (the wire's own; first-sight seeds excluded)",
+        totals.events
+    );
+    println!(
+        "  registered        {registered_files}/{} files with >=1 wire event AND a slot on the floor",
+        files.len()
+    );
+    println!(
+        "  drove the slot    {drove_files}/{registered_files} reached >=1 lifecycle class (Running/RequiresAction/Delegating)"
+    );
+    println!(
+        "  reached the UI    {drawn_files}/{registered_files} registered files would paint a sprite"
+    );
+    println!("  provenance (mtime ahead of the newest turn):");
+    for (k, n) in &gap_buckets {
+        println!("      {k:<9} {n}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    /// EVERY row, byte for byte: a column-count check could not fail from any
-    /// data change, since `roster`'s `\t` is in its own format literal.
-    fn the_whole_roster_is_pinned_row_by_row() {
-        assert_eq!(
-            roster(),
-            [
-                "claude-code\ttranscript",
-                "codex\ttranscript",
-                "antigravity\ttranscript",
-                "dsh\thook",
-                "reasonix\thook",
-                "codewhale\thook",
-                "opencode\thook",
-                "copilot\ttranscript",
-                "cursor\thook",
-                "hermes\thook",
-                "omp\ttranscript",
-                "openclaw\thook",
-                "grok\ttranscript",
-                "kimi\thook",
-                "jcode\thook",
-            ],
-            "the --roster columns are indexed POSITIONALLY by \
-             `just corpus-all`. Update it in the same change, then this pin."
+    fn a_non_utf8_line_loses_only_itself_not_its_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir
+            .path()
+            .join("0b9f3c1e-1111-4222-8333-944455556666.jsonl");
+        let mut body = br#"{"type":"assistant","cwd":"/r","message":{"model":"m","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{}}]}}"#.to_vec();
+        body.extend_from_slice(b"\n{\"type\":\"user\",\"x\":\"\xff\"}\n");
+        std::fs::write(&path, &body).expect("write the transcript");
+        let pack = std::sync::Arc::new(load_bundled_pack().expect("bundled pack"));
+
+        let v = check_file(
+            pixtuoid_core::source::claude_code::SOURCE_NAME,
+            &path,
+            &pack,
         );
+        assert_eq!(
+            (v.lines, v.unparseable),
+            (2, 1),
+            "the census reads lines as walk_jsonl does"
+        );
+        assert!(v.events > 0, "the valid line still decodes");
     }
 }

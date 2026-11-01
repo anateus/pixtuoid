@@ -10,9 +10,6 @@ updates:
     schedule:
       interval: weekly
     groups:
-      # Its own PR, so a red bump elsewhere in rust-deps never holds a lofi patch.
-      lofi:
-        patterns: ["pixtuoid-lofi"]
       rust-deps:
         patterns: ["*"]
     open-pull-requests-limit: 5
@@ -21,6 +18,10 @@ updates:
       # builds a second copy, so it moves only with png; deny.toml fails CI
       # when one side moves without the other.
       - dependency-name: "miniz_oxide"
+        update-types:
+          ["version-update:semver-minor", "version-update:semver-major"]
+      # ratatui-core's copy (Cargo.toml), likewise: it moves only with ratatui.
+      - dependency-name: "lru"
         update-types:
           ["version-update:semver-minor", "version-update:semver-major"]
       # objc2-app-kit MUST track winit's stack: winit 0.30.x still pulls 0.2.x,
@@ -50,20 +51,18 @@ updates:
       - dependency-name: "winit"
         update-types:
           ["version-update:semver-minor", "version-update:semver-major"]
-      # A lofi minor (0.y) is a breaking change
-      # (https://github.com/pixtuoid/lofi/blob/main/AGENTS.md#workflow),
-      # so it needs pixtuoid code or the owner's LISTEN and a person bumps it.
-      # Patches flow: lofi makes a changed dsp output a minor, so a patch is a
-      # lock-only bump.
-      - dependency-name: "pixtuoid-lofi"
-        update-types:
-          ["version-update:semver-minor", "version-update:semver-major"]
     cooldown:
       default-days: 7
-      # Our own crate: a lofi patch is reviewed in its repo before release
-      # (https://github.com/pixtuoid/lofi/blob/main/AGENTS.md#workflow), so the
-      # cooldown's quarantine buys nothing.
-      exclude: ["pixtuoid-lofi"]
+
+  # rust-toolchain.toml's exact pin, so CodSpeed's base and head build on one
+  # rustc and each release lands as its own PR; hawk and api-surface keep their
+  # own, which `_toolchain-covers` holds at or past it.
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: github-actions
     # `directory: /` searches ONLY `.github/workflows` plus a root `action.yml`,
@@ -79,22 +78,11 @@ updates:
       actions:
         patterns: ["*"]
     open-pull-requests-limit: 5
-    ignore:
-      # `actions/*` floats on a major (`@v4`): patch/minor updates already
-      # arrive without a PR, and Dependabot reads `@v4` as "version 4" and,
-      # filtered by the cooldown below, would rewrite the self-updating ref into
-      # an exact pin a week OLD, a downgrade (#786). Only majors need a human.
-      # Every action outside the namespaces .github/zizmor.yml relaxes is
-      # SHA-pinned (zizmor's default), so each of its updates, majors
-      # included, arrives as a PR.
-      - dependency-name: "actions/*"
-        update-types:
-          ["version-update:semver-patch", "version-update:semver-minor"]
     cooldown:
       default-days: 7
 
-  # requirements-dev.txt pins exact versions (pip.pypa.io topics/repeatable-installs);
-  # this moves the pins.
+  # requirements-dev.txt pins exact versions and hashes (pip.pypa.io
+  # topics/secure-installs); this moves both.
   - package-ecosystem: pip
     directory: /
     schedule:
@@ -103,6 +91,28 @@ updates:
       python-deps:
         patterns: ["*"]
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      checkers:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+    ignore:
+      # A major ahead of mise.toml's `node` types APIs CI's Node doesn't have.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: npm
+    directory: /crates/pixtuoid/src/install
+    schedule:
+      interval: weekly
     cooldown:
       default-days: 7
 
@@ -118,6 +128,9 @@ updates:
         patterns: ["*"]
     open-pull-requests-limit: 5
     ignore:
+      # A major ahead of mise.toml's `node` types APIs CI's Node doesn't have.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
       # typescript major (→7) is peer-rejected by @astrojs/check and
       # typescript-eslint, so `npm ci` ERESOLVEs.
       - dependency-name: "typescript"

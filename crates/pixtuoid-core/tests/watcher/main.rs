@@ -14,8 +14,9 @@ use pixtuoid_core::source::copilot::CopilotSource;
 use pixtuoid_core::source::jsonl::{JsonlWatcher, ProbeSnapshot, force_polling_backend_for_tests};
 use pixtuoid_core::source::{AgentEvent, Source, Transport};
 
-/// Run every watcher test on a fast `PollWatcher` backend instead of the native
-/// FSEvents/inotify watcher, whose stream setup/teardown dominated test time.
+/// Run every watcher test's root watch on a fast `PollWatcher` backend instead
+/// of the native FSEvents/inotify watcher, whose stream setup/teardown
+/// dominated test time.
 /// Idempotent / set-once. Call at the top of any test that drives a real
 /// `JsonlWatcher`/`Source::run`.
 fn fast_watch() {
@@ -118,11 +119,11 @@ fn codex_meta_line(uuid: &str, cwd: &str) -> serde_json::Value {
     })
 }
 
-/// Decodes to an id-less `ActivityStart`.
+/// Decodes to a call's `ToolUseStart`.
 fn codex_work_line() -> serde_json::Value {
     serde_json::json!({
-        "type": "event_msg",
-        "payload": { "type": "task_started", "turn_id": "t" }
+        "type": "response_item",
+        "payload": { "type": "function_call", "name": "exec_command", "call_id": "c1" }
     })
 }
 

@@ -1,15 +1,15 @@
-//! ONE row per agent CLI. A column must BOTH be picked by NAME by a generic
-//! caller AND be depended on by production, not merely reported (`ActivityRecency`,
-//! `should_seed_at_eof` fail that half). `home_env` is the deliberate exception:
-//! its value is not the datum but the QUESTION a struct literal forces, after a
-//! checklist bullet let three sources ship an unverified resolver (#880/#343/#342/#195).
+//! ONE row per agent CLI. A column must BOTH be picked by NAME by a generic caller
+//! AND be depended on by production, not merely reported (`ActivityRecency`,
+//! `should_seed_at_eof` fail that half). Exempt: `home_env`, the QUESTION a struct
+//! literal forces since a checklist let three sources ship an unverified resolver
+//! (#880/#343/#342/#195), and every path doctor checks, in the `Native` column.
 
 use crate::source::decoder::DecodeResult as Result;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::source::decoder::{
-    CwdExtractor, IdDeriver, LineDecoder, ParentExtractor, PathFilter, accept_all_paths,
-    default_id_from_path, extract_top_level_cwd,
+    CwdExtractor, IdDeriver, LineDecoder, ParentExtractor, PathFilter, default_id_from_path,
+    extract_top_level_cwd,
 };
 use crate::source::{
     AgentEvent, antigravity, claude_code, codewhale, codex, copilot, cursor, dsh, grok, hermes,
@@ -26,7 +26,7 @@ pub enum ToolIdKey {
     /// `tool_use_id` — Claude Code's spelling, and every CC-shaped envelope's
     /// but Kimi's.
     ToolUse,
-    /// `tool_call_id` — Kimi's (capture-verified: `fixtures/kimi/tool-run` never
+    /// `tool_call_id` — Kimi's (capture-verified: `kimi/fixtures/tool-run-hermetic` never
     /// carries `tool_use_id`).
     ToolCall,
 }
@@ -41,6 +41,9 @@ impl ToolIdKey {
     }
 }
 
+/// The JSON object a hook or presence decoder reads, so none re-checks its shape.
+pub type HookObject = Map<String, Value>;
+
 /// How a source's hook payloads decode. The source's own decoder runs FIRST,
 /// before any shared field requirement, so an alien envelope (no `session_id` at
 /// all) can still decode; TYPED by whether it may decline, so a
@@ -54,13 +57,13 @@ pub enum HookDecoding {
     Shared {
         /// The per-call tool id's wire name.
         tool_id_key: ToolIdKey,
-        extend: fn(&Value) -> Result<Option<Vec<AgentEvent>>>,
+        extend: fn(&HookObject) -> Result<Option<Vec<AgentEvent>>>,
     },
     /// CLAIMS every event: an alien-envelope source (no shared
     /// `hook_event_name`/`session_id` for the shared arms to key on) whose
     /// decoder handles EVERYTHING and constructs its own AgentIds. It can NOT
     /// decline, so a payload never silently falls through to the shared arms.
-    ClaimsAll(fn(&Value) -> Result<Vec<AgentEvent>>),
+    ClaimsAll(fn(&HookObject) -> Result<Vec<AgentEvent>>),
 }
 
 /// Reducer-facing capability flags — stable facts about the source's wire
@@ -81,7 +84,7 @@ pub(crate) struct SourceCaps {
     /// Are subagent delegations invisible on this source's event stream (a
     /// window in which the PARENT's own stream goes quiet)? When true, a Delegating slot's
     /// `last_event_at` freezes for the whole delegation, so the reducer gives it
-    /// the Waiting-class stale window instead of sweeping mid-delegation.
+    /// the `STALE_BLOCKED_TIMEOUT` window instead of sweeping mid-delegation.
     pub(crate) delegations_are_hook_silent: bool,
     /// What a subagent dispatch's end says about its child.
     pub(crate) child_end_inference: ChildEndInference,
@@ -89,6 +92,12 @@ pub(crate) struct SourceCaps {
     /// Then while the parent has a Task in flight its hook activity is the
     /// child's, and the reducer drops it.
     pub(crate) child_hooks_unnamed: bool,
+    /// Does ONE ordered stream carry each turn's start and its end, the end
+    /// written on every in-process exit? Then an open turn shows the agent
+    /// running between its items; on any other source a start with no sure
+    /// end would hold Running until the stale sweep. The hermetic profile
+    /// names the scenario recording each exit.
+    pub(crate) brackets_turns: bool,
 }
 
 /// What a subagent dispatch's end says about its child; where it says the
@@ -129,6 +138,7 @@ impl SourceCaps {
         delegations_are_hook_silent: false,
         child_end_inference: ChildEndInference::None,
         child_hooks_unnamed: false,
+        brackets_turns: false,
     };
 
     /// The short-idle-reaper policy, derived: only safe when the sweep is the
@@ -149,13 +159,8 @@ pub struct SourceDescriptor {
     pub label_prefix: &'static str,
     /// The CLI version this build's decoder + fixtures were last verified
     /// against: the release, prerelease included (`0.2.0-rc.2`), never a
-    /// build id.
-    /// `"unknown"`, NOT `""`, where we have no fixed anchor — `pixtuoid doctor`
-    /// only flags SKEW when [`parse_version`] reads one, with this row's
-    /// [`Self::version_hyphen`].
-    /// Pinned to the highest recorded capture's `version` banner by
-    /// `a_recorded_capture_anchors_its_sources_verified_version`, so a
-    /// re-record bumps it.
+    /// build id. Every capture of the source is recorded at it
+    /// (`every_capture_is_recorded_at_its_sources_pin`).
     pub verified_version: &'static str,
     /// argv to probe the installed CLI version. `None` = no stable CLI binary;
     /// `doctor` runs it best-effort and degrades to "version: unknown".
@@ -175,6 +180,8 @@ pub struct SourceDescriptor {
     /// What KIND of source this is. Consumers read through the accessors so the
     /// enum shape stays an internal detail.
     pub(crate) kind: SourceKind,
+    #[cfg(feature = "native")]
+    pub(crate) native: Native,
 }
 
 /// The transcript half of an `Agent` row. Bundling the fns makes the
@@ -211,9 +218,9 @@ pub struct Transcript {
     pub(crate) parent_extractor: Option<ParentExtractor>,
 }
 
-/// Where this source's OS pid comes from — a DATA-only capability: this const
-/// table compiles to wasm, so a native-only probe FN POINTER can never live here
-/// (the probes stay in the BINARY's `focus::resolve_pid`). ONE source of truth
+/// Where this source's OS pid comes from — a DATA-only capability, which a wasm
+/// build reads too; a click-time probe rides the row's native column
+/// (`SourceDescriptor::focus_probe`). ONE source of truth
 /// for the focus stamp gate, the hook exit-watch binding and the doctor report
 /// bucketing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,7 +239,7 @@ pub enum FocusChannel {
     ServerStamp,
     /// Pid resolves through a recycle-guarded liveness probe at CLICK time; hook
     /// stamps are never trusted (the shim resolves the nearest non-shell
-    /// ancestor, not necessarily the CLI). The probe fn itself lives in the binary.
+    /// ancestor, not necessarily the CLI). The probe is the row's `focus_probe`.
     TranscriptProbe,
     /// No pid channel — a focus click silently no-ops (the ONE failure rule).
     Unsupported,
@@ -258,6 +265,42 @@ impl FocusChannel {
     pub(crate) fn stamps_focus_pid(self) -> bool {
         matches!(self, FocusChannel::ShimStamp(_) | FocusChannel::PluginStamp)
     }
+}
+
+/// What only a native build of a source runs: a wasm build compiles the column
+/// away, so its fn pointers never reach wasm.
+#[cfg(feature = "native")]
+#[derive(Debug)]
+pub(crate) struct Native {
+    /// The primary on-disk root [`crate::source::resolved_source_root`] reports.
+    pub(crate) root: Option<fn() -> Option<std::path::PathBuf>>,
+    /// The click-time pid lookup, for a source whose stamp is absent or untrusted.
+    pub(crate) focus_probe: Option<FocusProbe>,
+}
+
+#[cfg(feature = "native")]
+impl Native {
+    pub(crate) const NONE: Self = Self {
+        root: None,
+        focus_probe: None,
+    };
+}
+
+/// A source's click-time pid lookup: a point query against the CLI's live
+/// state, never a transcript scan, riding the recycle-guarded probe, which is
+/// why a transcript family's pid is never taken from the shim parent. A
+/// non-unix build resolves nothing (focus silently no-ops).
+#[cfg(feature = "native")]
+#[derive(Debug, Clone, Copy)]
+pub struct FocusProbe {
+    /// The paths the lookup reads in this environment, one per root; `Err`
+    /// names why the layout hosts none.
+    pub paths: fn() -> std::result::Result<Vec<std::path::PathBuf>, &'static str>,
+    /// Whether a path is there as the lookup reads it (`Path::is_dir` or
+    /// `Path::is_file`): a stray file where a dir belongs reads missing.
+    pub present: fn(&std::path::Path) -> bool,
+    /// The live session's pid, as `path` names it.
+    pub pid_for_session: fn(path: &std::path::Path, session_id: &str) -> Option<i32>,
 }
 
 /// The two source classes, type-isolated: the registry-driven demux and the
@@ -340,6 +383,12 @@ impl SourceDescriptor {
         }
     }
 
+    /// Its click-time pid lookup.
+    #[cfg(feature = "native")]
+    pub fn focus_probe(&self) -> Option<&FocusProbe> {
+        self.native.focus_probe.as_ref()
+    }
+
     /// The hook-decoding spec (`None` for a daemon and for a transcript-only
     /// agent). `decode_hook_payload` already defaults a missing spec.
     pub fn hook(&self) -> Option<&HookDecoding> {
@@ -368,21 +417,21 @@ impl SourceDescriptor {
 }
 
 pub const REGISTRY: &[SourceDescriptor] = &[
-    CLAUDE_CODE,
-    CODEX,
-    ANTIGRAVITY,
-    DSH,
-    REASONIX,
-    CODEWHALE,
-    OPENCODE,
-    COPILOT,
-    CURSOR,
-    HERMES,
-    OMP,
-    OPENCLAW,
-    GROK,
-    KIMI,
-    JCODE,
+    claude_code::DESCRIPTOR,
+    codex::DESCRIPTOR,
+    antigravity::DESCRIPTOR,
+    dsh::DESCRIPTOR,
+    reasonix::DESCRIPTOR,
+    codewhale::DESCRIPTOR,
+    opencode::DESCRIPTOR,
+    copilot::DESCRIPTOR,
+    cursor::DESCRIPTOR,
+    hermes::DESCRIPTOR,
+    omp::DESCRIPTOR,
+    openclaw::DESCRIPTOR,
+    grok::DESCRIPTOR,
+    kimi::DESCRIPTOR,
+    jcode::DESCRIPTOR,
 ];
 
 /// Linear scan — a handful of entries; a map would cost more ceremony than it
@@ -495,13 +544,13 @@ pub fn id_deriver_for(source: &str) -> IdDeriver {
 pub(crate) fn path_filter_for(source: &str) -> PathFilter {
     descriptor_for(source)
         .and_then(|d| d.path_filter())
-        .unwrap_or(accept_all_paths)
+        .unwrap_or(crate::source::decoder::accept_all_paths)
 }
 
 /// A daemon source's wire decoder: its envelope → the sending INSTANCE's
 /// identity plus its presence deltas. Handed to the `HookRouter` demux, which
 /// therefore never learns what makes two instances of a daemon different.
-pub(crate) type PresenceDecoder = fn(&Value) -> Result<crate::source::daemon::DecodedPresence>;
+pub(crate) type PresenceDecoder = fn(&HookObject) -> Result<crate::source::daemon::DecodedPresence>;
 
 /// The presence decoder for a daemon source, or `None` for an agent source.
 #[cfg(any(feature = "native", feature = "harness"))]
@@ -518,556 +567,6 @@ pub fn daemon_sources() -> impl Iterator<Item = (&'static str, crate::source::da
         .filter(|d| d.is_daemon())
         .map(|d| (d.name, crate::source::daemon::PresenceTtl::DEFAULT))
 }
-
-const CLAUDE_CODE: SourceDescriptor = SourceDescriptor {
-    name: claude_code::SOURCE_NAME,
-    label_prefix: "cc",
-    verified_version: "2.1.306",
-    version_probe: Some(&["claude", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: Some("CLAUDE_CONFIG_DIR"),
-    kind: SourceKind::Agent {
-        transcript: Some(Transcript {
-            line_decoder: claude_code::decode_cc_line,
-            // The filename stem IS the session UUID the hook keys on.
-            id_from_path: claude_code::cc_id_from_path,
-            // The workflow orchestrator's foreign-schema `journal.jsonl` lives
-            // in the SAME projects tree.
-            path_filter: claude_code::admits_transcript,
-            cwd_extractor: extract_top_level_cwd,
-            parent_extractor: None,
-        }),
-        hook: Some(HookDecoding::Shared {
-            tool_id_key: ToolIdKey::ToolUse,
-            // They swap the event's SUBJECT (child AgentId ≠ session AgentId), which
-            // the shared arms can't express; Stop is a fleet subagent's ONLY end (#241).
-            extend: claude_code::decode_cc_hook_custom,
-        }),
-        caps: SourceCaps {
-            has_exit_signal: true,
-            // CC's JSONL SessionStart is first-sight-only, so a swept slot
-            // would not walk back in — moot with a real exit signal anyway.
-            resurrects_on_prompt: false,
-            delegations_are_hook_silent: false,
-            // A subagent turn fires SubagentStart, and SubagentStop once it has
-            // finished responding; an Agent call that backgrounds its subagent
-            // returns `async_launched` at launch (hooks.md).
-            child_end_inference: ChildEndInference::None,
-            child_hooks_unnamed: false,
-        },
-        focus: FocusChannel::TranscriptProbe,
-    },
-};
-
-const CODEX: SourceDescriptor = SourceDescriptor {
-    name: codex::SOURCE_NAME,
-    label_prefix: "cx",
-    verified_version: "0.163.0",
-    version_probe: Some(&["codex", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: Some("CODEX_HOME"),
-    kind: SourceKind::Agent {
-        transcript: Some(Transcript {
-            line_decoder: codex::decode_codex_line,
-            // The rollout filename's trailing UUID (the stem also has a timestamp).
-            id_from_path: codex::codex_id_from_path,
-            path_filter: accept_all_paths,
-            cwd_extractor: codex::extract_codex_cwd,
-            parent_extractor: Some(codex::extract_codex_parent),
-        }),
-        hook: Some(HookDecoding::Shared {
-            tool_id_key: ToolIdKey::ToolUse,
-            // A child's events change their SUBJECT, and a root's `spawn_agent`
-            // is a Task: neither is expressible in the shared arms.
-            extend: codex::decode_codex_hook_custom,
-        }),
-        caps: SourceCaps {
-            // Still false after #710 registered Codex's SessionEnd hook: it is
-            // teardown-only, so flipping this regresses abrupt exits to a 30-min reap.
-            has_exit_signal: false,
-            resurrects_on_prompt: true,
-            delegations_are_hook_silent: false,
-            // `spawn_agent` returns at launch, and a child's SubagentStop ends
-            // it (`codex-rs/core/src/hook_runtime.rs:401-437` at rust-v0.163.0).
-            child_end_inference: ChildEndInference::None,
-            child_hooks_unnamed: false,
-        },
-        focus: FocusChannel::TranscriptProbe,
-    },
-};
-
-const ANTIGRAVITY: SourceDescriptor = SourceDescriptor {
-    name: antigravity::SOURCE_NAME,
-    label_prefix: "ag",
-    verified_version: "1.4.2",
-    version_probe: Some(&["agy", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: None,
-    kind: SourceKind::Agent {
-        transcript: Some(Transcript {
-            line_decoder: antigravity::decode_ag_line,
-            id_from_path: antigravity::ag_id_from_path,
-            path_filter: antigravity::admits_transcript,
-            // AG step lines carry no cwd field at all; the cwd rides the
-            // `SessionStart` hook.
-            cwd_extractor: extract_top_level_cwd,
-            parent_extractor: None,
-        }),
-        hook: Some(HookDecoding::ClaimsAll(antigravity::decode_ag_hook_payload)),
-        // Both false is VERIFIED: no end marker (`status` is per-step, always DONE)
-        // and no end hook, and no prompt-time hook re-registers a swept session.
-        // Flipping `resurrects_on_prompt` for the 5-min reaper strands a live idle
-        // session. An exit rides the shim-stamped pid.
-        caps: SourceCaps {
-            has_exit_signal: false,
-            resurrects_on_prompt: false,
-            delegations_are_hook_silent: false,
-            child_end_inference: ChildEndInference::TaskDrain,
-            child_hooks_unnamed: false,
-        },
-        focus: FocusChannel::ShimStamp(Corroboration::Twice),
-    },
-};
-
-/// HOOK-ONLY: Reasonix v2 session files are full-rewritten per turn
-/// (untailable) and its hook envelope is ALIEN (camelCase, `event`
-/// discriminator, `sessionId` the identity), so the custom decoder claims
-/// every event.
-const REASONIX: SourceDescriptor = SourceDescriptor {
-    name: reasonix::SOURCE_NAME,
-    label_prefix: "rx",
-    verified_version: "2.44.0",
-    version_probe: Some(&["reasonix", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: None,
-    kind: SourceKind::Agent {
-        transcript: None,
-        hook: Some(HookDecoding::ClaimsAll(reasonix::decode_rx_hook_payload)),
-        caps: SourceCaps {
-            // SessionEnd fires on clean exit — best-effort counts.
-            has_exit_signal: true,
-            // UserPromptSubmit re-emits SessionStart, so a swept-but-live
-            // session walks back in on the next prompt.
-            resurrects_on_prompt: true,
-            // A subagent's hooks carry its own session id, the parent's
-            // suffixed with its role (`internal/ext/hook/runner.go:57-66` at
-            // v2.39.0), so the parent's slot emits NOTHING until the dispatch
-            // tool's PostToolUse.
-            delegations_are_hook_silent: true,
-            // A child's session fires no end; a skill tool's child is keyed
-            // by a call id its parent's tool hooks don't carry
-            // (`internal/assembly/boot/delegation.go:127-133`,
-            // `internal/ext/hook/hook.go:827-847` at v2.39.0).
-            child_end_inference: ChildEndInference::AnyTaskEnd,
-            child_hooks_unnamed: false,
-        },
-        focus: FocusChannel::ShimStamp(Corroboration::Twice),
-    },
-};
-
-const JCODE: SourceDescriptor = SourceDescriptor {
-    name: jcode::SOURCE_NAME,
-    label_prefix: "jc",
-    verified_version: "0.99.0",
-    version_probe: Some(&["jcode", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: None,
-    kind: SourceKind::Agent {
-        transcript: None,
-        hook: Some(HookDecoding::ClaimsAll(jcode::decode_jcode_hook_payload)),
-        caps: SourceCaps {
-            has_exit_signal: true,
-            resurrects_on_prompt: true,
-            delegations_are_hook_silent: false,
-            child_end_inference: ChildEndInference::None,
-            child_hooks_unnamed: false,
-        },
-        focus: FocusChannel::Unsupported,
-    },
-};
-
-/// HOOK-ONLY: DeepSeek Harness persists sessions as zstd-compressed
-/// concatenated frames (`session.jsonl.zstd` — not line-readable, format v0
-/// with no migration promise), so the only plane is the pixtuoid cordis
-/// plugin (`pixtuoid/src/install/dsh_plugin.mjs`) mounted via the home-level
-/// `$DSH_HOME/cordis.patch.yml`, claiming every payload here (the mount and
-/// never-block stories live on the template and its tests). One dsh process
-/// hosts many sessions (the `web` profile is a server), the opencode pid
-/// model.
-const DSH: SourceDescriptor = SourceDescriptor {
-    name: dsh::SOURCE_NAME,
-    label_prefix: "ds",
-    verified_version: "0.2.0-rc.2",
-    version_probe: Some(&["dsh", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    // `DSH_HOME` is honored INSTALLER-side (the plugin file + patch row live
-    // under it); hook-only, so core resolves no root to relocate.
-    home_env: None,
-    kind: SourceKind::Agent {
-        transcript: None,
-        hook: Some(HookDecoding::ClaimsAll(dsh::decode_dsh_payload)),
-        caps: SourceCaps {
-            // `agent/disposed` + the plugin's own effect-disposer sweep fire
-            // on clean quit AND signal shutdown (dsh runs disposers there
-            // too); SIGKILL and an uncaught crash (upstream installs no
-            // `uncaughtException` handler, so no disposer runs) fall to
-            // `HookPidWatch` via the stamped pid.
-            has_exit_signal: true,
-            // Sessions are persistent; a `--resume` boots a NEW dsh whose
-            // plugin emits a fresh `session_start` on the same id — the
-            // SessionStart arm's ordinary re-registration, not this flag.
-            resurrects_on_prompt: false,
-            // A delegation freezes the PARENT's stream either way: the
-            // local child's events all carry its OWN session id (the
-            // delegation capture), and a remote provider
-            // (`dsh-subagent-claude-code`/`-codex`/`-acp`) publishes no
-            // local child at all. `true` can only over-retain a dead slot.
-            delegations_are_hook_silent: true,
-            child_end_inference: ChildEndInference::TaskDrain,
-            child_hooks_unnamed: false,
-        },
-        // The plugin runs in-process (a cordis plugin in the launcher's one
-        // root context; no worker mode exists for plugins), so its stamped
-        // `process.pid` is dsh's own.
-        focus: FocusChannel::PluginStamp,
-    },
-};
-
-/// HOOK-ONLY: CodeWhale has NO tailable transcript (`rollout_path` is an unused
-/// `state.db` column; saved sessions are full-snapshot rewrites; headless
-/// `codewhale exec` runs hooks-off — only the TUI fires hooks). Its hook
-/// envelope is ALIEN (snake_case `event` discriminator, identity via
-/// `DEEPSEEK_*` env vars), so the custom decoder claims every event — keyed on
-/// cwd, because `session_id` is inconsistent across events.
-const CODEWHALE: SourceDescriptor = SourceDescriptor {
-    name: codewhale::SOURCE_NAME,
-    label_prefix: "cw",
-    verified_version: "0.10.1",
-    version_probe: Some(&["codewhale", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: None,
-    kind: SourceKind::Agent {
-        transcript: None,
-        hook: Some(HookDecoding::ClaimsAll(codewhale::decode_cw_hook_payload)),
-        caps: SourceCaps {
-            // session_end fires on a clean TUI quit — best-effort counts.
-            has_exit_signal: true,
-            // message_submit re-emits SessionStart, so a swept-but-live session
-            // walks back in on the next prompt.
-            resurrects_on_prompt: true,
-            // The recorded dispatch fires nothing of the child's own between
-            // `subagent_spawn` and `subagent_complete`.
-            delegations_are_hook_silent: true,
-            child_end_inference: ChildEndInference::TaskDrain,
-            child_hooks_unnamed: false,
-        },
-        focus: FocusChannel::ShimStamp(Corroboration::Twice),
-    },
-};
-
-const OPENCODE: SourceDescriptor = SourceDescriptor {
-    name: opencode::SOURCE_NAME,
-    label_prefix: "oc",
-    verified_version: "2.1.2",
-    version_probe: Some(&["opencode", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: None,
-    kind: SourceKind::Agent {
-        transcript: None,
-        hook: Some(HookDecoding::ClaimsAll(opencode::decode_oc_hook_payload)),
-        caps: SourceCaps {
-            // A TUI quit ends nothing: the session lives on in the server.
-            has_exit_signal: false,
-            // The next prompt's `session.execution.started` decodes to
-            // `SessionStart`.
-            resurrects_on_prompt: true,
-            // A `subagent` child is parented by its `session.created`'s `parentID`,
-            // so its events keep the parent fresh (`scope::refresh_lineage`).
-            delegations_are_hook_silent: false,
-            // A `subagent` call can return while its child runs on
-            // (`packages/core/src/tool/plugin/subagent.ts:229-243` at v2.0.32),
-            // and a session ends only by `session.deleted`.
-            child_end_inference: ChildEndInference::Durable,
-            child_hooks_unnamed: false,
-        },
-        // The plugin runs in the background server every TUI attaches to
-        // (`packages/client/src/service-contender.ts:19-20`), not in a TUI.
-        focus: FocusChannel::ServerStamp,
-    },
-};
-
-/// The DAEMON row: OpenClaw is one always-on gateway, not a per-session coding
-/// agent — its backend `claude-cli` sessions already show up as `cc·`, so it
-/// renders ONE presence-gated wandering lobster mascot instead.
-const OPENCLAW: SourceDescriptor = SourceDescriptor {
-    name: openclaw::SOURCE_NAME,
-    label_prefix: "ok",
-    verified_version: "2026.10.5",
-    version_probe: Some(&["openclaw", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: None,
-    kind: SourceKind::Daemon {
-        presence_decoder: openclaw::decode_openclaw_hook_payload,
-    },
-};
-
-/// GitHub Copilot CLI (`@github/copilot`). TRANSCRIPT-ONLY: the whole lifecycle
-/// is persisted to `<copilot_home>/session-state/<id>/events.jsonl`, so it needs
-/// no hook install target and no custom hook decoder. Sub-agents interleave in
-/// the root file, keyed on the envelope `agentId`.
-const COPILOT: SourceDescriptor = SourceDescriptor {
-    name: copilot::SOURCE_NAME,
-    label_prefix: "cp",
-    verified_version: "1.0.98",
-    version_probe: Some(&["copilot", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: Some("COPILOT_HOME"),
-    kind: SourceKind::Agent {
-        transcript: Some(Transcript {
-            line_decoder: copilot::decode_copilot_line,
-            id_from_path: copilot::copilot_id_from_path,
-            path_filter: accept_all_paths,
-            cwd_extractor: copilot::extract_copilot_cwd,
-            parent_extractor: None,
-        }),
-        hook: None,
-        caps: SourceCaps {
-            // `session.shutdown` is a real persisted exit marker.
-            has_exit_signal: true,
-            // sessionId is constant across `--resume`, so a swept session does
-            // not silently walk back in.
-            resurrects_on_prompt: false,
-            // The `task` dispatch emits `tool.execution_start`/`complete` AND
-            // explicit `subagent.started`/`completed` events.
-            delegations_are_hook_silent: false,
-            child_end_inference: ChildEndInference::TaskDrain,
-            child_hooks_unnamed: false,
-        },
-        focus: FocusChannel::Unsupported,
-    },
-};
-
-/// HOOK-ONLY: Cursor CLI (`cursor-agent`) has no passively-observable
-/// transcript — its stream-json NDJSON is per-invocation stdout and its on-disk
-/// sessions are SQLite. The reachable seam is Cursor Hooks
-/// (`~/.cursor/hooks.json`), whose envelope reuses CC's `hook_event_name` field
-/// NAME with camelCase values, so the custom decoder claims every event and keys
-/// on `session_id`. Subagents render FLAT: children run as independent sessions
-/// with no parent-link on the wire.
-const CURSOR: SourceDescriptor = SourceDescriptor {
-    name: cursor::SOURCE_NAME,
-    label_prefix: "cu",
-    verified_version: "2026.09.18",
-    version_probe: Some(&["cursor-agent", "--version"]),
-    version_hyphen: Hyphen::Build,
-    home_env: None,
-    kind: SourceKind::Agent {
-        transcript: None,
-        hook: Some(HookDecoding::ClaimsAll(cursor::decode_cursor_hook_payload)),
-        caps: SourceCaps {
-            // `sessionEnd` fires on clean completion. An abrupt exit rides the
-            // shim-stamped pid, which reaches the CLI only because the ancestor walk
-            // skips Cursor's wrapper shell (#896).
-            has_exit_signal: true,
-            // Each `cursor-agent` invocation is a NEW session_id, so a swept
-            // session never walks back in.
-            resurrects_on_prompt: false,
-            // A `Task` dispatch gets NO `postToolUse`, and its children are separate
-            // unlinkable sessions.
-            delegations_are_hook_silent: true,
-            child_end_inference: ChildEndInference::TaskDrain,
-            child_hooks_unnamed: false,
-        },
-        focus: FocusChannel::ShimStamp(Corroboration::Twice),
-    },
-};
-
-/// HOOK-ONLY: Hermes Agent (Nous Research) has no tailable transcript; the
-/// reachable seam is Hermes shell hooks (the `config.yaml` under
-/// `hermes::hermes_home`, which is NOT `~/.hermes` on Windows). The envelope
-/// reuses CC's `hook_event_name` field NAME with snake_case values, so the
-/// custom decoder claims every event and keys on `session_id` — not the
-/// workspace, which would merge a user's concurrent instances.
-const HERMES: SourceDescriptor = SourceDescriptor {
-    name: hermes::SOURCE_NAME,
-    label_prefix: "hm",
-    verified_version: "0.22.2",
-    version_probe: Some(&["hermes", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: Some("HERMES_HOME"),
-    kind: SourceKind::Agent {
-        transcript: None,
-        hook: Some(HookDecoding::ClaimsAll(hermes::decode_hermes_hook_payload)),
-        caps: SourceCaps {
-            // `on_session_finalize`, fired by upstream's atexit `_run_cleanup` with
-            // `reason="shutdown"`. NOT `on_session_end`, which despite the name is a
-            // TURN boundary (`source/hermes.rs`).
-            has_exit_signal: true,
-            resurrects_on_prompt: false,
-            // No subagent nesting on the wire — sessions render flat.
-            delegations_are_hook_silent: false,
-            child_end_inference: ChildEndInference::TaskDrain,
-            child_hooks_unnamed: false,
-        },
-        focus: FocusChannel::ShimStamp(Corroboration::Twice),
-    },
-};
-
-/// Grok Build (`grok`, xai-org/grok-build). TRANSCRIPT-BEARING **with** a hook
-/// target. The decoder reads the camelCase envelope (`hookEventName`, `toolUseId`)
-/// — the only spelling pre-1.0 sent, hence the claims-all custom decoder; 1.0.x
-/// mirrors every key in CC's snake_case as well (`grok/tool-run-recorded`).
-/// Coalescing rests on `sessionId == the transcript's parent-dir name` (upstream
-/// joins the id into `session_dir`), mirrored by `grok_id_from_path`. Transcript
-/// = `{grok_home}/sessions/<enc-cwd>/<session-id>/updates.jsonl`, append-only.
-const GROK: SourceDescriptor = SourceDescriptor {
-    name: grok::SOURCE_NAME,
-    label_prefix: "gk",
-    verified_version: "1.0.62",
-    version_probe: Some(&["grok", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: Some("GROK_HOME"),
-    kind: SourceKind::Agent {
-        transcript: Some(Transcript {
-            line_decoder: grok::decode_grok_line,
-            id_from_path: grok::grok_id_from_path,
-            // Session dirs carry rewrite-on-resume siblings (chat_history /
-            // rewind_points / events.jsonl) that must never be tailed.
-            path_filter: grok::is_updates_jsonl,
-            // Always-None: grok lines carry no cwd — the URL-encoded group dir
-            // does, applied via the watcher's cwd deriver.
-            cwd_extractor: grok::extract_grok_cwd,
-            parent_extractor: None,
-        }),
-        hook: Some(HookDecoding::ClaimsAll(grok::decode_grok_hook_payload)),
-        caps: SourceCaps {
-            // `session_end` does NOT fire on a plain TUI quit (the loop breaks without
-            // draining the session actor), so the DOMINANT exit is signal-less; the
-            // authority is the liveness probe over grok's `active_sessions.json`.
-            has_exit_signal: false,
-            // Every prompt fires `user_prompt_submit` (→ SessionStart), so a swept
-            // LIVE session walks back in — which is what makes the short idle reap
-            // safe for grok's untracked headless one-shots.
-            resurrects_on_prompt: true,
-            // A BLOCKING spawn's Task detail gets its post_tool_use at
-            // completion, and a background spawn never mints a Task at all.
-            delegations_are_hook_silent: false,
-            child_end_inference: ChildEndInference::TaskDrain,
-            child_hooks_unnamed: false,
-        },
-        // `active_sessions.json` maps session_id → pid with an `opened_at` recycle
-        // guard; a shim stamp would shadow it with a walk carrying no guard (#527).
-        focus: FocusChannel::TranscriptProbe,
-    },
-};
-
-/// Oh My Pi (`omp`, omp.sh). HYBRID: the durable authority is the transcript
-/// at `<omp_sessions_dir>/<encoded-cwd>/<ts>_<uuid>.jsonl`; the bridge
-/// extension (`pixtuoid/src/install/omp_extension.ts`, auto-discovered from the agent
-/// dir's `extensions/`) forwards what the transcript can never carry —
-/// pre-persist presence, empty-session shutdown, the approval wait, and the
-/// process's own `_pid` (#951). Both transports key on the sessionFile stem chain
-/// ([`omp::omp_id_from_path`]), so they mint ONE AgentId per session — the
-/// grok same-key pattern. Under `omp --no-extensions`, or with the bridge
-/// broken or absent, the transcript path IS the old transcript-only source.
-/// Subagents persist as SEPARATE nested files (`<parent-stem>/<taskId>.jsonl`),
-/// parent-linked by path.
-const OMP: SourceDescriptor = SourceDescriptor {
-    name: omp::SOURCE_NAME,
-    label_prefix: "om",
-    verified_version: "18.12.1",
-    version_probe: Some(&["omp", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: Some("PI_CODING_AGENT_DIR"),
-    kind: SourceKind::Agent {
-        transcript: Some(Transcript {
-            line_decoder: omp::decode_omp_line,
-            // The nested stem CHAIN, so a subagent task id can't collide across
-            // sessions.
-            id_from_path: omp::omp_id_from_path,
-            path_filter: accept_all_paths,
-            cwd_extractor: extract_top_level_cwd,
-            parent_extractor: None,
-        }),
-        hook: Some(HookDecoding::ClaimsAll(omp::decode_omp_hook_payload)),
-        caps: SourceCaps {
-            // The `session_exit` entry is appended + flushed on every clean
-            // teardown incl. SIGINT/SIGTERM (and the bridge fires
-            // `session_shutdown` even for empty sessions the entry skips).
-            // SIGKILL: with the bridge, `HookPidWatch` ends the stamped pid's
-            // sessions promptly; without it, the stale-sweep.
-            has_exit_signal: true,
-            // The header `SessionStart` decodes once per transcript life. A
-            // `--resume` fires the bridge's `session_start` on the SAME id
-            // (`omp/fixtures/resume-recorded`), so an ended
-            // session CAN walk back in — through the SessionStart arm's
-            // ordinary parentless re-registration, not this prompt-resurrect
-            // flag.
-            resurrects_on_prompt: false,
-            // The `task` dispatch emits a toolCall/toolResult pair on the parent
-            // AND the child persists its own parent-linked transcript.
-            delegations_are_hook_silent: false,
-            child_end_inference: ChildEndInference::TaskDrain,
-            child_hooks_unnamed: false,
-        },
-        // The bridge extension runs IN-PROCESS (upstream: extensions share
-        // the runtime), so its stamped `process.pid` IS omp's own —
-        // PluginStamp trust. The router stamps the kernel start marker; the
-        // click-time compare refuses a recycled pid (#527). The flip also
-        // puts omp on `HookPidWatch` (prompt exits) and makes a bridge-only,
-        // never-persisted session focusable from birth. Stamp-less shapes —
-        // `--no-extensions`, a session predating the bridge install — still
-        // focus through the append-fd probe: `resolve_pid` dispatches by
-        // source name and reads no channel.
-        focus: FocusChannel::PluginStamp,
-    },
-};
-
-/// HOOK-ONLY: Kimi Code CLI (`kimi`, MoonshotAI) DOES persist a transcript
-/// (`<KIMI_CODE_HOME>/sessions/.../wire.jsonl`), but that format is EXPLICITLY
-/// unstable (a versioned `metadata` envelope, a `wire/migration/` module,
-/// undocumented op `type` strings), so pixtuoid does NOT watch it. Its hooks are
-/// the stable surface and the envelope is CLAUDE-CODE-SHAPED, so it rides the
-/// SHARED arms keyed on `session_id`; the custom `Extend` decoder claims ONLY
-/// Kimi's `PostToolUseFailure`/`StopFailure` variants and declines the rest.
-const KIMI: SourceDescriptor = SourceDescriptor {
-    name: kimi::SOURCE_NAME,
-    label_prefix: "km",
-    verified_version: "2.3.0",
-    version_probe: Some(&["kimi", "--version"]),
-    version_hyphen: Hyphen::Prerelease,
-    home_env: None,
-    kind: SourceKind::Agent {
-        transcript: None,
-        hook: Some(HookDecoding::Shared {
-            // The ONE source that does not spell the per-call id `tool_use_id`.
-            tool_id_key: ToolIdKey::ToolCall,
-            extend: kimi::decode_kimi_hook_custom,
-        }),
-        caps: SourceCaps {
-            // `SessionEnd` fires on exit — best-effort counts; abrupt exits fall
-            // to the stale-sweep.
-            has_exit_signal: true,
-            // SessionStart is the registration carrier, not UserPromptSubmit, so
-            // a swept session does not walk back in.
-            resurrects_on_prompt: false,
-            // Consumed via the `Agent` tool: 0.36.1's `AgentToolInputSchema` injects
-            // `subagent_type: "coder"` when the model omits it, so `make_tool_detail`
-            // mints Task. `AgentSwarm` has NO such injection, so an omitting swarm
-            // call mints Generic instead; `true` can only over-retain a dead slot.
-            delegations_are_hook_silent: true,
-            child_end_inference: ChildEndInference::TaskDrain,
-            // A subagent's tool hooks carry the session's id alone
-            // (kimi-code@2.2.0 `agentExternalHooksService.ts:301-313`).
-            child_hooks_unnamed: true,
-        },
-        // kimi-code 2.2.0 spawns every hook with `shell: true`, which Node runs as
-        // `/bin/sh -c` on Unix and `%ComSpec%` on Windows
-        // (`packages/agent-core-v2/src/features/externalHooks/internal/runHook.ts:66-67`,
-        // https://nodejs.org/api/child_process.html): re-check both if either changes.
-        focus: FocusChannel::ShimStamp(Corroboration::OnceViaShell),
-    },
-};
 
 #[cfg(test)]
 mod tests {
@@ -1139,19 +638,6 @@ mod tests {
     }
 
     #[test]
-    fn every_descriptor_has_two_char_label_prefix() {
-        for d in REGISTRY {
-            assert_eq!(
-                d.label_prefix.chars().count(),
-                2,
-                "source {:?} label_prefix {:?} must be exactly 2 chars",
-                d.name,
-                d.label_prefix
-            );
-        }
-    }
-
-    #[test]
     fn every_descriptor_has_a_verified_version() {
         for d in REGISTRY {
             assert!(
@@ -1173,24 +659,20 @@ mod tests {
         );
     }
 
+    /// The binary's focus dispatch reads no channel, so a `TranscriptProbe`
+    /// source without a probe would silently never focus.
+    #[cfg(feature = "native")]
     #[test]
-    fn descriptor_names_match_module_source_name_consts() {
-        assert_eq!(CLAUDE_CODE.name, claude_code::SOURCE_NAME);
-        assert_eq!(CODEX.name, codex::SOURCE_NAME);
-        assert_eq!(ANTIGRAVITY.name, antigravity::SOURCE_NAME);
-        assert_eq!(REASONIX.name, reasonix::SOURCE_NAME);
-        assert_eq!(CODEWHALE.name, codewhale::SOURCE_NAME);
-        assert_eq!(OPENCODE.name, opencode::SOURCE_NAME);
-        assert_eq!(COPILOT.name, copilot::SOURCE_NAME);
-        assert_eq!(CURSOR.name, cursor::SOURCE_NAME);
-        assert_eq!(HERMES.name, hermes::SOURCE_NAME);
-        assert_eq!(OMP.name, omp::SOURCE_NAME);
-        assert_eq!(OPENCLAW.name, openclaw::SOURCE_NAME);
-        assert_eq!(GROK.name, grok::SOURCE_NAME);
-        assert_eq!(KIMI.name, kimi::SOURCE_NAME);
-        assert_eq!(DSH.name, dsh::SOURCE_NAME);
-        assert_eq!(JCODE.name, jcode::SOURCE_NAME);
-        assert_eq!(REGISTRY.len(), 15, "new row? add its name-pin assert above");
+    fn every_transcript_probe_source_has_a_focus_probe() {
+        for d in REGISTRY {
+            if d.focus_channel() == FocusChannel::TranscriptProbe {
+                assert!(
+                    d.focus_probe().is_some(),
+                    "{} is TranscriptProbe with no probe",
+                    d.name
+                );
+            }
+        }
     }
 
     #[test]
@@ -1371,16 +853,6 @@ mod tests {
     }
 
     #[test]
-    fn openclaw_is_the_only_daemon() {
-        let daemons: Vec<&str> = REGISTRY
-            .iter()
-            .filter(|d| d.is_daemon())
-            .map(|d| d.name)
-            .collect();
-        assert_eq!(daemons, vec![openclaw::SOURCE_NAME]);
-    }
-
-    #[test]
     fn daemon_accessors_are_inert() {
         let d = descriptor_for(openclaw::SOURCE_NAME).unwrap();
         assert!(d.is_daemon());
@@ -1460,9 +932,7 @@ mod tests {
     }
 
     proptest! {
-        // An `Err` is fine: the watcher logs-and-continues on a malformed line, so
-        // the property is only that it does not PANIC. Iterated from REGISTRY, so a
-        // new source is covered with no test edit.
+        // Iterated from REGISTRY, so a new source is covered with no test edit.
         #[test]
         fn every_line_decoder_never_panics_on_arbitrary_json(v in arb_json()) {
             for d in REGISTRY {
@@ -1478,17 +948,17 @@ mod tests {
         #[test]
         fn every_hook_and_presence_decoder_never_panics(v in arb_json()) {
             for d in REGISTRY {
-                match d.hook() {
-                    Some(HookDecoding::Shared { extend, .. }) => {
-                        let _ = extend(&v);
+                match (d.hook(), v.as_object()) {
+                    (Some(HookDecoding::Shared { extend, .. }), Some(obj)) => {
+                        let _ = extend(obj);
                     }
-                    Some(HookDecoding::ClaimsAll(f)) => {
-                        let _ = f(&v);
+                    (Some(HookDecoding::ClaimsAll(f)), Some(obj)) => {
+                        let _ = f(obj);
                     }
-                    None => {}
+                    _ => {}
                 }
-                if let Some(presence) = d.presence_decoder() {
-                    let _ = presence(&v);
+                if let (Some(presence), Some(obj)) = (d.presence_decoder(), v.as_object()) {
+                    let _ = presence(obj);
                 }
             }
             let _ = crate::source::decoder::decode_hook_payload(v.clone());
@@ -1527,8 +997,8 @@ mod tests {
 
                 match resolved {
                     None => failures.push(format!(
-                        "{name} declares home_env={var} but `resolved_source_root` has no arm \
-                     for it — add one, or the declaration is unproven"
+                        "{name} declares home_env={var} but its `Native::root` is None — set \
+                     one, or the declaration is unproven"
                     )),
                     Some(r) if !r.starts_with(&root_env) => failures.push(format!(
                         "{name}: ${var}={} did not reach the resolved root {} — the override is \

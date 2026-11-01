@@ -330,8 +330,8 @@ fn a_standing_fixture_casts_its_shadow_under_its_whole_box() {
 }
 
 /// The sizes the roster invariants sweep, each at [`CENSUS_SEEDS`]: the layout
-/// floor, a spread of window-grid widths, the committed heroes' buffers
-/// (`scripts/media.json`) and two mid sizes that place a lounge and an island.
+/// floor, a spread of window-grid widths, the committed heroes' layout units
+/// (`scripts/media.json`'s `w`/`h`) and two mid sizes that place a lounge and an island.
 pub(crate) const CENSUS_SIZES: &[(u16, u16)] = &[
     (
         super::super::compute::MIN_LAYOUT_W,
@@ -730,12 +730,8 @@ fn corridor_appliance_art_never_lands_on_a_workstation() {
             })
             .map(|f| f.visual)
             .collect();
-        workstations.extend(l.home_desks.iter().enumerate().map(|(i, &desk)| {
-            let at = seated_top_left(
-                desk,
-                CHARACTER_SPRITE_W,
-                l.desk_facing(FloorLocalDeskIndex(i)),
-            );
+        workstations.extend(l.home_desks.iter().map(|desk| {
+            let at = seated_top_left(desk.at, CHARACTER_SPRITE_W, desk.facing);
             Bounds {
                 x: at.x,
                 y: at.y,
@@ -879,7 +875,7 @@ fn a_desk_sorts_between_a_walker_behind_it_and_one_in_front() {
     use crate::layout::{CHARACTER_SPRITE_W, WALKING_Y_OFF};
     use crate::sim::anchors::walking_top_left;
     let desk_at = Point { x: 40, y: 40 };
-    let desk = desk_fixtures(&[desk_at], u16::MAX)
+    let desk = desk_fixtures([desk_at], u16::MAX)
         .find(|f| matches!(f.kind, FixtureKind::Desk(_)))
         .expect("a desk");
     let Depth::Sorted { row, tie } = desk.depth else {

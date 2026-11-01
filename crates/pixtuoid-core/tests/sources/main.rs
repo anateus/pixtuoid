@@ -1,5 +1,5 @@
 mod captures;
-mod claude;
+mod claude_code;
 mod codewhale;
 mod codex;
 mod conformance;
@@ -9,6 +9,7 @@ mod decode;
 mod delegation;
 mod grok;
 mod manager;
+mod merge;
 mod omp;
 mod opencode;
 mod reasonix;

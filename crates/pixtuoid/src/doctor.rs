@@ -284,16 +284,18 @@ pub(crate) struct SourceDiagnostics {
 impl SourceDiagnostics {
     /// A HARD install problem ⇒ the source is broken (zero sprites despite a
     /// claimed connection); nothing else counts.
+    pub(crate) fn broken_install(&self) -> Option<&crate::install::verify::SchemaVerifyResult> {
+        self.install.as_ref().filter(|i| !i.is_sound())
+    }
+
     pub(crate) fn is_broken(&self) -> bool {
-        self.install.as_ref().is_some_and(|i| !i.is_sound())
+        self.broken_install().is_some()
     }
 
     /// The single worst issue as a one-line, glyph-prefixed summary. Priority:
     /// install-broken (hooks can't fire) > decode-drift.
     pub(crate) fn summary(&self) -> Option<String> {
-        if let Some(i) = &self.install
-            && !i.is_sound()
-        {
+        if let Some(i) = self.broken_install() {
             return Some(format!("⚠ install broken: {}", i.issues.join("; ")));
         }
         let n = self.drift.total();
@@ -324,19 +326,15 @@ pub(crate) fn diagnose(
 }
 
 pub(crate) struct DoctorSourceRow {
-    pub prefix: &'static str,
-    /// The registry source id (e.g. "claude-code"), distinct from
+    /// Its `name` is the registry source id (e.g. "claude-code"), distinct from
     /// `install::Target.name`/`display_name`.
-    pub source_id: &'static str,
+    pub desc: &'static registry::SourceDescriptor,
     pub connected: bool,
     pub has_target: bool,
     pub hooks_installed: bool,
     /// The probe's first output line, sanitized ([`first_sanitized_line`]), if
     /// probeable.
     pub installed_version: Option<String>,
-    /// The version this build's decoder was verified against; `"unknown"` = no
-    /// anchor.
-    pub verified_version: &'static str,
     /// The SAME [`SourceDiagnostics`] the Sources panel + boot preflight read,
     /// embedded whole so `is_broken`/`drift` stay the ONE authority.
     pub diag: SourceDiagnostics,
@@ -346,29 +344,21 @@ pub(crate) struct DoctorSourceRow {
 /// year is no breaking major.
 const CALVER_MIN_MAJOR: u64 = 1000;
 
-/// Installed-vs-verified comparison, `None` when either side can't parse or
-/// there is no anchor.
-pub(crate) fn version_cmp(
-    installed: Option<&str>,
+/// Installed-vs-verified comparison, `None` when there is no parseable anchor.
+fn version_cmp(
+    installed: &semver::Version,
     verified: &str,
     hyphen: Hyphen,
 ) -> Option<std::cmp::Ordering> {
-    let installed = installed.and_then(|s| registry::parse_version(s, hyphen))?;
     Some(installed.cmp_precedence(&registry::parse_version(verified, hyphen)?))
 }
 
 /// The version a skew verdict compared — for the `versions` category, where
 /// showing the two COMPARED values beats echoing a raw banner.
-fn parsed_version_display(s: &str, hyphen: Hyphen) -> Option<String> {
-    registry::parse_version(s, hyphen).map(|mut v| {
-        v.build = semver::BuildMetadata::EMPTY;
-        v.to_string()
-    })
-}
-
-/// How the row's CLI writes a `-` in its version.
-fn hyphen_of(r: &DoctorSourceRow) -> Hyphen {
-    registry::descriptor_for(r.source_id).map_or(Hyphen::Prerelease, |d| d.version_hyphen)
+fn compared_version(installed: &semver::Version) -> String {
+    let mut v = installed.clone();
+    v.build = semver::BuildMetadata::EMPTY;
+    v.to_string()
 }
 
 /// A broken install outranks drift (✗ vs !); the two quiet
@@ -447,8 +437,8 @@ fn format_doctor_row(row: &DoctorSourceRow, ink: &Ink) -> String {
     let mut out = format!(
         "{DETAIL_INDENT}{} {}\u{b7}{:<13} {} {:<15} {}",
         verdict_glyph(row, ink),
-        row.prefix,
-        row.source_id,
+        row.desc.label_prefix,
+        row.desc.name,
         conn,
         state,
         version
@@ -490,22 +480,12 @@ fn first_sanitized_line(bytes: &[u8]) -> Option<String> {
 }
 
 /// Probe a source's `<cli> --version` (argv from the static registry — never user input)
-/// → the first non-empty output line, sanitized. Best-effort: a spawn error, a NONZERO
-/// exit (whose error text must never show as a version), or a hang all yield None. stdin
-/// is nulled so the child can't block on the inherited TTY.
+/// → the first non-empty output line, sanitized. Best-effort: a spawn error or a NONZERO
+/// exit (whose error text must never show as a version) yields None. `output()` closes
+/// the child's stdin, so it can't block on the inherited TTY.
 fn probe_version(argv: &'static [&'static str]) -> Option<String> {
-    use std::process::{Command, Stdio};
-    const PROBE_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     let (cmd, args) = argv.split_first()?;
-    let output = crate::output_within(
-        Command::new(cmd)
-            .args(args)
-            .stdin(Stdio::null())
-            // `--version` output is tiny, which `output_within` requires.
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-        PROBE_VERSION_TIMEOUT,
-    )?;
+    let output = std::process::Command::new(cmd).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -666,15 +646,8 @@ struct DoctorReport {
     /// `false` = the focus backend itself can't work here (the Wayland /
     /// no-display arms) — the focus category's verdict, not a probe result.
     backend_healthy: bool,
-    /// `None` = probe disabled (non-standard projects root).
-    cc_registry: Option<(ShownPath, bool)>,
-    codex_sessions: (ShownPath, bool),
-    /// The other two probe roots (omp's probe is the stamp-less FALLBACK since
-    /// the PluginStamp flip). Each is source-specific — omp's is the resolved
-    /// sessions dir, grok's a registry FILE — so each needs its own
-    /// hand-written row, pinned by `every_focusable_source_appears_in_the_focus_category`.
-    omp_sessions: (ShownPath, bool),
-    grok_registry: (ShownPath, bool),
+    /// One per probe-backed source, in registry order.
+    probes: Vec<ProbePath>,
     home_split: Option<String>,
     /// Whether the report may carry ANSI color — see [`report_color`].
     color: bool,
@@ -744,17 +717,18 @@ fn probe_terminal_caps(
 /// through `resolved_source_root` — the SAME call the driver makes, since a second copy
 /// could show a healthy path while the watcher polled another.
 fn collect_roots() -> Vec<RootStatus> {
-    registry::registered_source_names()
-        .filter_map(|src| {
-            let root = pixtuoid_core::source::resolved_source_root(src)?;
-            let env = registry::descriptor_for(src)
-                .and_then(|d| d.home_env)
+    registry::REGISTRY
+        .iter()
+        .filter_map(|d| {
+            let root = pixtuoid_core::source::resolved_source_root(d.name)?;
+            let env = d
+                .home_env
                 // The SAME `path_env` the resolvers use, or the two disagree: `env::var` reads
                 // a non-UTF-8 override as UNSET, silencing the ⚠ when the root IS wrong (#172).
                 .map(|v| (v, pixtuoid_core::platform::path_env(v).is_some()));
             let exists = root.is_dir();
             Some(RootStatus {
-                source: src,
+                source: d.name,
                 root: ShownPath::new(root),
                 exists,
                 env,
@@ -763,40 +737,38 @@ fn collect_roots() -> Vec<RootStatus> {
         .collect()
 }
 
-/// The click's probe roots ([`crate::focus::FocusPaths::from_env`]), so the
-/// report cannot claim a root a click would not read. grok's is a registry
-/// FILE, not a directory; omp's is its primary root.
-struct ProbeRoots {
-    cc_registry: Option<(std::path::PathBuf, bool)>,
-    codex_sessions: std::path::PathBuf,
-    codex_exists: bool,
-    omp_sessions: std::path::PathBuf,
-    omp_exists: bool,
-    grok_registry: std::path::PathBuf,
-    grok_exists: bool,
+/// One probe-backed source's click-time path ([`shown_path`]), and whether it is
+/// there, or why its layout hosts none. Read through the same
+/// `FocusProbe::paths` a click reads, so the report cannot claim a path a click
+/// would not.
+struct ProbePath {
+    source: &'static registry::SourceDescriptor,
+    path: Result<(ShownPath, bool), &'static str>,
 }
 
-fn probe_roots() -> ProbeRoots {
-    let roots = crate::focus::FocusPaths::from_env();
-    let cc_registry = pixtuoid_core::source::cc_registry_dir(&roots.cc_projects_root).map(|d| {
-        let exists = d.is_dir();
-        (d, exists)
-    });
-    let codex_sessions = roots.codex_sessions_root;
-    let omp_sessions = roots
-        .omp_sessions_roots
-        .into_iter()
-        .next()
-        .unwrap_or_default();
-    let grok_registry = roots.grok_root.join("active_sessions.json");
-    ProbeRoots {
-        cc_registry,
-        codex_exists: codex_sessions.is_dir(),
-        codex_sessions,
-        omp_exists: omp_sessions.is_dir(),
-        omp_sessions,
-        grok_exists: grok_registry.is_file(),
-        grok_registry,
+fn probe_paths() -> Vec<ProbePath> {
+    registry::REGISTRY
+        .iter()
+        .filter_map(|source| {
+            let probe = source.focus_probe()?;
+            let path = (probe.paths)().map(|paths| {
+                let (shown, present) = shown_path(&paths, probe.present);
+                (ShownPath::new(shown), present)
+            });
+            Some(ProbePath { source, path })
+        })
+        .collect()
+}
+
+/// The path a probe row shows: the first one there, as a click tries every one,
+/// else the first.
+fn shown_path(
+    paths: &[std::path::PathBuf],
+    present: fn(&std::path::Path) -> bool,
+) -> (std::path::PathBuf, bool) {
+    match paths.iter().find(|p| present(p)) {
+        Some(found) => (found.clone(), true),
+        None => (paths.first().cloned().unwrap_or_default(), false),
     }
 }
 
@@ -839,9 +811,10 @@ fn collect(
     )
     .unasked_here();
 
-    let rows: Vec<DoctorSourceRow> = registry::registered_source_names()
-        .map(|src| {
-            let desc = registry::descriptor_for(src);
+    let rows: Vec<DoctorSourceRow> = registry::REGISTRY
+        .iter()
+        .map(|desc| {
+            let src = desc.name;
             let target = crate::install::target::by_source(src);
             let hooks_installed = target
                 .map(|t| crate::install::has_hooks(t, None))
@@ -849,30 +822,19 @@ fn collect(
             let is_connected = connected.contains(src);
             let cli_detected = target.map(|t| (t.presence_probe)());
             DoctorSourceRow {
-                prefix: desc.map(|d| d.label_prefix).unwrap_or("??"),
-                source_id: src,
+                desc,
                 connected: is_connected,
                 has_target: target.is_some(),
                 hooks_installed,
                 installed_version: may_probe_version(is_connected, cli_detected)
-                    .then(|| desc.and_then(|d| d.version_probe).and_then(probe_version))
+                    .then(|| desc.version_probe.and_then(probe_version))
                     .flatten(),
-                verified_version: desc.map(|d| d.verified_version).unwrap_or("unknown"),
                 diag: diagnose(src, &log, None),
             }
         })
         .collect();
 
     let roots = collect_roots();
-    let ProbeRoots {
-        cc_registry,
-        codex_sessions,
-        codex_exists,
-        omp_sessions,
-        omp_exists,
-        grok_registry,
-        grok_exists,
-    } = probe_roots();
 
     // Read as BYTES, lossy ONLY here: the advisory renders these for a human and never
     // opens them, so this is the one boundary where losing an ill-formed byte costs nothing.
@@ -902,10 +864,7 @@ fn collect(
         roots,
         backend,
         backend_healthy,
-        cc_registry: cc_registry.map(|(p, exists)| (ShownPath::new(p), exists)),
-        codex_sessions: (ShownPath::new(codex_sessions), codex_exists),
-        omp_sessions: (ShownPath::new(omp_sessions), omp_exists),
-        grok_registry: (ShownPath::new(grok_registry), grok_exists),
+        probes: probe_paths(),
         home_split,
         color,
     })
@@ -1018,14 +977,9 @@ fn sources_category(rows: &[DoctorSourceRow], ink: &Ink) -> Category {
 /// Whether the installed MAJOR is below the verified one: only the latest
 /// release is supported, and a new major is where a wire breaks. A CalVer
 /// year is no major.
-fn below_verified_major(installed: Option<&str>, verified: &str, hyphen: Hyphen) -> bool {
-    match (
-        installed.and_then(|s| registry::parse_version(s, hyphen)),
-        registry::parse_version(verified, hyphen),
-    ) {
-        (Some(i), Some(v)) => i.major < v.major && v.major < CALVER_MIN_MAJOR,
-        _ => false,
-    }
+fn below_verified_major(installed: &semver::Version, verified: &str, hyphen: Hyphen) -> bool {
+    registry::parse_version(verified, hyphen)
+        .is_some_and(|v| installed.major < v.major && v.major < CALVER_MIN_MAJOR)
 }
 
 /// Two skews are worth an alarm: an older major, which is unsupported, and a
@@ -1033,24 +987,23 @@ fn below_verified_major(installed: Option<&str>, verified: &str, hyphen: Hyphen)
 /// (its wire format may have moved). An older minor or patch stays silent —
 /// that comparison is derivable, not actionable.
 fn versions_category(rows: &[DoctorSourceRow]) -> Category {
-    let older: Vec<&DoctorSourceRow> = rows
+    let parsed: Vec<(&DoctorSourceRow, semver::Version)> = rows
         .iter()
-        .filter(|r| {
-            below_verified_major(
-                r.installed_version.as_deref(),
-                r.verified_version,
-                hyphen_of(r),
-            )
+        .filter_map(|r| {
+            let installed =
+                registry::parse_version(r.installed_version.as_deref()?, r.desc.version_hyphen)?;
+            Some((r, installed))
         })
         .collect();
-    let newer: Vec<&DoctorSourceRow> = rows
+    let older: Vec<_> = parsed
         .iter()
-        .filter(|r| {
-            version_cmp(
-                r.installed_version.as_deref(),
-                r.verified_version,
-                hyphen_of(r),
-            ) == Some(std::cmp::Ordering::Greater)
+        .filter(|(r, v)| below_verified_major(v, r.desc.verified_version, r.desc.version_hyphen))
+        .collect();
+    let newer: Vec<_> = parsed
+        .iter()
+        .filter(|(r, v)| {
+            version_cmp(v, r.desc.verified_version, r.desc.version_hyphen)
+                == Some(std::cmp::Ordering::Greater)
         })
         .collect();
     if older.is_empty() && newer.is_empty() {
@@ -1061,23 +1014,18 @@ fn versions_category(rows: &[DoctorSourceRow]) -> Category {
             details: Vec::new(),
         };
     }
-    let row = |r: &DoctorSourceRow, tail: String| {
-        // Both buckets compared a parsed installed side.
-        let inst = r
-            .installed_version
-            .as_deref()
-            .and_then(|s| parsed_version_display(s, hyphen_of(r)))
-            .unwrap_or_else(|| "unknown".to_string());
+    let row = |(r, installed): &(&DoctorSourceRow, semver::Version), tail: String| {
         format!(
-            "{DETAIL_INDENT}{:<15} {inst} installed \u{b7} {} verified{tail}",
-            format!("{}\u{b7}{}", r.prefix, r.source_id),
-            r.verified_version
+            "{DETAIL_INDENT}{:<15} {} installed \u{b7} {} verified{tail}",
+            format!("{}\u{b7}{}", r.desc.label_prefix, r.desc.name),
+            compared_version(installed),
+            r.desc.verified_version
         )
     };
     let details = older
         .iter()
-        .map(|r| row(r, format!(" — unsupported, upgrade {}", r.source_id)))
-        .chain(newer.iter().map(|r| row(r, String::new())))
+        .map(|&r| row(r, format!(" — unsupported, upgrade {}", r.0.desc.name)))
+        .chain(newer.iter().map(|&r| row(r, String::new())))
         .collect();
     let clis = |n: usize| format!("{n} {}", if n == 1 { "CLI" } else { "CLIs" });
     let summary: Vec<String> = [
@@ -1195,100 +1143,52 @@ fn roots_category(roots: &[RootStatus], ink: &Ink) -> Option<Category> {
 /// straight from the registry, so a new source lands in the right bucket with
 /// no edit here.
 fn focus_category(r: &DoctorReport, ink: &Ink) -> Category {
-    let prefix_of = |src: &str| {
-        registry::descriptor_for(src)
-            .map(|d| d.label_prefix)
-            .unwrap_or("??")
-    };
+    use registry::FocusChannel;
     let mut details = Vec::new();
     let mut problem = !r.backend_healthy;
-    let cc_prefix = prefix_of(pixtuoid_core::source::claude_code::SOURCE_NAME);
-    match &r.cc_registry {
-        Some((p, true)) => details.push(format!(
-            "{DETAIL_INDENT}{cc_prefix}\u{b7}claude-code — registry probe {} {}",
-            ink.ok("\u{2713}"),
-            p
-        )),
-        Some((p, false)) => {
-            problem = true;
-            details.push(format!(
-                "{DETAIL_INDENT}{cc_prefix}\u{b7}claude-code — registry probe {} {} (focus no-ops until \
-                 CC writes it)",
-                ink.bad("\u{2717} missing"),
-                p
-            ));
+    for p in &r.probes {
+        // Behind a stamp, the probe only covers the shapes the stamp misses.
+        let fallback = p.source.focus_channel() != FocusChannel::TranscriptProbe;
+        let row = format!(
+            "{DETAIL_INDENT}{}\u{b7}{} — pid probe{}",
+            p.source.label_prefix,
+            p.source.name,
+            if fallback {
+                " (stamp-less fallback)"
+            } else {
+                ""
+            }
+        );
+        match &p.path {
+            Ok((path, true)) => details.push(format!("{row} {} {path}", ink.ok("\u{2713}"))),
+            Ok((path, false)) if fallback => {
+                details.push(format!("{row} {} {path}", ink.warn("\u{2717} missing")));
+            }
+            Ok((path, false)) => {
+                problem = true;
+                details.push(format!(
+                    "{row} {} {path} (focus no-ops until {} writes it)",
+                    ink.bad("\u{2717} missing"),
+                    p.source.name
+                ));
+            }
+            Err(why) => {
+                problem |= !fallback;
+                details.push(format!("{row} disabled ({why}) — focus no-ops"));
+            }
         }
-        None => {
-            problem = true;
-            details.push(format!(
-                "{DETAIL_INDENT}{cc_prefix}\u{b7}claude-code — registry probe disabled (non-standard \
-                 projects root) — focus no-ops"
-            ));
-        }
     }
-    let cx_prefix = prefix_of(pixtuoid_core::source::codex::SOURCE_NAME);
-    if r.codex_sessions.1 {
-        details.push(format!(
-            "{DETAIL_INDENT}{cx_prefix}\u{b7}codex — rollout probe {} {}",
-            ink.ok("\u{2713}"),
-            r.codex_sessions.0
-        ));
-    } else {
-        problem = true;
-        details.push(format!(
-            "{DETAIL_INDENT}{cx_prefix}\u{b7}codex — rollout probe {} {} (focus no-ops until codex \
-             writes it)",
-            ink.bad("\u{2717} missing"),
-            r.codex_sessions.0
-        ));
-    }
-    let om_prefix = prefix_of(pixtuoid_core::source::omp::SOURCE_NAME);
-    if r.omp_sessions.1 {
-        details.push(format!(
-            "{DETAIL_INDENT}{om_prefix}\u{b7}omp — append-fd probe (stamp-less fallback) {} {}",
-            ink.ok("\u{2713}"),
-            r.omp_sessions.0
-        ));
-    } else {
-        // Not a problem row since the PluginStamp flip: the stamped pid is the
-        // primary channel, this probe only covers stamp-less shapes.
-        details.push(format!(
-            "{DETAIL_INDENT}{om_prefix}\u{b7}omp — append-fd probe (stamp-less fallback) {} {}",
-            ink.warn("\u{2717} missing"),
-            r.omp_sessions.0
-        ));
-    }
-    let gk_prefix = prefix_of(pixtuoid_core::source::grok::SOURCE_NAME);
-    if r.grok_registry.1 {
-        details.push(format!(
-            "{DETAIL_INDENT}{gk_prefix}\u{b7}grok — session registry {} {}",
-            ink.ok("\u{2713}"),
-            r.grok_registry.0
-        ));
-    } else {
-        problem = true;
-        details.push(format!(
-            "{DETAIL_INDENT}{gk_prefix}\u{b7}grok — session registry {} {} (focus no-ops until grok \
-             writes it)",
-            ink.bad("\u{2717} missing"),
-            r.grok_registry.0
-        ));
-    }
-    use registry::FocusChannel;
     let mut shim_stamp = Vec::new();
     let mut plugin_stamp = Vec::new();
     let mut no_channel = Vec::new();
-    for src in registry::registered_source_names() {
-        let Some(d) = registry::descriptor_for(src) else {
-            continue;
-        };
+    for d in registry::REGISTRY {
         // Daemons aren't click-focusable agents; the TranscriptProbe sources
-        // got their own probe rows above (omp appears in BOTH: its probe row
-        // is the stamp-less fallback, this census line the primary channel).
+        // got their probe rows above (omp appears in BOTH: its probe row is
+        // the stamp-less fallback, this census line the primary channel).
         if d.is_daemon() || d.focus_channel() == FocusChannel::TranscriptProbe {
             continue;
         }
-        let tag = format!("{}\u{b7}{}", d.label_prefix, src);
+        let tag = format!("{}\u{b7}{}", d.label_prefix, d.name);
         match d.focus_channel() {
             FocusChannel::ShimStamp(_) => shim_stamp.push(tag),
             FocusChannel::PluginStamp => plugin_stamp.push(tag),
@@ -1486,14 +1386,14 @@ mod tests {
         assert_eq!(c.status, CategoryStatus::Ok);
         assert_eq!(c.summary, "test-backend");
         let s = c.details.join("\n");
-        assert!(s.contains("claude-code — registry probe ✓"), "{s}");
-        assert!(s.contains("codex — rollout probe ✓"), "{s}");
+        assert!(s.contains("claude-code — pid probe ✓"), "{s}");
+        assert!(s.contains("codex — pid probe ✓"), "{s}");
         assert!(
             s.contains("dsh") && s.contains("plugin-stamped"),
             "plugin stampers listed separately: {s}"
         );
         assert!(
-            s.contains("om\u{b7}omp — append-fd probe (stamp-less fallback)"),
+            s.contains("om\u{b7}omp — pid probe (stamp-less fallback)"),
             "omp keeps its fallback-probe row beside the stamp census: {s}"
         );
         assert!(
@@ -1519,51 +1419,54 @@ mod tests {
     #[test]
     fn focus_category_warns_on_missing_and_disabled_probe_roots() {
         let mut r = summary_report(vec![]);
-        r.cc_registry = Some((ShownPath::new("/home/u/.claude/sessions"), false));
-        r.codex_sessions = (ShownPath::new("/home/u/.codex/sessions"), false);
+        set_probe(
+            &mut r,
+            "claude-code",
+            Ok((ShownPath::new("/home/u/.claude/sessions"), false)),
+        );
+        set_probe(
+            &mut r,
+            "codex",
+            Ok((ShownPath::new("/home/u/.codex/sessions"), false)),
+        );
         let c = focus_category(&r, &Ink { on: false });
         assert_eq!(c.status, CategoryStatus::Warn);
         let s = c.details.join("\n");
         assert!(
-            s.contains("✗ missing") && s.contains("focus no-ops until CC writes it"),
+            s.contains("✗ missing") && s.contains("focus no-ops until claude-code writes it"),
             "{s}"
         );
         assert!(s.contains("focus no-ops until codex writes it"), "{s}");
 
-        r.cc_registry = None;
-        r.codex_sessions = (ShownPath::new("/home/u/.codex/sessions"), true);
+        set_probe(&mut r, "claude-code", Err("non-standard projects root"));
+        set_probe(
+            &mut r,
+            "codex",
+            Ok((ShownPath::new("/home/u/.codex/sessions"), true)),
+        );
         let c = focus_category(&r, &Ink { on: false });
         assert_eq!(c.status, CategoryStatus::Warn);
         assert!(
             c.details
                 .iter()
-                .any(|l| l.contains("registry probe disabled (non-standard projects root)")),
+                .any(|l| l.contains("pid probe disabled (non-standard projects root)")),
             "{:?}",
             c.details
         );
     }
 
     /// Every focusable (non-daemon) registered source must appear SOMEWHERE in
-    /// the category. A `TranscriptProbe` row is HAND-WRITTEN — the registry loop
-    /// below it skips that channel — so without this a newly probe-backed source
-    /// silently VANISHES from the report, which is exactly what omp did the
-    /// moment it left `Unsupported`.
+    /// the category: the census skips `TranscriptProbe`, leaving such a source to
+    /// its probe row, and omp vanished the moment it left `Unsupported`.
     #[test]
     fn every_focusable_source_appears_in_the_focus_category() {
-        let mut r = summary_report(vec![]);
-        r.cc_registry = Some((ShownPath::new("/home/u/x"), true));
-        r.codex_sessions = (ShownPath::new("/home/u/x"), true);
-        r.omp_sessions = (ShownPath::new("/home/u/x"), true);
-        r.grok_registry = (ShownPath::new("/home/u/x"), true);
+        let r = summary_report(vec![]);
         let s = focus_category(&r, &Ink { on: false }).details.join("\n");
-        for src in registry::registered_source_names() {
-            let Some(d) = registry::descriptor_for(src) else {
-                continue;
-            };
+        for d in registry::REGISTRY {
             if d.is_daemon() {
                 continue;
             }
-            let tag = format!("{}\u{b7}{}", d.label_prefix, src);
+            let tag = format!("{}\u{b7}{}", d.label_prefix, d.name);
             assert!(
                 s.contains(&tag),
                 "{tag} is missing from the focus category:\n{s}"
@@ -1599,20 +1502,74 @@ mod tests {
         assert!(!out.contains('\u{1b}'), "piped output stays plain: {out}");
     }
 
-    fn summary_row(prefix: &'static str, id: &'static str) -> DoctorSourceRow {
+    fn registered(id: &str) -> &'static registry::SourceDescriptor {
+        registry::descriptor_for(id).expect("a registered source")
+    }
+
+    /// A version `skew` away from the source's verified pin.
+    fn skewed(id: &str, skew: impl FnOnce(&mut semver::Version)) -> String {
+        let desc = registered(id);
+        let mut v = registry::parse_version(desc.verified_version, desc.version_hyphen)
+            .expect("the pin parses");
+        skew(&mut v);
+        v.to_string()
+    }
+
+    /// The pin's own major at its lowest precedence: `x.0.0-0` sorts below every
+    /// `x.y.z` release.
+    fn lowest_of_major(v: &mut semver::Version) {
+        v.minor = 0;
+        v.patch = 0;
+        v.pre = semver::Prerelease::new("0").unwrap();
+    }
+
+    /// Installed AT the verified pin, so the row raises no version skew.
+    fn summary_row(id: &str) -> DoctorSourceRow {
+        let desc = registered(id);
         DoctorSourceRow {
-            prefix,
-            source_id: id,
+            desc,
             connected: true,
             has_target: true,
             hooks_installed: true,
-            installed_version: Some("1.0.0".into()),
-            verified_version: "unknown",
+            installed_version: Some(desc.verified_version.into()),
             diag: SourceDiagnostics {
                 install: Some(crate::install::verify::SchemaVerifyResult::default()),
                 drift: LogScanResult::default(),
             },
         }
+    }
+
+    #[test]
+    fn a_probe_row_shows_the_first_path_a_click_would_find() {
+        let home = tempfile::tempdir().unwrap();
+        let default = home.path().join("default");
+        let profile = home.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        assert_eq!(
+            shown_path(&[default.clone(), profile.clone()], std::path::Path::is_dir),
+            (profile, true),
+            "a profile's dir alone is found, as the click finds it"
+        );
+        assert_eq!(
+            shown_path(
+                &[default.clone(), home.path().join("gone")],
+                std::path::Path::is_dir
+            ),
+            (default, false),
+            "none there: the first is the one reported missing"
+        );
+    }
+
+    fn set_probe(
+        r: &mut DoctorReport,
+        source: &str,
+        path: Result<(ShownPath, bool), &'static str>,
+    ) {
+        r.probes
+            .iter_mut()
+            .find(|p| p.source.name == source)
+            .expect("a probe-backed source")
+            .path = path;
     }
 
     fn summary_report(rows: Vec<DoctorSourceRow>) -> DoctorReport {
@@ -1633,10 +1590,14 @@ mod tests {
             roots: vec![],
             backend: "NSRunningApplication (macOS)",
             backend_healthy: true,
-            cc_registry: Some((ShownPath::new("/tmp/reg"), true)),
-            codex_sessions: (ShownPath::new("/tmp/cx"), true),
-            omp_sessions: (ShownPath::new("/tmp/om"), true),
-            grok_registry: (ShownPath::new("/tmp/gk/active_sessions.json"), true),
+            probes: registry::REGISTRY
+                .iter()
+                .filter(|source| source.focus_probe().is_some())
+                .map(|source| ProbePath {
+                    source,
+                    path: Ok((ShownPath::new(format!("/tmp/{}", source.name)), true)),
+                })
+                .collect(),
             home_split: None,
             color: false,
         }
@@ -1649,7 +1610,7 @@ mod tests {
         // Fields with a minting fn are poisoned through it, so the test covers
         // the mint as well as the render; the rest are poisoned raw and pin the
         // render-side strip.
-        let mut row = summary_row("cc", "claude-code");
+        let mut row = summary_row("claude-code");
         row.installed_version = first_sanitized_line(format!("1.0.0 {EVIL}").as_bytes());
         row.diag.drift = scan_log_for_source(
             &format!(
@@ -1665,7 +1626,7 @@ mod tests {
             issues,
             notes: vec![],
         });
-        let mut noted = summary_row("cx", "codex");
+        let mut noted = summary_row("codex");
         noted.diag.install = Some(crate::install::verify::SchemaVerifyResult {
             issues: vec![],
             notes: vec![evil()],
@@ -1691,10 +1652,10 @@ mod tests {
         );
         r.term_env = Some(evil());
         r.colorterm_env = Some(evil());
-        r.cc_registry = Some((ShownPath::new(evil()), false));
-        r.codex_sessions = (ShownPath::new(evil()), false);
-        r.omp_sessions = (ShownPath::new(evil()), false);
-        r.grok_registry = (ShownPath::new(evil()), false);
+        set_probe(&mut r, "claude-code", Ok((ShownPath::new(evil()), false)));
+        set_probe(&mut r, "codex", Ok((ShownPath::new(evil()), false)));
+        set_probe(&mut r, "omp", Ok((ShownPath::new(evil()), false)));
+        set_probe(&mut r, "grok", Ok((ShownPath::new(evil()), false)));
         r.home_split = home_split_advisory(true, Some(&evil()), Some(r"C:\Users\me"));
         r.roots = vec![RootStatus {
             source: "claude-code",
@@ -1835,8 +1796,8 @@ mod tests {
     #[test]
     fn report_clean_state_is_all_check_categories() {
         let out = render(&summary_report(vec![
-            summary_row("cc", "claude-code"),
-            summary_row("cx", "codex"),
+            summary_row("claude-code"),
+            summary_row("codex"),
         ]));
         assert!(out.starts_with("pixtuoid doctor\n"), "{out}");
         assert!(
@@ -1859,26 +1820,26 @@ mod tests {
     #[test]
     fn report_rows_ride_under_the_sources_category() {
         let out = render(&summary_report(vec![
-            summary_row("cc", "claude-code"),
-            summary_row("cx", "codex"),
+            summary_row("claude-code"),
+            summary_row("codex"),
         ]));
         assert!(
-            out.contains("\n      ✓ cc\u{b7}claude-code   connected    installed       1.0.0\n"),
+            out.contains(&format!(
+                "\n      ✓ cc\u{b7}claude-code   connected    installed       {}\n",
+                registered("claude-code").verified_version
+            )),
             "every source keeps its row, healthy or not: {out}"
         );
     }
 
     #[test]
     fn report_broken_install_expands_with_fix_line() {
-        let mut broken = summary_row("cx", "codex");
+        let mut broken = summary_row("codex");
         broken.diag.install = Some(crate::install::verify::SchemaVerifyResult {
             issues: vec!["missing hook entries for: SessionEnd".into()],
             notes: vec![],
         });
-        let out = render(&summary_report(vec![
-            summary_row("cc", "claude-code"),
-            broken,
-        ]));
+        let out = render(&summary_report(vec![summary_row("claude-code"), broken]));
         assert!(
             out.contains("[✗] sources — 1 of 2 needs attention"),
             "{out}"
@@ -1900,62 +1861,72 @@ mod tests {
 
     #[test]
     fn report_versions_category_lists_only_newer_than_verified() {
-        let mut newer = summary_row("cp", "copilot");
-        newer.installed_version = Some("GitHub Copilot CLI 1.0.79.".into());
-        newer.verified_version = "1.0.62";
-        let mut older = summary_row("hm", "hermes");
-        older.installed_version = Some("v0.17.0".into());
-        older.verified_version = "0.18.0";
+        let pin = registered("copilot").verified_version;
+        let newer_v = skewed("copilot", |v| v.patch += 1);
+        let mut newer = summary_row("copilot");
+        newer.installed_version = Some(format!("GitHub Copilot CLI {newer_v}."));
+        let older_v = skewed("hermes", lowest_of_major);
+        let mut older = summary_row("hermes");
+        older.installed_version = Some(format!("v{older_v}"));
         let out = render(&summary_report(vec![newer, older]));
         assert!(
             out.contains("[!] versions — 1 CLI newer than verified (drift possible)"),
             "older-than-verified is not an alarm: {out}"
         );
         assert!(
-            out.contains("      cp\u{b7}copilot      1.0.79 installed \u{b7} 1.0.62 verified"),
+            out.contains(&format!(
+                "      cp\u{b7}copilot      {newer_v} installed \u{b7} {pin} verified"
+            )),
             "the PARSED pair that was compared, not the raw banner: {out}"
         );
         assert!(
-            !out.contains("0.18.0 verified"),
+            !out.contains(&format!(
+                "{} verified",
+                registered("hermes").verified_version
+            )),
             "older-than-verified grows no versions detail row: {out}"
         );
         // The raw banner stays on the source row, without skew prose.
-        assert!(out.contains("GitHub Copilot CLI 1.0.79."), "{out}");
+        assert!(
+            out.contains(&format!("GitHub Copilot CLI {newer_v}.")),
+            "{out}"
+        );
         assert!(!out.contains("NEWER than verified"), "{out}");
     }
 
     #[test]
     fn report_versions_category_flags_an_older_major_as_unsupported() {
-        let mut v1 = summary_row("oc", "opencode");
-        v1.installed_version = Some("1.18.30".into());
-        v1.verified_version = "2.0.27";
-        let mut older_minor = summary_row("cp", "copilot");
-        older_minor.installed_version = Some("1.0.50".into());
-        older_minor.verified_version = "1.0.62";
-        let mut calver = summary_row("ok", "openclaw");
+        let v1_v = skewed("opencode", |v| v.major -= 1);
+        let mut v1 = summary_row("opencode");
+        v1.installed_version = Some(v1_v.clone());
+        let mut older_minor = summary_row("copilot");
+        older_minor.installed_version = Some(skewed("copilot", lowest_of_major));
+        let mut calver = summary_row("openclaw");
         calver.installed_version = Some("OpenClaw 2025.12.1".into());
-        calver.verified_version = "2026.10.1";
         let out = render(&summary_report(vec![v1, older_minor, calver]));
         assert!(
             out.contains("[!] versions — 1 CLI unsupported (upgrade needed)\n"),
             "{out}"
         );
         assert!(
-            out.contains(
-                "      oc\u{b7}opencode     1.18.30 installed \u{b7} 2.0.27 verified — \
-                 unsupported, upgrade opencode"
-            ),
+            out.contains(&format!(
+                "      oc\u{b7}opencode     {v1_v} installed \u{b7} {} verified — \
+                 unsupported, upgrade opencode",
+                registered("opencode").verified_version
+            )),
             "{out}"
         );
-        assert!(
-            !out.contains("1.0.62 verified") && !out.contains("2026.10.1 verified"),
-            "an older minor, or a CalVer year, is no older major: {out}"
-        );
+        for id in ["copilot", "openclaw"] {
+            assert!(
+                !out.contains(&format!("{} verified", registered(id).verified_version)),
+                "an older minor, or a CalVer year, is no older major: {out}"
+            );
+        }
     }
 
     #[test]
     fn report_drift_verdict_line_points_at_rows_and_upstream() {
-        let mut drifted = summary_row("gk", "grok");
+        let mut drifted = summary_row("grok");
         drifted.diag.drift = LogScanResult {
             unknown_event: 2,
             missing_field: 1,
@@ -1980,7 +1951,7 @@ mod tests {
 
     #[test]
     fn report_unreadable_log_surfaces_the_warning_not_a_clean_verdict() {
-        let mut r = summary_report(vec![summary_row("cc", "claude-code")]);
+        let mut r = summary_report(vec![summary_row("claude-code")]);
         r.log_warning =
             Some("log unreadable: /x (denied) — the decode-drift counts are not meaningful".into());
         let out = render(&r);
@@ -1993,7 +1964,7 @@ mod tests {
 
     #[test]
     fn report_roots_list_every_row_and_alarm_only_on_env_set_missing() {
-        let mut r = summary_report(vec![summary_row("cc", "claude-code")]);
+        let mut r = summary_report(vec![summary_row("claude-code")]);
         r.roots = vec![
             RootStatus {
                 source: "claude-code",
@@ -2037,29 +2008,32 @@ mod tests {
 
     #[test]
     fn report_focus_probe_failure_warns_with_detail() {
-        let mut r = summary_report(vec![summary_row("cc", "claude-code")]);
-        r.cc_registry = Some((ShownPath::new("/tmp/reg"), false));
+        let mut r = summary_report(vec![summary_row("claude-code")]);
+        set_probe(
+            &mut r,
+            "claude-code",
+            Ok((ShownPath::new("/tmp/reg"), false)),
+        );
         let out = render(&r);
         assert!(
             out.contains("[!] focus-jump — NSRunningApplication (macOS)\n"),
             "{out}"
         );
         assert!(
-            out.contains("claude-code — registry probe ✗ missing /tmp/reg"),
+            out.contains("claude-code — pid probe ✗ missing /tmp/reg"),
             "{out}"
         );
     }
 
     #[test]
     fn report_footer_counts_issue_categories() {
-        let mut broken = summary_row("cx", "codex");
+        let mut broken = summary_row("codex");
         broken.diag.install = Some(crate::install::verify::SchemaVerifyResult {
             issues: vec!["shim binary missing: /old".into()],
             notes: vec![],
         });
-        let mut newer = summary_row("cp", "copilot");
-        newer.installed_version = Some("2.0.0".into());
-        newer.verified_version = "1.0.0";
+        let mut newer = summary_row("copilot");
+        newer.installed_version = Some(skewed("copilot", |v| v.major += 1));
         let out = render(&summary_report(vec![broken, newer]));
         assert!(out.ends_with("! issues in 2 categories\n"), "{out}");
     }
@@ -2334,13 +2308,11 @@ mod tests {
     #[test]
     fn format_row_clean_vs_drift_and_transcript_only() {
         let clean = DoctorSourceRow {
-            prefix: "cx",
-            source_id: "codex",
+            desc: registered("codex"),
             connected: true,
             has_target: true,
             hooks_installed: true,
             installed_version: Some("2.0.0".into()),
-            verified_version: "unknown",
             diag: SourceDiagnostics {
                 install: Some(crate::install::verify::SchemaVerifyResult::default()),
                 drift: LogScanResult::default(),
@@ -2361,13 +2333,11 @@ mod tests {
         );
 
         let drifted = DoctorSourceRow {
-            prefix: "cp",
-            source_id: "copilot",
+            desc: registered("copilot"),
             connected: true,
             has_target: false, // transcript-only
             hooks_installed: false,
             installed_version: Some("1.1.0".into()),
-            verified_version: "1.0.62",
             diag: SourceDiagnostics {
                 install: None,
                 drift: LogScanResult {
@@ -2392,13 +2362,11 @@ mod tests {
     #[test]
     fn format_row_flags_a_broken_install() {
         let broken = DoctorSourceRow {
-            prefix: "rx",
-            source_id: "reasonix",
+            desc: registered("reasonix"),
             connected: true,
             has_target: true,
             hooks_installed: true,
             installed_version: None,
-            verified_version: "unknown",
             diag: SourceDiagnostics {
                 install: Some(crate::install::verify::SchemaVerifyResult {
                     issues: vec!["shim binary missing: /old/pixtuoid-hook".into()],
@@ -2518,7 +2486,10 @@ mod tests {
     #[test]
     fn version_cmp_compares_only_with_a_known_anchor() {
         use std::cmp::Ordering;
-        let cmp = |installed, verified| version_cmp(installed, verified, Hyphen::Prerelease);
+        let cmp = |installed: Option<&str>, verified| {
+            let installed = registry::parse_version(installed?, Hyphen::Prerelease)?;
+            version_cmp(&installed, verified, Hyphen::Prerelease)
+        };
         assert_eq!(cmp(Some("3.4.5"), "unknown"), None);
         assert_eq!(cmp(Some("1.1.0"), "1.0.62"), Some(Ordering::Greater));
         assert_eq!(cmp(Some("1.0.0"), "1.0.62"), Some(Ordering::Less));
@@ -2539,15 +2510,13 @@ mod tests {
 
     #[test]
     fn the_versions_row_shows_only_what_was_compared() {
+        let shown = |s, hyphen| compared_version(&registry::parse_version(s, hyphen).unwrap());
         assert_eq!(
-            parsed_version_display("2026.10.02-abc1234", Hyphen::Build).as_deref(),
-            Some("2026.10.2"),
+            shown("2026.10.02-abc1234", Hyphen::Build),
+            "2026.10.2",
             "a build id no comparison reads is not shown"
         );
-        assert_eq!(
-            parsed_version_display("0.2.0-rc.3", Hyphen::Prerelease).as_deref(),
-            Some("0.2.0-rc.3")
-        );
+        assert_eq!(shown("0.2.0-rc.3", Hyphen::Prerelease), "0.2.0-rc.3");
     }
 
     #[test]
@@ -2559,7 +2528,11 @@ mod tests {
             "2026.09.18-0123456",
         ] {
             assert_eq!(
-                version_cmp(Some(installed), "2026.09.18", Hyphen::Build),
+                version_cmp(
+                    &registry::parse_version(installed, Hyphen::Build).unwrap(),
+                    "2026.09.18",
+                    Hyphen::Build
+                ),
                 Some(Ordering::Equal),
                 "{installed}"
             );
@@ -2659,13 +2632,11 @@ mod tests {
     #[test]
     fn verdict_glyph_dash_for_clean_transcript_only_row() {
         let row = DoctorSourceRow {
-            prefix: "cp",
-            source_id: "copilot",
+            desc: registered("copilot"),
             connected: true,
             has_target: false,
             hooks_installed: false,
             installed_version: None,
-            verified_version: "unknown",
             diag: SourceDiagnostics {
                 install: None,
                 drift: LogScanResult::default(),
@@ -2683,13 +2654,11 @@ mod tests {
     #[test]
     fn row_installable_but_not_installed_shows_circle_and_not_installed() {
         let row = DoctorSourceRow {
-            prefix: "cc",
-            source_id: "claude-code",
+            desc: registered("claude-code"),
             connected: false,
             has_target: true,
             hooks_installed: false,
             installed_version: None,
-            verified_version: "unknown",
             diag: SourceDiagnostics {
                 install: None,
                 drift: LogScanResult::default(),
@@ -2711,13 +2680,11 @@ mod tests {
     #[test]
     fn format_row_emits_note_continuation_for_sound_schema_with_notes() {
         let row = DoctorSourceRow {
-            prefix: "cw",
-            source_id: "codewhale",
+            desc: registered("codewhale"),
             connected: true,
             has_target: true,
             hooks_installed: true,
             installed_version: Some("1.0.0".into()),
-            verified_version: "unknown",
             diag: SourceDiagnostics {
                 install: Some(crate::install::verify::SchemaVerifyResult {
                     issues: vec![],
@@ -2744,13 +2711,11 @@ mod tests {
     #[test]
     fn format_row_drift_detail_covers_all_kinds_samples_and_last_ts() {
         let row = DoctorSourceRow {
-            prefix: "cp",
-            source_id: "copilot",
+            desc: registered("copilot"),
             connected: true,
             has_target: false,
             hooks_installed: false,
             installed_version: None,
-            verified_version: "unknown",
             diag: SourceDiagnostics {
                 install: None,
                 drift: LogScanResult {

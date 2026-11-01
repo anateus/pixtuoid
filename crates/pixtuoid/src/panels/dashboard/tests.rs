@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use pixtuoid_core::AgentId;
-use pixtuoid_core::state::{ActivityState, AgentSlot, GlobalDeskIndex, ToolKind};
+use pixtuoid_core::state::{ActivityState, AgentSlot, GlobalDeskIndex, ToolKind, ToolUse};
 
 /// Build a slot with the fields the dashboard reads; the rest are inert.
 fn mk_slot(
@@ -27,11 +27,10 @@ fn mk_slot(
         created_at: now,
         last_event_at: now,
         exiting_at: None,
-        pending_idle_at: None,
         desk_index: GlobalDeskIndex(desk_index),
         floor_idx,
         tool_call_count: 0,
-        active_ms: 0,
+        running_ms: 0,
         unknown_cwd: false,
         parent_id,
         pid: None,
@@ -283,7 +282,7 @@ fn clamp_scroll_edge_cases() {
 }
 
 #[test]
-fn build_rows_carries_waiting_and_active_state() {
+fn build_rows_carries_requires_action_and_running_state() {
     let w = id("/p/w.jsonl");
     let a = id("/p/a.jsonl");
     let mut scene = SceneState::uniform(8);
@@ -295,8 +294,8 @@ fn build_rows_carries_waiting_and_active_state() {
             0,
             0,
             None,
-            ActivityState::Waiting {
-                reason: Arc::from("permission"),
+            ActivityState::RequiresAction {
+                reason: Some(Arc::from("permission")),
             },
         ),
     );
@@ -308,20 +307,35 @@ fn build_rows_carries_waiting_and_active_state() {
             1,
             0,
             None,
-            ActivityState::Active {
-                tool_use_id: None,
-                detail: Some(Arc::from("Edit x")),
-                kind: ToolKind::Edit,
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: None,
+                    detail: Some(Arc::from("Edit x")),
+                    kind: ToolKind::Edit,
+                }),
             },
         ),
     );
     let rows = build_dashboard_rows(&scene, &DashboardFolds::default());
-    assert_eq!(rows[0].state, RowState::Waiting(Arc::from("permission")));
-    assert_eq!(rows[1].state, RowState::Active(Some(Arc::from("Edit x"))));
+    assert_eq!(
+        rows[0].state,
+        RowState::RequiresAction(Some(Arc::from("permission")))
+    );
+    assert_eq!(rows[1].state, RowState::Running(Some(Arc::from("Edit x"))));
 }
 
 #[test]
 fn build_dashboard_rows_empty_scene_is_empty() {
     let scene = SceneState::uniform(8);
     assert!(build_dashboard_rows(&scene, &DashboardFolds::default()).is_empty());
+}
+
+/// An open turn between items is a running row with no tool: the row then
+/// reads "running".
+#[test]
+fn an_open_turn_with_no_item_is_a_running_row_with_no_tool() {
+    assert_eq!(
+        row_state(&ActivityState::Running { item: None }),
+        RowState::Running(None)
+    );
 }

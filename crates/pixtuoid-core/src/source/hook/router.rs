@@ -73,12 +73,14 @@ impl HookRouter {
     }
 
     /// Wire the #246 child-end un-claim producer.
+    #[must_use]
     pub fn with_child_end_unclaims(mut self, unclaims: Option<ChildEndUnclaims>) -> Self {
         self.child_end_unclaims = unclaims;
         self
     }
 
     /// Wire the daemon-presence side channel.
+    #[must_use]
     pub fn with_presence_tx(mut self, presence_tx: Option<PresenceSender>) -> Self {
         self.presence_tx = presence_tx;
         self
@@ -100,7 +102,7 @@ impl Source for HookRouter {
                 let chain = format!("{e:#}");
                 tracing::warn!(
                     error = ?chain,
-                    "hook plane disabled — hook-borne signals (permission Waiting, instant \
+                    "hook plane disabled — hook-borne signals (permission requests, instant \
                      lifecycle, daemon presence) belong to the owning instance; transcript \
                      sources keep running"
                 );
@@ -144,7 +146,7 @@ mod tests {
         let events: Vec<(Transport, AgentEvent)> = vec![
             (
                 Transport::Hook,
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id: root,
                     tool_use_id: Some("tu_1".into()),
                     detail: None,
@@ -217,7 +219,7 @@ mod tests {
         let res = Box::new(HookRouter::new(bad)).run(tx).await;
         assert!(
             res.is_err(),
-            "a non-Busy bind failure must be Err (SourceDeath fuel), got {res:?}"
+            "a non-`SocketBusy` bind failure must be Err (SourceDeath fuel), got {res:?}"
         );
     }
 }

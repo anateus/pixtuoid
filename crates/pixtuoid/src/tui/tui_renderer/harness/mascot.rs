@@ -9,17 +9,17 @@ fn gateway_scene(
     last_seen: SystemTime,
     sessions: u32,
 ) -> SceneState {
-    gateway_scene_runs(liveness, entered_at, last_seen, sessions, &[])
+    gateway_scene_turns(liveness, entered_at, last_seen, sessions, &[])
 }
 
-/// As `gateway_scene`, with in-flight RUN keys. Busy is DERIVED: pass
-/// `DaemonLiveness::UP` + ≥1 run, not a stored Busy state.
-fn gateway_scene_runs(
+/// As `gateway_scene`, with in-flight TURN keys. Running is DERIVED: pass
+/// `DaemonLiveness::UP` + ≥1 turn, not a stored Running state.
+fn gateway_scene_turns(
     liveness: pixtuoid_core::state::DaemonLiveness,
     entered_at: SystemTime,
     last_seen: SystemTime,
     sessions: u32,
-    runs: &[&str],
+    turns: &[&str],
 ) -> SceneState {
     let mut s = SceneState::uniform(16);
     s.insert_daemon(
@@ -30,11 +30,16 @@ fn gateway_scene_runs(
             active_sessions: sessions,
             last_seen,
             entered_at,
-            in_flight_runs: runs
+            in_flight_turns: turns
                 .iter()
-                // Stamped at the scene's own clock so the run lease is fresh —
-                // these fixtures assert the BUSY render, not the decay.
-                .map(|r| (r.to_string(), last_seen))
+                // Stamped at the scene's own clock so the turn lease is fresh —
+                // these fixtures assert the running render, not the decay.
+                .map(|r| {
+                    (
+                        pixtuoid_core::state::TurnKey::Id(r.to_string().into()),
+                        last_seen,
+                    )
+                })
                 .collect(),
             current_pid: Some(1),
         },
@@ -57,7 +62,7 @@ fn gateway_scene_at(ports: &[&str], entered_at: SystemTime, last_seen: SystemTim
                 active_sessions: 0,
                 last_seen,
                 entered_at,
-                in_flight_runs: Default::default(),
+                in_flight_turns: Default::default(),
                 current_pid: Some(1),
             },
         );
@@ -95,8 +100,8 @@ impl Probe {
         baseline: &SceneState,
         now: SystemTime,
     ) -> std::collections::BTreeSet<(u16, u16)> {
-        self.base.render(baseline, pack(), now).unwrap();
-        self.r.render(scene, pack(), now).unwrap();
+        self.base.render(baseline, now).unwrap();
+        self.r.render(scene, now).unwrap();
         let (base, buf) = (
             self.base.buf().expect("a frame"),
             self.r.buf().expect("a frame"),
@@ -197,7 +202,7 @@ fn the_port_suffix_names_a_gateway_only_when_it_has_a_sibling() {
         // pixel.
         for &(x, y) in cells.iter().step_by(5) {
             p.r.set_mouse_pos(Some((x, CellArea::row_of(y))));
-            p.r.render(&scene, pack(), t0()).unwrap();
+            p.r.render(&scene, t0()).unwrap();
             let text = frame_text(p.r.frame_buffer());
             if text.contains("gateway") {
                 out.push(text);
@@ -236,7 +241,7 @@ fn the_port_suffix_names_a_gateway_only_when_it_has_a_sibling() {
             active_sessions: 0,
             last_seen: seen,
             entered_at: entered,
-            in_flight_runs: Default::default(),
+            in_flight_turns: Default::default(),
             current_pid: Some(1),
         },
     );
@@ -245,7 +250,7 @@ fn the_port_suffix_names_a_gateway_only_when_it_has_a_sibling() {
     assert!(!cells.is_empty(), "openclaw still paints its lobster");
     for &(x, y) in cells.iter().step_by(5) {
         p.r.set_mouse_pos(Some((x, CellArea::row_of(y))));
-        p.r.render(&mixed, pack(), t0()).unwrap();
+        p.r.render(&mixed, t0()).unwrap();
         let text = frame_text(p.r.frame_buffer());
         if text.contains("gateway") {
             assert!(
@@ -349,12 +354,12 @@ fn gateway_mascot_present_when_up() {
 }
 
 #[test]
-fn gateway_mascot_busy_bubbles_track_runs_not_sessions() {
+fn gateway_mascot_running_bubbles_track_turns_not_sessions() {
     let entered = t0() - Duration::from_secs(20);
 
-    // sessions=1 with NO runs; then the same session WITH two in-flight runs.
+    // sessions=1 with NO turns; then the same session WITH two in-flight turns.
     let idle = gateway_scene(pixtuoid_core::state::DaemonLiveness::UP, entered, t0(), 1);
-    let busy = gateway_scene_runs(
+    let running = gateway_scene_turns(
         pixtuoid_core::state::DaemonLiveness::UP,
         entered,
         t0(),
@@ -365,19 +370,19 @@ fn gateway_mascot_busy_bubbles_track_runs_not_sessions() {
     let mut p = Probe::new();
     // Bubbles animate by `now`; scan a few frames so we don't land on an
     // all-off-screen phase.
-    let mut runs_add = 0;
+    let mut turns_add = 0;
     let mut session_adds = 0;
     for k in 0..8u64 {
         let now = t0() + Duration::from_millis(k * 130);
-        // Runs are the ONLY difference between the two scenes, so their diff is
+        // Turns are the ONLY difference between the two scenes, so their diff is
         // the bubbles. The session arm is the negative half: a second session
-        // with no runs must move nothing.
-        runs_add = runs_add.max(p.diff(&busy, &idle, now).len());
+        // with no turns must move nothing.
+        turns_add = turns_add.max(p.diff(&running, &idle, now).len());
         let more_sessions =
             gateway_scene(pixtuoid_core::state::DaemonLiveness::UP, entered, t0(), 3);
         session_adds = session_adds.max(p.diff(&more_sessions, &idle, now).len());
     }
-    assert!(runs_add > 0, "an in-flight run ⇒ activity bubbles render");
+    assert!(turns_add > 0, "an in-flight turn ⇒ activity bubbles render");
     assert_eq!(session_adds, 0, "more idle sessions must NOT bubble");
 }
 
@@ -448,7 +453,7 @@ fn gateway_mascot_tooltip_on_hover() {
     );
     // vec![] = no pet, so the pet hover arm is skipped and the mascot arm runs.
     let mut p = Probe::new();
-    p.r.render(&scene, pack(), t0()).unwrap();
+    p.r.render(&scene, t0()).unwrap();
 
     assert!(
         !frame_text(p.r.frame_buffer()).contains("gateway"),
@@ -461,7 +466,7 @@ fn gateway_mascot_tooltip_on_hover() {
     // The hover is the painted frame, which tolerates the approximate
     // center.
     p.r.set_mouse_pos(Some((cx, CellArea::row_of(cy_px))));
-    p.r.render(&scene, pack(), t0()).unwrap();
+    p.r.render(&scene, t0()).unwrap();
 
     // The literal "gateway" is exclusive to the mascot arm — pet/coffee/furniture
     // tooltips never say it — so it distinguishes the branch from the fallthroughs.

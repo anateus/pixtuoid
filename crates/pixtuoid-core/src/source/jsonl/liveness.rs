@@ -147,8 +147,7 @@ pub type LivenessProbe = Arc<dyn Fn() -> Option<ProbeSnapshot> + Send + Sync>;
 
 /// Negative vouch (#223): a previously-vouched id must be MISSING from two
 /// healthy probe snapshots at least this far apart before its exit is
-/// confirmed, immune to Codex's brief drop-and-reopen fd gap on a write failure
-/// and to the initial-seed / [`RESCAN_DELAY`](super::RESCAN_DELAY) adjacency.
+/// confirmed, immune to Codex's brief drop-and-reopen fd gap on a write failure.
 pub(super) const NEGATIVE_VOUCH_MIN_SPAN: Duration = Duration::from_secs(60);
 
 /// Whether the liveness probe vouches for this transcript. A vouched-for file is
@@ -349,7 +348,7 @@ pub(super) async fn emit_session_exit(id: &str, decoders: SourceDecoders, ctx: &
     };
     for path in &claimed {
         // A truncated-below-cursor file must be parked at its new EOF, not
-        // handed to the walk's truncation arm (cursor→0, no drain).
+        // handed to the walk's truncation arm (cursor→0, whole-file replay).
         park_if_truncated_below_cursor(path, ctx).await;
         walk_jsonl(path, decoders, ctx).await;
     }

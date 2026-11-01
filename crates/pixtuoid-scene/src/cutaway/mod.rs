@@ -2,8 +2,8 @@
 //! half-block painter, not a fidelity knob on it. Both read
 //! `sim::SimFrame`.
 //!
-//! `render_cutaway`, `CutawayCanvas` and the screen-text sink (`paint_grid`
-//! in a `Face`) are `#[doc(hidden)] pub` as seams for out-of-crate drivers
+//! `render_cutaway`, `CutawayCanvas` and the screen-text sink (`paint_grid`,
+//! its cells and `draws`) are `#[doc(hidden)] pub` as seams for out-of-crate drivers
 //! (the snapshot example, the render bench, the binary's font-coverage test,
 //! the painters) — MECHANISM, not a promise to a crates.io consumer. `shade` has no
 //! cross-crate caller and stays `pub(crate)`: a `pub` item on a published crate
@@ -20,5 +20,5 @@ pub(crate) mod shade;
 pub(crate) mod text;
 #[doc(hidden)]
 pub use crate::display::cells::CellPx;
-pub use grid::{Canvas, Face, GridInk, paint_grid};
+pub use grid::{Canvas, GridInk, chrome_cell, draws, glyph_cell, office_text_draws, paint_grid};
 pub(crate) mod wall;

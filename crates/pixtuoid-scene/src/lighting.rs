@@ -5,12 +5,12 @@
 
 use std::collections::HashMap;
 
-use pixtuoid_core::state::{ActivityState, FloorLocalDeskIndex};
+use pixtuoid_core::state::{ActivityState, FloorLocalDeskIndex, ToolUse};
 use pixtuoid_core::{AgentSlot, ToolKind};
 
 use crate::atmosphere::SkyTones;
 use crate::floor::NeonLevels;
-use crate::layout::{Facing, Point, SceneLayout};
+use crate::layout::{Facing, HomeDesk, Point, SceneLayout};
 
 /// The floor lamp's level at full dark, before the room's own level.
 const FLOOR_LAMP_GAIN: f32 = 0.55;
@@ -96,8 +96,8 @@ const SPILL_MAX_WIDEN: u16 = 3;
 pub(crate) enum EmitterKind {
     FloorLamp,
     DeskLamp,
-    /// Over a monitor lit by a call of this tool, and tinted by it.
-    MonitorHalo(ToolKind),
+    /// Over a monitor lit by this work, and tinted by it.
+    MonitorHalo(ScreenWork),
     NeonGlow,
     WindowSpill,
 }
@@ -338,10 +338,8 @@ impl Lights {
             desks: layout
                 .home_desks
                 .iter()
-                .enumerate()
-                .map(|(i, &desk)| {
-                    let facing = layout.desk_facing(FloorLocalDeskIndex(i));
-                    desk_lights(desk, facing, inputs.bulbs.at(facing), darkness, indoor)
+                .map(|&HomeDesk { at, facing }| {
+                    desk_lights(at, facing, inputs.bulbs.at(facing), darkness, indoor)
                 })
                 .collect(),
             monitor_halos: monitor_halos(layout, inputs),
@@ -424,28 +422,61 @@ impl DeskLights {
         Self {
             lamp: Emitter {
                 kind: EmitterKind::DeskLamp,
-                light: Light::Halo {
-                    centre: bulb,
-                    radius: DESK_LAMP_RADIUS,
-                    share: DESK_LAMP_MAX,
-                },
+                light: Self::halo(bulb),
                 strength: level,
             },
             screen_idle,
         }
     }
+
+    /// These lights with the lamp's pool centred on `centre`, where the art the
+    /// painter draws hangs its bulb.
+    pub(crate) fn relit_at(self, centre: Point) -> Self {
+        Self {
+            lamp: Emitter {
+                light: Self::halo(centre),
+                ..self.lamp
+            },
+            ..self
+        }
+    }
+
+    fn halo(centre: Point) -> Light {
+        Light::Halo {
+            centre,
+            radius: DESK_LAMP_RADIUS,
+            share: DESK_LAMP_MAX,
+        }
+    }
 }
 
-/// The tool lighting the screen of a desk facing `facing`, whose occupant
-/// `agent` sits there right now (`seated`, so not mid-walk during the Active
-/// grace window): `None` where the screen is dark, or shows us the monitor's
-/// back — a glow there would be light leaking out of a case. The one rule the
-/// screen glow and its halo share.
-pub(crate) fn lit_screen(agent: &AgentSlot, facing: Facing, seated: bool) -> Option<ToolKind> {
-    match agent.state {
-        ActivityState::Active { kind, .. } if seated && facing == Facing::North => Some(kind),
-        _ => None,
+/// The work an agent's screen shows, which tints its glow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScreenWork {
+    /// Its turn's item: a call of this tool.
+    ToolUse(ToolKind),
+    /// Its open turn, between items.
+    Turn,
+}
+
+/// What `agent`'s screen shows: `None` unless it is Running.
+pub(crate) fn screen_work(agent: &AgentSlot) -> Option<ScreenWork> {
+    match &agent.state {
+        ActivityState::Running {
+            item: Some(ToolUse { kind, .. }),
+        } => Some(ScreenWork::ToolUse(*kind)),
+        ActivityState::Running { item: None } => Some(ScreenWork::Turn),
+        ActivityState::Idle | ActivityState::RequiresAction { .. } => None,
     }
+}
+
+/// The work lighting the screen of a desk facing `facing`, whose occupant
+/// `agent` sits there right now (`seated`, so not mid-walk): `None` where the
+/// screen is dark, or shows us the monitor's back — a glow there would be
+/// light leaking out of a case. The one rule the screen glow and its halo
+/// share.
+pub(crate) fn lit_screen(agent: &AgentSlot, facing: Facing, seated: bool) -> Option<ScreenWork> {
+    screen_work(agent).filter(|_| seated && facing == Facing::North)
 }
 
 /// The glow of a desk's screen: its occupant's [`lit_screen`],
@@ -458,7 +489,7 @@ pub(crate) fn desk_screen_glow(
 ) -> Option<pixtuoid_core::sprite::Rgb> {
     occupant
         .and_then(|a| crate::lighting::lit_screen(a, facing, seated))
-        .map(|tool| theme.tool_glow.for_kind(tool))
+        .map(|work| theme.tool_glow.for_work(work))
 }
 
 /// One halo over each [`lit_screen`], on the row above its desk, clear of the
@@ -471,14 +502,14 @@ fn monitor_halos(layout: &SceneLayout, inputs: &LightInputs<'_>) -> Vec<Emitter>
         .filter_map(|agent| {
             let local = agent.desk_index.single_floor_local();
             let seated = inputs.seated.get(&local).copied().unwrap_or(false);
-            let tool = lit_screen(agent, layout.desk_facing(local), seated)?;
             let desk = layout.home_desk(local)?;
+            let work = lit_screen(agent, desk.facing, seated)?;
             Some(Emitter {
-                kind: EmitterKind::MonitorHalo(tool),
+                kind: EmitterKind::MonitorHalo(work),
                 light: Light::Patch {
                     centre: Point {
-                        x: desk.x + MONITOR_HALO_DX,
-                        y: desk.y.saturating_sub(1),
+                        x: desk.at.x + MONITOR_HALO_DX,
+                        y: desk.at.y.saturating_sub(1),
                     },
                 },
                 strength: MONITOR_HALO_INTENSITY,

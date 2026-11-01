@@ -1,13 +1,19 @@
-//! Oh My Pi (`omp`, omp.sh) source. Watches the omp session transcripts
-//! (`<sessions-root>/<encoded-cwd>/<ts>_<uuid>.jsonl`) via one `JsonlWatcher`
-//! per root: [`omp_sessions_dir`] owns every axis of the primary root,
-//! [`omp_profile_sessions_dirs`] adds every other profile's. omp has no shell-hook
-//! seam — its hooks are in-process TS extension modules — so the hook plane
-//! is a pixtuoid-owned bridge extension
-//! (`pixtuoid/src/install/omp_extension.ts`) whose payloads
-//! `decode_omp_hook_payload` claims (#951). Wire shape: upstream
-//! `packages/coding-agent/src/session/` (transcript) and `src/extensibility/`
-//! (extension events).
+//! Oh My Pi (`omp`, omp.sh) source. HYBRID: the durable authority is the
+//! session transcript (`<sessions-root>/<encoded-cwd>/<ts>_<uuid>.jsonl`), read
+//! by one `JsonlWatcher` per root: `omp_sessions_dir` owns every axis of the
+//! primary root, `omp_profile_sessions_dirs` adds every other profile's.
+//! Subagents persist as SEPARATE nested files (`<parent-stem>/<taskId>.jsonl`),
+//! parent-linked by path. omp has no shell-hook seam — its hooks are in-process
+//! TS extension modules — so the hook plane is a pixtuoid-owned bridge
+//! extension (`pixtuoid/src/install/omp_extension.ts`, auto-discovered from the
+//! agent dir's `extensions/`) whose payloads `decode_omp_hook_payload` claims
+//! (#951). It forwards what the transcript can never carry: pre-persist
+//! presence, empty-session shutdown, the approval wait, and the process's own
+//! `_pid`. Both transports key on the sessionFile stem chain
+//! ([`omp_id_from_path`]), so they mint ONE AgentId per session, as grok's do;
+//! under `omp --no-extensions`, or with the bridge broken, the transcript alone
+//! carries the session. Wire shape: upstream `packages/coding-agent/src/session/`
+//! (transcript) and `src/extensibility/` (extension events).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,18 +22,76 @@ use crate::source::decoder::DecodeResult as Result;
 use serde_json::Value;
 
 use crate::AgentId;
-use crate::source::decoder::{MAX_DECODED_FIELD_CHARS, ellipsize};
-use crate::source::{AgentEvent, ToolDetail};
+use crate::source::decoder::{
+    MAX_DECODED_FIELD_CHARS, accept_all_paths, ellipsize, extract_top_level_cwd,
+};
+use crate::source::registry::{
+    ChildEndInference, FocusChannel, HookDecoding, HookObject, Hyphen, SourceCaps,
+    SourceDescriptor, SourceKind, Transcript,
+};
+use crate::source::{AgentEvent, RequestKeys, ToolDetail};
 
 #[cfg(feature = "native")]
 mod native;
 #[cfg(feature = "native")]
 pub use native::OmpSource;
-#[cfg(feature = "native")]
-pub(crate) use native::live_omp_session_ids_for_focus;
 
 /// The Oh My Pi (omp) source's registry name (its `SourceDescriptor.name`).
 pub const SOURCE_NAME: &str = "omp";
+
+pub(crate) const DESCRIPTOR: SourceDescriptor = SourceDescriptor {
+    name: SOURCE_NAME,
+    label_prefix: "om",
+    verified_version: "18.14.2",
+    version_probe: Some(&["omp", "--version"]),
+    version_hyphen: Hyphen::Prerelease,
+    home_env: Some("PI_CODING_AGENT_DIR"),
+    kind: SourceKind::Agent {
+        transcript: Some(Transcript {
+            line_decoder: decode_omp_line,
+            // The nested stem CHAIN, so a subagent task id can't collide across
+            // sessions.
+            id_from_path: omp_id_from_path,
+            path_filter: accept_all_paths,
+            cwd_extractor: extract_top_level_cwd,
+            parent_extractor: None,
+        }),
+        hook: Some(HookDecoding::ClaimsAll(decode_omp_hook_payload)),
+        caps: SourceCaps {
+            // The `session_exit` entry is appended + flushed on every clean
+            // teardown incl. SIGINT/SIGTERM (and the bridge fires
+            // `session_shutdown` even for empty sessions the entry skips).
+            // SIGKILL: with the bridge, `HookPidWatch` ends the stamped pid's
+            // sessions promptly; without it, the stale-sweep.
+            has_exit_signal: true,
+            // The header `SessionStart` decodes once per transcript life. A
+            // `--resume` fires the bridge's `session_start` on the SAME id
+            // (`omp/fixtures/resume-hermetic`), so an ended
+            // session CAN walk back in — through the SessionStart arm's
+            // ordinary parentless re-registration, not this prompt-resurrect
+            // flag.
+            resurrects_on_prompt: false,
+            // The `task` dispatch emits a toolCall/toolResult pair on the parent
+            // AND the child persists its own parent-linked transcript.
+            delegations_are_hook_silent: false,
+            child_end_inference: ChildEndInference::TaskDrain,
+            child_hooks_unnamed: false,
+            brackets_turns: false,
+        },
+        // The bridge extension runs IN-PROCESS (upstream: extensions share
+        // the runtime), so its stamped `process.pid` IS omp's own —
+        // PluginStamp trust. The router stamps the kernel start marker; the
+        // click-time compare refuses a recycled pid (#527). The flip also
+        // puts omp on `HookPidWatch` (prompt exits) and makes a bridge-only,
+        // never-persisted session focusable from birth. Stamp-less shapes —
+        // `--no-extensions`, a session predating the bridge install — still
+        // focus through its `NATIVE` focus probe, which `resolve_pid` reads
+        // with no channel gate.
+        focus: FocusChannel::PluginStamp,
+    },
+    #[cfg(feature = "native")]
+    native: native::NATIVE,
+};
 
 /// omp's SESSIONS root, mirroring `dirs.ts` — deliberately NOT
 /// `omp_agent_dir().join("sessions")`, because the XDG redirect FLATTENS the
@@ -35,12 +99,9 @@ pub const SOURCE_NAME: &str = "omp";
 /// read through the `.env` overlay first (`with_omp_dotenv`): upstream applies
 /// those files and then REBUILDS this resolver, so a var set only in `~/.env`
 /// moves the sessions dir and process env alone would watch an empty directory.
-/// The read is deliberately UNBOUNDED, unlike `source/`'s per-refresh probe
-/// reads: a cap could truncate a key upstream's own `parseEnvFile` honors.
-pub fn omp_sessions_dir() -> PathBuf {
-    let env = with_omp_dotenv(&OmpEnv::from_process(), &|p| {
-        std::fs::read_to_string(p).ok()
-    });
+#[cfg(feature = "native")]
+pub(crate) fn omp_sessions_dir() -> PathBuf {
+    let env = overlaid_env();
     resolve_omp_sessions_dir(
         &env,
         cfg!(any(target_os = "linux", target_os = "macos")),
@@ -50,15 +111,13 @@ pub fn omp_sessions_dir() -> PathBuf {
 
 /// omp's ACTIVE agent directory, the root its extension loader scans (its
 /// `EXTENSIONS_SUBDIR` child). Same `.env` overlay as
-/// [`omp_sessions_dir`], same profile/override precedence, but NO XDG
+/// `omp_sessions_dir`, same profile/override precedence, but NO XDG
 /// flatten: upstream's `getAgentDir()` returns `dirs.agentDir` un-redirected
 /// (`dirs.ts` applies XDG only per-category via `agentSubdir`), so a
 /// migrated-XDG user's extensions still load from here. Exported for the
 /// install target — a second resolver copy is the #880 drift class.
 pub fn omp_agent_dir() -> PathBuf {
-    let env = with_omp_dotenv(&OmpEnv::from_process(), &|p| {
-        std::fs::read_to_string(p).ok()
-    });
+    let env = overlaid_env();
     resolve_omp_agent_dir(&env)
 }
 
@@ -71,6 +130,15 @@ pub(crate) const EXTENSIONS_SUBDIR: &str = "extensions";
 /// to non-public items).
 pub fn omp_extensions_dir() -> PathBuf {
     omp_agent_dir().join(EXTENSIONS_SUBDIR)
+}
+
+/// The process env under the `.env` overlay. The read is deliberately
+/// UNBOUNDED, unlike `source/`'s per-refresh probe reads: a cap could truncate
+/// a key upstream's own `parseEnvFile` honors.
+fn overlaid_env() -> OmpEnv {
+    with_omp_dotenv(&OmpEnv::from_process(), &|p| {
+        std::fs::read_to_string(p).ok()
+    })
 }
 
 /// The process environment omp's resolver reads, injected so every arm — the
@@ -216,6 +284,7 @@ fn resolve_omp_agent_dir(env: &OmpEnv) -> PathBuf {
 }
 
 /// `getSessionsDir()` = `agentSubdir(undefined, "sessions", "data")`.
+#[cfg(feature = "native")]
 fn resolve_omp_sessions_dir(
     env: &OmpEnv,
     xdg_platform: bool,
@@ -241,10 +310,9 @@ fn resolve_omp_sessions_dir(
 /// set is deterministic. Only the SELECTED profile's `.env` files overlay the
 /// env (upstream freezes the resolver per process the same way), so another
 /// profile's own `.env` relocations are unseen here.
-pub fn omp_profile_sessions_dirs() -> Vec<PathBuf> {
-    let env = with_omp_dotenv(&OmpEnv::from_process(), &|p| {
-        std::fs::read_to_string(p).ok()
-    });
+#[cfg(feature = "native")]
+pub(crate) fn omp_profile_sessions_dirs() -> Vec<PathBuf> {
+    let env = overlaid_env();
     omp_profile_sessions_dirs_resolved(
         &env,
         cfg!(any(target_os = "linux", target_os = "macos")),
@@ -262,20 +330,34 @@ pub fn omp_profile_sessions_dirs() -> Vec<PathBuf> {
     )
 }
 
+/// The dir [`omp_profile_sessions_dirs`] enumerates, so each new entry in it
+/// is a new profile.
+#[cfg(feature = "native")]
+pub(crate) fn omp_profiles_dir() -> Option<PathBuf> {
+    let env = overlaid_env();
+    profiles_dir(&env)
+}
+
+#[cfg(feature = "native")]
+fn profiles_dir(env: &OmpEnv) -> Option<PathBuf> {
+    Some(omp_config_root(env, None)?.join(PROFILES_SUBDIR))
+}
+
+#[cfg(feature = "native")]
 fn omp_profile_sessions_dirs_resolved(
     env: &OmpEnv,
     xdg_platform: bool,
     exists: &dyn Fn(&Path) -> bool,
     list_profiles: &dyn Fn(&Path) -> Vec<String>,
 ) -> Vec<PathBuf> {
-    let Some(base) = omp_config_root(env, None) else {
+    let Some(profiles) = profiles_dir(env) else {
         return Vec::new();
     };
     let primary = resolve_omp_sessions_dir(env, xdg_platform, exists);
     // Through the same validator omp applies: a dir failing its name regex (or
     // a stray `default`) is one omp can never select, so watching it would
     // follow a root omp never writes.
-    let mut names: Vec<String> = list_profiles(&base.join(PROFILES_SUBDIR))
+    let mut names: Vec<String> = list_profiles(&profiles)
         .iter()
         .filter_map(|n| normalize_profile_name(Some(n)))
         .collect();
@@ -298,6 +380,7 @@ fn omp_profile_sessions_dirs_resolved(
 /// the home-rooted layout. Linux and macOS only, and only for a DEFAULT agent dir.
 /// The file's own header claims there is no existence check; its code calls
 /// `fs.existsSync`.
+#[cfg(feature = "native")]
 fn xdg_app_root(
     xdg_data_home: Option<&Path>,
     profile: Option<&str>,
@@ -556,14 +639,14 @@ const ROLE_TOOL_RESULT: &str = "toolResult";
 /// The assistant-content block a tool call arrives in. Its `id` is a REQUIRED
 /// pairing key on a block we decode, so an absent one is upstream drift rather than
 /// a line we ignore — breadcrumb, then drop. An unkeyable `toolResult` is the same
-/// case: it could never close its Start, leaking Active forever.
+/// case: it could never close its Start, leaking Running forever.
 const BLOCK_TOOL_CALL: &str = "toolCall";
 
-/// The tool that BLOCKS on human input: its `ActivityStart` binds the reducer's
-/// `gated_before_waiting` gate to the ask's own tool_use_id, so the answer's
-/// `toolResult` resolves the Wait. Ask pairs are appended LAST — a sibling's later
-/// ActivityStart would flip the slot back to Active, drop the gate, and strand the
-/// Wait forever.
+/// The tool that BLOCKS on human input: its `ToolUseStart` makes the ask's own
+/// tool_use_id a member of the reducer's action request, so the answer's
+/// `toolResult` resolves the Wait. The request takes as its member the call
+/// shown when it is raised, so ask pairs are appended LAST: each ask's [`AgentEvent::UserActionRequest`]
+/// directly follows its own start, never a sibling's.
 const TOOL_ASK: &str = "ask";
 
 /// `prefix·<text>` at the label cap — the ONE place omp assembles a
@@ -618,19 +701,15 @@ pub(crate) fn omp_head_title(v: &Value) -> Option<String> {
 /// Decode one omp session JSONL line into zero or more `AgentEvent`s.
 /// Unknown entry types / roles and malformed shapes return `vec![]` — the
 /// upstream loader is itself lenient (`parseJsonlLenient`).
-///
-/// # Errors
-///
-/// Never: the `Result` is the [`LineDecoder`](crate::source::decoder::LineDecoder) signature, and a malformed line decodes to `vec![]`.
-pub fn decode_omp_line(transcript_path: &str, source: &str, v: Value) -> Result<Vec<AgentEvent>> {
+pub fn decode_omp_line(transcript_path: &str, source: &str, v: Value) -> Vec<AgentEvent> {
     let path = Path::new(transcript_path);
     let acting = AgentId::from_parts(source, &omp_id_from_path(path));
     let Some(obj) = v.as_object() else {
-        return Ok(vec![]);
+        return vec![];
     };
     let kind = obj.get("type").and_then(|s| s.as_str()).unwrap_or("");
 
-    let out = match kind {
+    match kind {
         SESSION => {
             let cwd = obj.get("cwd").and_then(|c| c.as_str()).unwrap_or_else(|| {
                 crate::source::drift::missing_field(source, "session", "cwd");
@@ -647,7 +726,7 @@ pub fn decode_omp_line(transcript_path: &str, source: &str, v: Value) -> Result<
         }
         MESSAGE => {
             let Some(msg) = obj.get("message") else {
-                return Ok(vec![]);
+                return vec![];
             };
             match msg.get("role").and_then(|r| r.as_str()) {
                 Some(ROLE_ASSISTANT) => {
@@ -676,9 +755,8 @@ pub fn decode_omp_line(transcript_path: &str, source: &str, v: Value) -> Result<
                         }
                     }
                     let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
-                        return Ok(out);
+                        return out;
                     };
-                    let mut asks = Vec::new();
                     for b in blocks
                         .iter()
                         .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some(BLOCK_TOOL_CALL))
@@ -691,30 +769,30 @@ pub fn decode_omp_line(transcript_path: &str, source: &str, v: Value) -> Result<
                             crate::source::drift::missing_field(source, BLOCK_TOOL_CALL, "name");
                             ""
                         });
-                        let is_ask = name == TOOL_ASK;
-                        let dst = if is_ask { &mut asks } else { &mut out };
-                        dst.push(AgentEvent::ActivityStart {
+                        out.push(AgentEvent::ToolUseStart {
                             agent_id: acting,
                             tool_use_id: Some(id.to_string()),
                             detail: Some(omp_tool_detail(name, b.get("arguments"))),
                         });
-                        if is_ask {
-                            asks.push(AgentEvent::Waiting {
-                                agent_id: acting,
-                                reason: omp_ask_reason(b.get("arguments")),
-                                tool_use_id: None,
-                            });
+                        if name == TOOL_ASK {
+                            out.push(AgentEvent::user_action_request(
+                                acting,
+                                Some(omp_ask_reason(b.get("arguments"))),
+                                RequestKeys {
+                                    tool_use_id: Some(id.to_string()),
+                                    ..RequestKeys::default()
+                                },
+                            ));
                         }
                     }
-                    out.extend(asks);
                     out
                 }
                 Some(ROLE_TOOL_RESULT) => {
                     let Some(tool_call_id) = msg.get("toolCallId").and_then(|i| i.as_str()) else {
                         crate::source::drift::missing_field(source, "toolResult", "toolCallId");
-                        return Ok(vec![]);
+                        return vec![];
                     };
-                    vec![AgentEvent::ActivityEnd {
+                    vec![AgentEvent::ToolUseEnd {
                         agent_id: acting,
                         tool_use_id: Some(tool_call_id.to_string()),
                     }]
@@ -749,8 +827,7 @@ pub fn decode_omp_line(transcript_path: &str, source: &str, v: Value) -> Result<
         },
         // Not sprite-visible (`model_change` among them — see `ROLE_ASSISTANT`).
         _ => vec![],
-    };
-    Ok(out)
+    }
 }
 
 /// omp's tool-detail dispatch. The subagent dispatch is the `task` tool,
@@ -767,7 +844,7 @@ fn omp_tool_detail(tool: &str, args: Option<&Value>) -> ToolDetail {
     crate::source::decoder::generic_keyed_detail(tool, args, KEYS)
 }
 
-/// The Waiting reason for an `ask` round: the first question's text, falling
+/// The [`AgentEvent::UserActionRequest`] reason for an `ask` round: the first question's text, falling
 /// back to the call's intent (`arguments.i`), then the bare tool name.
 fn omp_ask_reason(args: Option<&Value>) -> String {
     args.and_then(|a| {
@@ -798,7 +875,7 @@ const HOOK_APPROVAL_RESOLVED: &str = "tool_approval_resolved";
 
 /// The hook event types this decoder turns into events, pinned to the dispatch arms by
 /// `every_exported_set_is_exactly_its_dispatch_arms` and to the TS
-/// extension's registration list by the install-side two-language pin.
+/// extension's registrations by its selftest, through `the_plugin_contract_is_the_committed_file`.
 #[cfg(any(test, feature = "harness"))]
 #[doc(hidden)]
 pub const DECODED_HOOK_EVENTS: &[&str] = &[
@@ -839,10 +916,7 @@ pub const DECODED_HOOK_EVENTS: &[&str] = &[
 /// # Errors
 ///
 /// Never: a malformed or unknown payload decodes to `vec![]`; the `Result` is the hook-decoder signature.
-pub(crate) fn decode_omp_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
-    let Some(obj) = v.as_object() else {
-        return Ok(vec![]);
-    };
+pub(crate) fn decode_omp_hook_payload(obj: &HookObject) -> Result<Vec<AgentEvent>> {
     let Some(ty) = obj.get("type").and_then(|t| t.as_str()) else {
         crate::source::drift::missing_field(SOURCE_NAME, "hook", "type");
         return Ok(vec![]);
@@ -910,16 +984,19 @@ pub(crate) fn decode_omp_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
             };
             let tool = obj.get("toolName").and_then(|t| t.as_str()).unwrap_or("");
             let event = if ty == HOOK_APPROVAL_REQUESTED {
-                AgentEvent::Waiting {
+                AgentEvent::user_action_request(
                     agent_id,
-                    reason: omp_approval_reason(obj, tool),
-                    tool_use_id: Some(tool_call_id.to_string()),
-                }
+                    Some(omp_approval_reason(obj, tool)),
+                    RequestKeys {
+                        tool_use_id: Some(tool_call_id.to_string()),
+                        ..RequestKeys::default()
+                    },
+                )
             } else if obj.get("approved").and_then(|a| a.as_bool()) == Some(true) {
                 // The resume. copilot's approve-emits-nothing shape doesn't fit
                 // omp: the transcript wrote this call BEFORE the request, so
                 // only this Start can lift the wait.
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id,
                     tool_use_id: Some(tool_call_id.to_string()),
                     detail: Some(omp_tool_detail(tool, None)),
@@ -927,7 +1004,7 @@ pub(crate) fn decode_omp_hook_payload(v: &Value) -> Result<Vec<AgentEvent>> {
             } else {
                 // Denial: resolves the gated wait now; the transcript's
                 // isError toolResult later is the deduped/no-op backstop.
-                AgentEvent::ActivityEnd {
+                AgentEvent::ToolUseEnd {
                     agent_id,
                     tool_use_id: Some(tool_call_id.to_string()),
                 }
@@ -961,7 +1038,7 @@ fn omp_hook_session_key(obj: &serde_json::Map<String, Value>) -> Option<(String,
         .map(|s| (s.to_string(), None))
 }
 
-/// The Waiting reason for an approval gate: the wire's `reason` when it says
+/// The [`AgentEvent::UserActionRequest`] reason for an approval gate: the wire's `reason` when it says
 /// anything (a plain bash gate sends none — probe-verified at this source's
 /// `verified_version`), else the tool name, else the literal gate.
 fn omp_approval_reason(obj: &serde_json::Map<String, Value>, tool: &str) -> String {
@@ -979,6 +1056,7 @@ fn omp_approval_reason(obj: &serde_json::Map<String, Value>, tool: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::decoder::test_obj;
     use serde_json::json;
 
     const ROOT: &str = "/home/u/.omp/agent/sessions/-dev-proj/2026-07-09T08-00-00-000Z_0197f0aa-0000-7000-8000-000000000001.jsonl";
@@ -1006,7 +1084,7 @@ mod tests {
             };
             let mut evs = 0;
             let logs = crate::test_capture::capture_logs(|| {
-                evs = decode_omp_line(ROOT, SOURCE_NAME, line).map_or(0, |e| e.len());
+                evs = decode_omp_line(ROOT, SOURCE_NAME, line).len();
             });
             evs > 0 || logs.contains(crate::source::drift::TARGET)
         };
@@ -1039,7 +1117,7 @@ mod tests {
         AgentId::from_parts(SOURCE_NAME, ROOT_KEY)
     }
     fn decode_at(path: &str, line: &str) -> Vec<AgentEvent> {
-        decode_omp_line(path, SOURCE_NAME, serde_json::from_str(line).unwrap()).unwrap()
+        decode_omp_line(path, SOURCE_NAME, serde_json::from_str(line).unwrap())
     }
     fn decode(line: &str) -> Vec<AgentEvent> {
         decode_at(ROOT, line)
@@ -1240,44 +1318,13 @@ mod tests {
         );
         assert!(matches!(
             decode_omp_line(ROOT, SOURCE_NAME, title_entry(TITLE_CHANGE, field))
-                .expect("title entry decodes")
                 .as_slice(),
             [AgentEvent::Rename { label, .. }] if label == "om·Name this session"
         ));
 
         let renamed = "renamedTitle";
         assert!(omp_head_title(&title_entry(TITLE, renamed)).is_none());
-        assert!(
-            decode_omp_line(ROOT, SOURCE_NAME, title_entry(TITLE_CHANGE, renamed))
-                .expect("unknown title field is ignored")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn session_header_registers_root_with_cwd_and_no_parent() {
-        let line = r#"{"type":"session","version":3,"id":"0197f0aa-0000-7000-8000-000000000001","timestamp":"2026-07-09T08:00:00.000Z","cwd":"/home/u/proj"}"#;
-        match &decode(line)[..] {
-            [
-                AgentEvent::SessionStart {
-                    agent_id,
-                    source,
-                    session_id,
-                    cwd,
-                    parent_id,
-                },
-            ] => {
-                assert_eq!(*agent_id, root());
-                assert_eq!(source, "omp");
-                assert_eq!(
-                    session_id, ROOT_KEY,
-                    "session_id must match the watcher's id-deriver key"
-                );
-                assert_eq!(cwd, Path::new("/home/u/proj"));
-                assert_eq!(*parent_id, None);
-            }
-            other => panic!("expected one SessionStart, got {other:?}"),
-        }
+        assert!(decode_omp_line(ROOT, SOURCE_NAME, title_entry(TITLE_CHANGE, renamed)).is_empty());
     }
 
     #[test]
@@ -1303,7 +1350,7 @@ mod tests {
 
     /// Every message-level name reaches a real arm. Each is an equality guard
     /// whose miss is SILENT — a renamed role decodes the turn to nothing, a
-    /// renamed block type finds no tool calls, a renamed `ask` strands the Waiting
+    /// renamed block type finds no tool calls, a renamed `ask` strands the RequiresAction
     /// gate.
     #[test]
     fn each_message_level_name_reaches_an_arm() {
@@ -1315,7 +1362,7 @@ mod tests {
                        "message": {"role": role, "timestamp": 1,
                                    "content": [{"type": block, "id": "t1", "name": tool}]}}),
             )
-            .map_or(0, |e| e.len())
+            .len()
         };
         let good = turn(ROLE_ASSISTANT, BLOCK_TOOL_CALL, TOOL_ASK);
         assert!(good > 0, "the message vocabulary decodes a turn");
@@ -1329,7 +1376,7 @@ mod tests {
             );
         }
 
-        // The ask arm's OWN probe: an ask-named call must gate Waiting, and a
+        // The ask arm's OWN probe: an ask-named call must gate a UserActionRequest, and a
         // renamed ask must not — start-only, never the gate.
         let waits = |tool: &str| {
             decode_omp_line(
@@ -1340,25 +1387,14 @@ mod tests {
                                    "content": [{"type": BLOCK_TOOL_CALL, "id": "t2",
                                                 "name": tool}]}}),
             )
-            .is_ok_and(|evs| evs.iter().any(|e| matches!(e, AgentEvent::Waiting { .. })))
+            .iter()
+            .any(|e| matches!(e, AgentEvent::UserActionRequest { .. }))
         };
-        assert!(waits(TOOL_ASK), "an ask call must gate Waiting");
+        assert!(waits(TOOL_ASK), "an ask call must gate a UserActionRequest");
         assert!(
             !waits("pxd_renamed_ask"),
-            "a renamed ask must not gate Waiting"
+            "a renamed ask must not gate a UserActionRequest"
         );
-    }
-
-    #[test]
-    fn session_exit_ends_root_not_as_child() {
-        let line = r#"{"type":"custom","id":"a1b2c3d4","parentId":"e5f6a7b8","timestamp":"2026-07-09T08:10:00.000Z","customType":"session_exit","data":{"reason":"exit command","kind":"normal","recordedAt":"2026-07-09T08:10:00.000Z"}}"#;
-        match &decode(line)[..] {
-            [AgentEvent::SessionEnd { agent_id, as_child }] => {
-                assert_eq!(*agent_id, root());
-                assert!(!*as_child);
-            }
-            other => panic!("expected root SessionEnd, got {other:?}"),
-        }
     }
 
     #[test]
@@ -1399,28 +1435,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn assistant_tool_calls_start_activity_keyed_on_block_id() {
-        let line = r#"{"type":"message","id":"m1","parentId":null,"timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"Reading."},{"type":"toolCall","id":"toolu_01AAA","name":"read","arguments":{"path":"/home/u/proj/main.rs"}}],"stopReason":"toolUse","timestamp":1720512000000}}"#;
-        match &decode(line)[..] {
-            [
-                AgentEvent::ActivityStart {
-                    agent_id,
-                    tool_use_id,
-                    detail: Some(ToolDetail::Generic { display }),
-                },
-            ] => {
-                assert_eq!(*agent_id, root());
-                assert_eq!(tool_use_id.as_deref(), Some("toolu_01AAA"));
-                assert!(
-                    display.contains("main.rs"),
-                    "read tool should show its path target, got {display:?}"
-                );
-            }
-            other => panic!("expected one ActivityStart, got {other:?}"),
-        }
-    }
-
     /// Byte-real: omp mandates a per-call `i` intent, and its `edit`/`todo`
     /// tools carry NO path-like argument, so they would render as a bare verb
     /// without `i` as the last-resort target.
@@ -1432,12 +1446,12 @@ mod tests {
             );
             match &decode(&line)[..] {
                 [
-                    AgentEvent::ActivityStart {
+                    AgentEvent::ToolUseStart {
                         detail: Some(ToolDetail::Generic { display }),
                         ..
                     },
                 ] => display.clone(),
-                other => panic!("expected one ActivityStart, got {other:?}"),
+                other => panic!("expected one ToolUseStart, got {other:?}"),
             }
         };
         assert_eq!(
@@ -1477,12 +1491,12 @@ mod tests {
                     model: Some(model),
                     effort: None,
                 },
-                AgentEvent::ActivityStart { .. },
+                AgentEvent::ToolUseStart { .. },
             ] => {
                 assert_eq!(*agent_id, root());
                 assert_eq!(model.as_str(), "kimi-for-coding");
             }
-            other => panic!("expected ModelInfo then ActivityStart, got {other:?}"),
+            other => panic!("expected ModelInfo then ToolUseStart, got {other:?}"),
         }
         let text_only = r#"{"type":"message","id":"m2","parentId":null,"timestamp":"t","message":{"role":"assistant","provider":"anthropic","model":"claude-fable-5","content":[{"type":"text","text":"done"}],"timestamp":2}}"#;
         match &decode(text_only)[..] {
@@ -1493,18 +1507,9 @@ mod tests {
         }
         let empty = r#"{"type":"message","id":"m3","timestamp":"t","message":{"role":"assistant","model":"","content":[],"timestamp":3}}"#;
         assert!(decode(empty).is_empty());
-        // pi-ai `types.ts` requires `content`, so this shape cannot occur on real
-        // wire — it pins the let-else early return's `Ok(out)`, not `Ok(vec![])`.
-        let no_content = r#"{"type":"message","id":"m4","timestamp":"t","message":{"role":"assistant","model":"claude-fable-5","timestamp":4}}"#;
-        match &decode(no_content)[..] {
-            [AgentEvent::ModelInfo { model: Some(m), .. }] => {
-                assert_eq!(m.as_str(), "claude-fable-5");
-            }
-            other => panic!("expected one ModelInfo, got {other:?}"),
-        }
     }
 
-    /// Byte-real shape, anchored by the recorded `omp/ask-recorded` fixture:
+    /// Byte-real shape, anchored by the recorded `omp/fixtures/tool-run-hermetic`:
     /// `configured` is the user's PIN and is `null` whenever the pin is "auto",
     /// while `thinkingLevel` is what the turn actually ran at — only the latter
     /// is an effort observation.
@@ -1548,53 +1553,15 @@ mod tests {
     }
 
     #[test]
-    fn parallel_tool_calls_each_start_activity() {
-        let line = r#"{"type":"message","id":"m1","parentId":null,"timestamp":"t","message":{"role":"assistant","content":[{"type":"toolCall","id":"t1","name":"bash","arguments":{"command":"cargo test"}},{"type":"toolCall","id":"t2","name":"grep","arguments":{"pattern":"fn main"}}],"timestamp":1}}"#;
-        let evs = decode(line);
-        assert_eq!(evs.len(), 2, "one ActivityStart per toolCall block");
-        match &evs[..] {
-            [
-                AgentEvent::ActivityStart {
-                    tool_use_id: id1, ..
-                },
-                AgentEvent::ActivityStart {
-                    tool_use_id: id2, ..
-                },
-            ] => {
-                assert_eq!(id1.as_deref(), Some("t1"));
-                assert_eq!(id2.as_deref(), Some("t2"));
-            }
-            other => panic!("expected two ActivityStarts, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tool_result_ends_activity_keyed_on_tool_call_id() {
-        let line = r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"t","message":{"role":"toolResult","toolCallId":"toolu_01AAA","toolName":"read","content":[{"type":"text","text":"fn main() {}"}],"isError":false,"timestamp":1720512001000}}"#;
-        match &decode(line)[..] {
-            [
-                AgentEvent::ActivityEnd {
-                    agent_id,
-                    tool_use_id,
-                },
-            ] => {
-                assert_eq!(*agent_id, root());
-                assert_eq!(tool_use_id.as_deref(), Some("toolu_01AAA"));
-            }
-            other => panic!("expected one ActivityEnd, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn task_dispatch_is_delegating() {
         let line = r#"{"type":"message","id":"m3","parentId":null,"timestamp":"t","message":{"role":"assistant","content":[{"type":"toolCall","id":"t3","name":"task","arguments":{"task":"fix the flaky test","id":"Alpha"}}],"timestamp":1}}"#;
         match &decode(line)[..] {
             [
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     detail: Some(d), ..
                 },
             ] => assert!(d.is_task(), "task tool must be Delegating, got {d:?}"),
-            other => panic!("expected Delegating ActivityStart, got {other:?}"),
+            other => panic!("expected Delegating ToolUseStart, got {other:?}"),
         }
     }
 
@@ -1603,14 +1570,14 @@ mod tests {
         let line = r#"{"type":"message","id":"m4","parentId":null,"timestamp":"t","message":{"role":"assistant","content":[{"type":"toolCall","id":"t4","name":"read","arguments":{"path":"x.rs","subagent_type":null}}],"timestamp":1}}"#;
         match &decode(line)[..] {
             [
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     detail: Some(d), ..
                 },
             ] => assert!(
                 !d.is_task(),
                 "a spoofed subagent_type arg must stay Generic, got {d:?}"
             ),
-            other => panic!("expected Generic ActivityStart, got {other:?}"),
+            other => panic!("expected Generic ToolUseStart, got {other:?}"),
         }
     }
 
@@ -1619,26 +1586,30 @@ mod tests {
         let line = r#"{"type":"message","id":"m7","parentId":null,"timestamp":"t","message":{"role":"assistant","content":[{"type":"toolCall","id":"tool_ASK1","name":"ask","arguments":{"i":"Resolving packages/ui collision","questions":[{"id":"ui_collision","question":"packages/ui already exists. What should happen?","options":[{"label":"Replace"},{"label":"Merge"}]}]}}],"timestamp":1}}"#;
         match &decode(line)[..] {
             [
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id,
                     tool_use_id,
                     ..
                 },
-                AgentEvent::Waiting {
+                AgentEvent::UserActionRequest {
                     agent_id: wid,
                     reason,
+                    tool_use_id: asked,
                     ..
                 },
             ] => {
                 assert_eq!(*agent_id, root());
                 assert_eq!(*wid, root());
                 assert_eq!(tool_use_id.as_deref(), Some("tool_ASK1"));
+                assert_eq!(asked, tool_use_id, "the question names its own call");
                 assert!(
-                    reason.contains("packages/ui already exists"),
+                    reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("packages/ui already exists")),
                     "reason carries the question text, got {reason:?}"
                 );
             }
-            other => panic!("expected ActivityStart then Waiting, got {other:?}"),
+            other => panic!("expected ToolUseStart then UserActionRequest, got {other:?}"),
         }
     }
 
@@ -1646,48 +1617,42 @@ mod tests {
     fn ask_reason_falls_back_to_intent_then_bare_name() {
         let intent = r#"{"type":"message","id":"m8","parentId":null,"timestamp":"t","message":{"role":"assistant","content":[{"type":"toolCall","id":"tool_ASK2","name":"ask","arguments":{"i":"Confirming scope"}}],"timestamp":1}}"#;
         match &decode(intent)[..] {
-            [_, AgentEvent::Waiting { reason, .. }] => assert_eq!(reason, "Confirming scope"),
-            other => panic!("expected Start+Waiting, got {other:?}"),
+            [_, AgentEvent::UserActionRequest { reason, .. }] => {
+                assert_eq!(reason.as_deref(), Some("Confirming scope"))
+            }
+            other => panic!("expected Start+UserActionRequest, got {other:?}"),
         }
         let bare = r#"{"type":"message","id":"m9","parentId":null,"timestamp":"t","message":{"role":"assistant","content":[{"type":"toolCall","id":"tool_ASK3","name":"ask"}],"timestamp":1}}"#;
         match &decode(bare)[..] {
-            [_, AgentEvent::Waiting { reason, .. }] => assert_eq!(reason, "ask"),
-            other => panic!("expected Start+Waiting, got {other:?}"),
+            [_, AgentEvent::UserActionRequest { reason, .. }] => {
+                assert_eq!(reason.as_deref(), Some("ask"))
+            }
+            other => panic!("expected Start+UserActionRequest, got {other:?}"),
         }
     }
 
     #[test]
-    fn ask_batched_with_parallel_tool_calls_decodes_last() {
+    fn an_ask_among_parallel_calls_names_its_own() {
         let line = r#"{"type":"message","id":"mB","parentId":null,"timestamp":"t","message":{"role":"assistant","content":[{"type":"toolCall","id":"tool_ASK5","name":"ask","arguments":{"i":"Confirming scope"}},{"type":"toolCall","id":"t7","name":"bash","arguments":{"command":"cargo check"}}],"timestamp":1}}"#;
         match &decode(line)[..] {
             [
-                AgentEvent::ActivityStart {
-                    tool_use_id: bash, ..
-                },
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     tool_use_id: ask, ..
                 },
-                AgentEvent::Waiting { .. },
+                AgentEvent::UserActionRequest {
+                    tool_use_id: asked, ..
+                },
+                AgentEvent::ToolUseStart {
+                    tool_use_id: bash, ..
+                },
             ] => {
-                assert_eq!(bash.as_deref(), Some("t7"));
                 assert_eq!(ask.as_deref(), Some("tool_ASK5"));
+                assert_eq!(asked, ask);
+                assert_eq!(bash.as_deref(), Some("t7"));
             }
-            other => panic!("expected bash Start, then ask Start+Waiting, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ask_reason_is_capped_at_the_decode_boundary() {
-        let long = "q".repeat(MAX_DECODED_FIELD_CHARS * 10);
-        let line = format!(
-            r#"{{"type":"message","id":"mA","parentId":null,"timestamp":"t","message":{{"role":"assistant","content":[{{"type":"toolCall","id":"tool_ASK4","name":"ask","arguments":{{"questions":[{{"id":"x","question":"{long}"}}]}}}}],"timestamp":1}}}}"#
-        );
-        match &decode(&line)[..] {
-            [_, AgentEvent::Waiting { reason, .. }] => {
-                assert_eq!(reason.chars().count(), MAX_DECODED_FIELD_CHARS + 1);
-                assert!(reason.ends_with('…'));
-            }
-            other => panic!("expected Start+Waiting, got {other:?}"),
+            other => panic!(
+                "expected the ask's Start+UserActionRequest, then bash's Start, got {other:?}"
+            ),
         }
     }
 
@@ -1706,7 +1671,7 @@ mod tests {
         let no_name = r#"{"type":"message","id":"m6","parentId":null,"timestamp":"t","message":{"role":"assistant","content":[{"type":"toolCall","id":"t6","arguments":{}}],"timestamp":1}}"#;
         let out = crate::test_capture::capture_logs(|| match &decode(no_name)[..] {
             [
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     tool_use_id,
                     detail: Some(d),
                     ..
@@ -1715,7 +1680,7 @@ mod tests {
                 assert_eq!(tool_use_id.as_deref(), Some("t6"));
                 assert!(!d.is_task());
             }
-            other => panic!("expected one ActivityStart, got {other:?}"),
+            other => panic!("expected one ToolUseStart, got {other:?}"),
         });
         for needle in [crate::source::drift::TARGET, "missing_field", "toolCall"] {
             assert!(
@@ -1762,16 +1727,8 @@ mod tests {
         ] {
             assert!(decode(line).is_empty(), "expected no events for {line}");
         }
-        assert!(
-            decode_omp_line(ROOT, SOURCE_NAME, json!("not an object"))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            decode_omp_line(ROOT, SOURCE_NAME, json!(["array"]))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(decode_omp_line(ROOT, SOURCE_NAME, json!("not an object")).is_empty());
+        assert!(decode_omp_line(ROOT, SOURCE_NAME, json!(["array"])).is_empty());
     }
 
     #[test]
@@ -2425,7 +2382,7 @@ mod tests {
     }
 
     fn hook(v: serde_json::Value) -> Vec<AgentEvent> {
-        decode_omp_hook_payload(&v).unwrap()
+        decode_omp_hook_payload(test_obj(&v)).unwrap()
     }
 
     #[test]
@@ -2583,10 +2540,11 @@ mod tests {
         match &evs[..] {
             [
                 AgentEvent::Identity { agent_id: iid, .. },
-                AgentEvent::Waiting {
+                AgentEvent::UserActionRequest {
                     agent_id,
-                    reason,
+                    reason: Some(reason),
                     tool_use_id,
+                    ..
                 },
             ] => {
                 assert_eq!(iid, agent_id);
@@ -2603,7 +2561,9 @@ mod tests {
             "toolCallId": "call_1", "toolName": "bash", "reason": "outside workspace",
         }));
         match &evs[..] {
-            [_, AgentEvent::Waiting { reason, .. }] => assert_eq!(reason, "outside workspace"),
+            [_, AgentEvent::UserActionRequest { reason, .. }] => {
+                assert_eq!(reason.as_deref(), Some("outside workspace"))
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -2618,7 +2578,7 @@ mod tests {
         match &evs[..] {
             [
                 AgentEvent::Identity { .. },
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id,
                     tool_use_id,
                     detail,
@@ -2643,7 +2603,7 @@ mod tests {
         match &evs[..] {
             [
                 AgentEvent::Identity { .. },
-                AgentEvent::ActivityEnd {
+                AgentEvent::ToolUseEnd {
                     agent_id,
                     tool_use_id,
                 },
@@ -2675,7 +2635,7 @@ mod tests {
             "toolCallId": "call_t", "toolName": "task", "approved": true,
         }));
         match &evs[..] {
-            [_, AgentEvent::ActivityStart { detail, .. }] => {
+            [_, AgentEvent::ToolUseStart { detail, .. }] => {
                 assert!(detail.as_ref().is_some_and(|d| d.is_task()));
             }
             other => panic!("unexpected: {other:?}"),

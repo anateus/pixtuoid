@@ -39,7 +39,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use pixtuoid::dev::{Protocol, renderer};
-use pixtuoid_core::state::{ActivityState, SceneState, ToolKind};
+use pixtuoid_core::state::{ActivityState, SceneState, ToolKind, ToolUse};
 use pixtuoid_core::{AgentId, AgentSlot, GlobalDeskIndex};
 use pixtuoid_scene::anim::{Motion, PAINT_FPS};
 use pixtuoid_scene::look::spans;
@@ -163,10 +163,12 @@ fn office(start: SystemTime) -> SceneState {
         let id = AgentId::from_transcript_path(&format!("/pacing/a{i}.jsonl"));
         let (state, started) = match i % 3 {
             0 => (
-                ActivityState::Active {
-                    tool_use_id: Some(format!("tu_{i}").into()),
-                    detail: Some("Edit: src/lib.rs".into()),
-                    kind: ToolKind::Edit,
+                ActivityState::Running {
+                    item: Some(ToolUse {
+                        tool_use_id: Some(format!("tu_{i}").into()),
+                        detail: Some("Edit: src/lib.rs".into()),
+                        kind: ToolKind::Edit,
+                    }),
                 },
                 long_ago,
             ),
@@ -190,11 +192,10 @@ fn office(start: SystemTime) -> SceneState {
                 created_at: started,
                 last_event_at: started,
                 exiting_at: None,
-                pending_idle_at: None,
                 desk_index: GlobalDeskIndex(i),
                 floor_idx: scene.floor_of(GlobalDeskIndex(i)),
                 tool_call_count: 0,
-                active_ms: 0,
+                running_ms: 0,
                 unknown_cwd: false,
                 parent_id: None,
                 model: None,
@@ -259,7 +260,7 @@ fn run(
         wire.take();
         clock.take();
         let begun = Instant::now();
-        r.render(&scene, pack, now)?;
+        r.render(&scene, now)?;
         let total = begun.elapsed();
         let (bytes, write_ns) = wire.take();
         let spans = clock.take();
@@ -312,7 +313,7 @@ fn real_clock(
         if let Some(prev) = last.replace(begun) {
             intervals.push(begun - prev);
         }
-        r.render(&scene, pack, start + clock.elapsed())?;
+        r.render(&scene, start + clock.elapsed())?;
         renders.push(begun.elapsed());
         // The loop's own wait is crossterm's input poll; a CI runner has no
         // terminal to poll, so it sleeps.
@@ -489,8 +490,9 @@ fn owner_terminal(pack: &pixtuoid_scene::pack::OfficeArt, cell: (u16, u16)) -> R
     (1..=1000u16)
         .flat_map(|c| (1..=400u16).map(move |r| (c, r)))
         .find(|&(c, r)| {
-            pixtuoid::dev::cutaway_office(c, r, cell, pack)
-                .is_some_and(|(w, h, _)| w >= OWNER_OFFICE.0 && h >= OWNER_OFFICE.1)
+            pixtuoid::dev::cutaway_office(c, r, cell, pack).is_some_and(|fit| {
+                fit.logical().w >= OWNER_OFFICE.0 && fit.logical().h >= OWNER_OFFICE.1
+            })
         })
         .context("no terminal fits the owner's office")
 }
@@ -533,13 +535,17 @@ fn hitch(path: &Path) -> Result<()> {
     let pack = Arc::new(pixtuoid_scene::pack::load_bundled_pack()?);
     let (cols, rows) = owner_terminal(&pack, OWNER_CELL)?;
     anyhow::ensure!(
-        pixtuoid::dev::cutaway_office(cols, rows, OWNER_CELL, &pack)
-            .is_some_and(|(w, h, _)| (w, h) == OWNER_OFFICE),
+        pixtuoid::dev::cutaway_office(cols, rows, OWNER_CELL, &pack).is_some_and(|fit| (
+            fit.logical().w,
+            fit.logical().h
+        )
+            == OWNER_OFFICE),
         "the owner's terminal no longer gives the owner's office exactly: its runs stop being comparable"
     );
     let tick = Duration::from_secs(1) / PAINT_FPS;
     let real_secs = pixtuoid_core::platform::text_env("HITCH_REAL_SECS")
-        .and_then(|s| s.parse().ok())
+        .map(|s| s.parse().with_context(|| format!("HITCH_REAL_SECS={s:?}")))
+        .transpose()?
         .unwrap_or(600);
     let only = pixtuoid_core::platform::text_env("HITCH_ONLY");
     let noon = pixtuoid_scene::localclock::at_hour(12);
@@ -668,7 +674,8 @@ fn hitch(path: &Path) -> Result<()> {
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
     let mut stdout = std::io::stdout().lock();
     for t in &terms {
-        let office_of = pixtuoid::dev::cutaway_office(t.cols, t.rows, t.cell, &pack);
+        let office_of = pixtuoid::dev::cutaway_office(t.cols, t.rows, t.cell, &pack)
+            .map(|fit| (fit.logical().w, fit.logical().h, fit.scale().get()));
         let _ = writeln!(
             stdout,
             "{}: {}x{} cells of {:?} px, cutaway office/scale {office_of:?}",
@@ -680,13 +687,18 @@ fn hitch(path: &Path) -> Result<()> {
         .flat_map(|t| sweeps.iter().map(move |r| (t, r)))
         .collect();
     plan.insert(0, (&terms[0], &real));
-    for (term, run) in plan {
-        if only.as_deref().is_some_and(|o| {
-            !o.split('|')
+    plan.retain(|(term, run)| {
+        only.as_deref().is_none_or(|o| {
+            o.split('|')
                 .all(|part| term.name.contains(part) || run.name.contains(part))
-        }) {
-            continue;
-        }
+        })
+    });
+    anyhow::ensure!(
+        !plan.is_empty(),
+        "HITCH_ONLY={:?} selects no run",
+        only.as_deref().unwrap_or_default()
+    );
+    for (term, run) in plan {
         let pets = vec![Pet::defaulted(PetKind::Cat), Pet::defaulted(PetKind::Dog)];
         let (mut r, wire) = renderer(
             term.protocol,
@@ -724,7 +736,7 @@ fn hitch(path: &Path) -> Result<()> {
         let wall = Instant::now();
         let start = run.start.unwrap_or_else(SystemTime::now);
         let scene = office(start);
-        pixtuoid::dev::warm(&mut r, &scene, &pack, start);
+        pixtuoid::dev::warm(&mut r, &scene, start);
         let mut totals = Vec::new();
         let mut n = 0u64;
         let pace = if pixtuoid_core::platform::text_env("HITCH_HOT").is_some() {
@@ -749,7 +761,7 @@ fn hitch(path: &Path) -> Result<()> {
             wire.take();
             probe.take();
             let begun = Instant::now();
-            r.render(&scene, &pack, now)?;
+            r.render(&scene, now)?;
             let total = begun.elapsed();
             let (bytes, write_ns) = wire.take();
             let seen = probe.take();

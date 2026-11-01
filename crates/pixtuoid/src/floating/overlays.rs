@@ -1,7 +1,7 @@
 //! The window's chrome over the office: its footer, tooltip and panels, and the panel geometry a press maps through.
 
 use pixtuoid_core::state::SceneState;
-use pixtuoid_scene::cutaway::{Canvas, CellPx, Face, GridInk, paint_grid};
+use pixtuoid_scene::cutaway::{Canvas, CellPx, GridInk, chrome_cell, paint_grid};
 use pixtuoid_scene::display::cells::{CARD_SHADOW, CellGrid, CellRect};
 use pixtuoid_scene::footer::FooterModel;
 use pixtuoid_scene::pack::OfficeArt;
@@ -48,16 +48,15 @@ pub(crate) fn panels_grid(
 /// A window `window` physical px big, in screen cells of `cell`: the
 /// surface the panels are laid out on.
 pub(crate) fn panel_cells((w, h): (u32, u32), cell: CellPx) -> (u16, u16) {
-    let fits = |px: u32, size: u16| u16::try_from(px / u32::from(size.max(1))).unwrap_or(u16::MAX);
+    let fits = |px: u32, size: u16| u16::try_from(px / u32::from(size)).unwrap_or(u16::MAX);
     (fits(w, cell.w), fits(h, cell.h))
 }
 
 /// The screen cell of `cell` under window point `(x, y)`: the panels paint
 /// from the window's top-left ([`paint_panels`]).
 pub(crate) fn cell_at((x, y): (f64, f64), cell: CellPx) -> (u16, u16) {
-    let at = |p: f64, size: u16| {
-        u16::try_from(p.max(0.0) as u32 / u32::from(size.max(1))).unwrap_or(u16::MAX)
-    };
+    let at =
+        |p: f64, size: u16| u16::try_from(p.max(0.0) as u32 / u32::from(size)).unwrap_or(u16::MAX);
     (at(x, cell.w), at(y, cell.h))
 }
 
@@ -71,7 +70,7 @@ pub(crate) fn modal_press(
     shown: Option<PixelFit>,
 ) -> crate::panels::ModalMouse {
     let cells = shown.map(|at| {
-        let cell = Face::chrome(at);
+        let cell = chrome_cell(at);
         (cell_at(cursor, cell), panel_cells(window, cell))
     });
     let popup_scale = crate::panels::ui_state::popup_whole(ui.modal().version_popup_open);
@@ -100,8 +99,7 @@ impl PlacedTip {
         (w, h): (u32, u32),
     ) -> Self {
         let card = tip.card(theme);
-        let cells =
-            |px: u32, size: u16| u16::try_from(px / u32::from(size.max(1))).unwrap_or(u16::MAX);
+        let cells = |px: u32, size: u16| u16::try_from(px / u32::from(size)).unwrap_or(u16::MAX);
         let area = CellRect {
             x: 0,
             y: 0,
@@ -152,13 +150,7 @@ pub(crate) fn paint_tooltip(
         halo: None,
         shadow: Some(CARD_SHADOW),
     };
-    paint_grid(
-        canvas,
-        &placed.card,
-        (placed.at, cell),
-        (Face::Screen, pack),
-        ink,
-    );
+    paint_grid(canvas, &placed.card, (placed.at, cell), pack, ink);
 }
 
 /// The panel `name` (`help`, `dashboard`, `sources` or `theme`) open over
@@ -238,14 +230,14 @@ pub(crate) fn paint_panels(
         halo: None,
         shadow: None,
     };
-    paint_grid(canvas, panels, ((0, 0), cell), (Face::Screen, pack), ink);
+    paint_grid(canvas, panels, ((0, 0), cell), pack, ink);
 }
 
 /// How many screen cells of `cell` fit across a `win_w`-pixel window
 /// between the footer's margins: its column budget.
 pub fn footer_budget(win_w: usize, cell: CellPx) -> u16 {
     let room = win_w.saturating_sub(2 * usize::from(FOOTER_MARGIN_PX));
-    u16::try_from(room / usize::from(cell.w.max(1))).unwrap_or(u16::MAX)
+    u16::try_from(room / usize::from(cell.w)).unwrap_or(u16::MAX)
 }
 
 /// The footer's band: a `window`'s full width at its foot, `at`'s
@@ -272,7 +264,7 @@ pub(crate) fn paint_footer(
     at: PixelFit,
     window: (u32, u32),
 ) {
-    let cell = Face::chrome(at);
+    let cell = chrome_cell(at);
     let band = footer_rect(at, window);
     let ground = theme.surface.bg_fallback;
     for y in band.y..band.y.saturating_add_unsigned(band.h) {
@@ -290,7 +282,7 @@ pub(crate) fn paint_footer(
         canvas,
         &model.line(theme),
         ((margin, band.y + margin), cell),
-        (Face::Screen, pack),
+        pack,
         ink,
     );
 }
@@ -364,7 +356,7 @@ impl OverlayLayers {
             panels,
         } = next;
         let look = Look { theme, at, window };
-        let cell = Face::chrome(at);
+        let cell = chrome_cell(at);
         refresh(&mut self.footer, Some((footer, look)), |(model, _)| {
             let mut layer = RgbaLayer::new(footer_rect(at, window));
             paint_footer(&mut layer, model, (theme, pack), at, window);
@@ -422,9 +414,10 @@ impl OverlayLayers {
 #[cfg(test)]
 mod tests {
     use super::super::compose::{XrgbSurface, pack_xrgb};
-    use super::super::fixtures::{active_on, density, scene_with};
+    use super::super::fixtures::{density, running_on, scene_with};
     use super::super::geometry::{Zoom, window_geometry};
     use super::*;
+    use pixtuoid_scene::cutaway::glyph_cell;
     use pixtuoid_scene::footer::{FooterInputs, build_footer};
     use winit::dpi::PhysicalSize;
 
@@ -441,7 +434,7 @@ mod tests {
             let mut px = vec![0u32; w * h];
             let mut sb = XrgbSurface::new(&mut px, w, h).expect("sized");
             let look = (theme, &pack);
-            let cell = Face::Screen.cell(1);
+            let cell = glyph_cell(2);
             let placed = PlacedTip::new(tip, cursor, theme, cell, (w as u32, h as u32));
             paint_tooltip(&mut sb, &placed, look, cell);
             let rows: Vec<usize> = (0..h)
@@ -475,7 +468,7 @@ mod tests {
         );
         // An agent's card opens below the pointer, flips above at the bottom
         // edge, and shifts left at the right one.
-        let agent = active_on("/p/a.jsonl", 0, 0);
+        let agent = running_on("/p/a.jsonl", 0, 0);
         let id = agent.agent_id;
         let scene = scene_with(vec![agent], 16);
         let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
@@ -529,7 +522,7 @@ mod tests {
         use pixtuoid_scene::footer::{FooterTone, RungKind};
         let theme = pixtuoid_scene::theme::theme_by_name("normal").expect("normal theme exists");
         let mut scene = SceneState::new([8; pixtuoid_core::state::MAX_FLOORS]);
-        let slot = active_on("/p/a.jsonl", 0, 0);
+        let slot = running_on("/p/a.jsonl", 0, 0);
         scene.agents.insert(slot.agent_id, slot);
         let inputs = FooterInputs::new(
             &scene,
@@ -541,7 +534,7 @@ mod tests {
             density(),
             Zoom::default(),
         );
-        let model = build_footer(&inputs, footer_budget(w, Face::chrome(at)));
+        let model = build_footer(&inputs, footer_budget(w, chrome_cell(at)));
         let pack = pixtuoid_scene::pack::load_bundled_pack().expect("bundled pack loads");
         // The office as the window draws it, then the footer over it.
         const OFFICE: u32 = 0x0012_3456;
@@ -564,8 +557,8 @@ mod tests {
             "the band's ground"
         );
         assert!(
-            sb.contains(&pack_xrgb(FooterTone::Rung(RungKind::Active).rgb(theme))),
-            "the ●A rung paints the shared label_active hue"
+            sb.contains(&pack_xrgb(FooterTone::Rung(RungKind::Running).rgb(theme))),
+            "the ●R rung paints the shared label_running hue"
         );
     }
 
@@ -640,7 +633,7 @@ mod tests {
             density(),
             Zoom::default(),
         );
-        let cell = Face::chrome(at);
+        let cell = chrome_cell(at);
         let tip = pixtuoid_scene::tooltip::coffee();
         for cursor in [(100.0, 4.0), (630.0, 390.0), (0.0, 200.0)] {
             let placed = PlacedTip::new(&tip, cursor, theme, cell, window);

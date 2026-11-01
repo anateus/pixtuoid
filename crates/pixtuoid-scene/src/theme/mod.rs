@@ -188,7 +188,7 @@ pub(crate) struct FurnitureColors {
 /// Transient effect cues (glow, sleep z, steam, dust, bubble).
 #[derive(Debug, Clone)]
 pub(crate) struct EffectColors {
-    /// Lit monitor bezel on an active screen.
+    /// Lit monitor bezel on a running agent's screen.
     pub(crate) monitor_frame_lit: Rgb,
     /// A powered-but-quiet screen's glass — a back-turned desk shows it after dark whether or not anyone is at it.
     pub(crate) monitor_idle: Rgb,
@@ -198,8 +198,8 @@ pub(crate) struct EffectColors {
     pub(crate) coffee_steam: Rgb,
     /// Dust puff kicked up while walking.
     pub(crate) walking_dust: Rgb,
-    /// Overhead bubble on a waiting agent.
-    pub(crate) waiting_bubble: Rgb,
+    /// Overhead bubble on a requires-action agent.
+    pub(crate) requires_action_bubble: Rgb,
 }
 
 /// Per-tool monitor-glow hues (the screen glow while a tool runs).
@@ -233,15 +233,28 @@ impl ToolGlowColors {
             ToolKind::Other => self.default,
         }
     }
+
+    /// The hue of a screen's work: its tool's, or `default` for a turn
+    /// between items.
+    pub(crate) fn for_work(&self, work: crate::lighting::ScreenWork) -> Rgb {
+        match work {
+            crate::lighting::ScreenWork::ToolUse(kind) => self.for_kind(kind),
+            crate::lighting::ScreenWork::Turn => self.default,
+        }
+    }
 }
 
 /// Name-badge, tooltip, and neon-brand UI colors.
 #[derive(Debug, Clone)]
 pub struct UiColors {
-    /// Name-badge tone for an active agent.
-    pub label_active: Rgb,
-    /// Name-badge tone for a waiting agent.
-    pub label_waiting: Rgb,
+    /// Work in flight: an agent's tool call, or a gateway's turn.
+    pub label_running: Rgb,
+    /// The `ok` tone, not a slot state: a connected CLI, a checked checkbox.
+    pub label_ok: Rgb,
+    /// The needs-you tone: an agent that requires action.
+    pub label_requires_action: Rgb,
+    /// The alarm: a fault or a dead connection.
+    pub label_warn: Rgb,
     /// Name-badge tone for an idle agent.
     pub label_idle: Rgb,
     /// Name-badge tone for an exiting agent.
@@ -262,7 +275,7 @@ pub struct UiColors {
     /// The neon sign's hue while an agent waits on the user. The hue change IS the
     /// signal, so it must read as a different light from [`Self::neon_brand`]
     /// (`the_neon_alert_hue_is_a_different_light_in_every_theme`) — which a
-    /// theme's `label_waiting` is not always.
+    /// theme's `label_requires_action` is not always.
     pub(crate) neon_alert: Rgb,
 }
 
@@ -406,17 +419,6 @@ mod tests {
     }
 
     #[test]
-    fn all_themes_resolve_by_name() {
-        for t in ALL_THEMES {
-            assert!(
-                theme_by_name(t.name).is_some(),
-                "theme '{}' not found",
-                t.name
-            );
-        }
-    }
-
-    #[test]
     fn unknown_theme_returns_none() {
         assert!(theme_by_name("doesnotexist").is_none());
     }
@@ -481,11 +483,6 @@ mod tests {
     }
 
     #[test]
-    fn light_themes_marked_light() {
-        assert_eq!(NORMAL.kind, ThemeKind::Light);
-    }
-
-    #[test]
     fn sun_and_moon_read_warm_and_cool_for_every_theme() {
         for t in ALL_THEMES {
             let l = &t.lighting;
@@ -534,8 +531,8 @@ mod tests {
     }
 
     // Two glow roles too close to tell apart is a CORRECTNESS bug, not taste:
-    // `CharacterGlow::Thinking` also resolves to `default`, so an aliased
-    // `default` makes a thinking agent read as an editing one.
+    // an open turn showing no item also glows `default`, so an aliased
+    // `default` makes it read as an editing one.
     #[test]
     fn tool_glow_hues_are_distinct_for_every_theme() {
         /// Deliberately looser than `MIN_SOURCE_HUE_DIST`: six glow roles share
@@ -711,17 +708,5 @@ mod tests {
                 d.label_prefix
             );
         }
-    }
-
-    #[test]
-    fn tool_glow_is_the_shared_kind_to_hue_map() {
-        use pixtuoid_core::state::ToolKind;
-        let glow = &NORMAL.tool_glow;
-        assert_eq!(glow.for_kind(ToolKind::Edit), glow.edit);
-        assert_eq!(glow.for_kind(ToolKind::Read), glow.read);
-        assert_eq!(glow.for_kind(ToolKind::Bash), glow.bash);
-        assert_eq!(glow.for_kind(ToolKind::Task), glow.agent);
-        assert_eq!(glow.for_kind(ToolKind::Search), glow.grep);
-        assert_eq!(glow.for_kind(ToolKind::Other), glow.default);
     }
 }

@@ -7,8 +7,9 @@ use crate::harness::hermetic::{
 use crate::harness::plan::Placeholder;
 
 pub(crate) const PROFILE: Profile = Profile {
-    source: "openclaw",
+    source: crate::source::openclaw::SOURCE_NAME,
     package: Package::Npm("openclaw"),
+    plugin_types: &["openclaw"],
     invocation: &[
         "openclaw",
         "agent",
@@ -68,7 +69,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "gateway_stop",
                 "session_end",
             ],
-            fixture: "fixtures/openclaw/tool-run-hermetic",
             turn: Turn::PROFILE,
         },
         Scenario {
@@ -83,7 +83,6 @@ pub(crate) const PROFILE: Profile = Profile {
                 "gateway_stop",
                 "session_end",
             ],
-            fixture: "fixtures/openclaw/model-error-hermetic",
             turn: Turn::PROFILE,
         },
     ],
@@ -108,4 +107,6 @@ pub(crate) const PROFILE: Profile = Profile {
         // `docs/platforms/mac/bundled-gateway.md:46-49`).
         env: &[("OPENCLAW_GATEWAY_HOST_LIFELINE", "stdin")],
     }),
+    server_stop: None,
+    turn_exits: &[],
 };

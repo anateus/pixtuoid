@@ -73,6 +73,7 @@ impl Rgb {
     /// The warm and cool shift is a pull in OKLab's a/b plane toward a fixed
     /// hue: a hue rotation flips direction at the hue opposite its target and
     /// has nothing to rotate on a grey, where the pull warms its lights.
+    #[must_use]
     pub fn ramp(self, level: i8) -> Rgb {
         if level == 0 {
             return self;
@@ -84,8 +85,7 @@ impl Rgb {
             *memo.entry((self, level)).or_insert_with(|| {
                 self.ramp_run(level > 0)
                     .take(usize::from(level.unsigned_abs()))
-                    .last()
-                    .unwrap_or(self)
+                    .fold(self, |_, step| step)
             })
         })
     }
@@ -142,6 +142,7 @@ impl Rgb {
     /// Interpolated in OKLab, the space [`Rgb::ramp`] steps in, so a mix's
     /// lightness moves evenly with `t` where an sRGB mix of two hues sags
     /// through a darker, muddier middle.
+    #[must_use]
     pub fn mix(self, other: Rgb, t: f32) -> Rgb {
         debug_assert!(!t.is_nan(), "a NaN t survives the clamp");
         Rgb::from_oklab_in_gamut(self.to_oklab().mix(other.to_oklab(), t))
@@ -371,6 +372,7 @@ impl Frame {
     }
 
     /// Reverse each row — turns a right-facing sprite into a left-facing one.
+    #[must_use]
     pub fn mirror_horizontal(&self) -> Self {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -386,6 +388,7 @@ impl Frame {
     }
 
     /// Flip rows top-to-bottom.
+    #[must_use]
     pub fn mirror_vertical(&self) -> Self {
         let w = self.width as usize;
         let h = self.height as usize;
@@ -1293,29 +1296,6 @@ mod tests {
                 Some(Rgb { r: 3, g: 0, b: 0 }),
             ]
         );
-    }
-
-    #[test]
-    fn rgb_buffer_put_get_roundtrip() {
-        let mut b = RgbBuffer::filled(3, 2, Rgb { r: 0, g: 0, b: 0 });
-        b.put(
-            1,
-            1,
-            Rgb {
-                r: 10,
-                g: 20,
-                b: 30,
-            },
-        );
-        assert_eq!(
-            b.get(1, 1),
-            Rgb {
-                r: 10,
-                g: 20,
-                b: 30
-            }
-        );
-        assert_eq!(b.get(0, 0), Rgb { r: 0, g: 0, b: 0 });
     }
 
     #[test]

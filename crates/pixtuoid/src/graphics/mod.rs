@@ -48,7 +48,7 @@ pub(crate) struct TileShape {
 }
 
 /// How long each wait of the capability probe may take: the query start to
-/// finish, and, inside tmux, the `allow-passthrough` read before it.
+/// finish.
 ///
 /// The query ends with a device-status request ([`wire::ask`]), so a terminal
 /// that answers ends the wait the moment its reply is complete; the budget is
@@ -367,11 +367,6 @@ pub(crate) enum Chosen {
     Name,
 }
 
-/// A text variable: `None` when unset, blank or not UTF-8.
-fn env_text(name: &str) -> Option<String> {
-    pixtuoid_core::platform::text_env(name).filter(|v| !v.trim().is_empty())
-}
-
 /// A marker variable, presence only, by [`path_env`](pixtuoid_core::platform::path_env)'s rule.
 fn env_set(name: &str) -> bool {
     pixtuoid_core::platform::path_env(name).is_some()
@@ -402,8 +397,8 @@ struct TermEnv {
 impl TermEnv {
     fn read() -> Self {
         Self {
-            term: env_text("TERM"),
-            term_program: env_text("TERM_PROGRAM"),
+            term: pixtuoid_core::platform::text_env("TERM"),
+            term_program: pixtuoid_core::platform::text_env("TERM_PROGRAM"),
             tmux_client: env_set("TMUX"),
             // ssh(1) ENVIRONMENT: what a session's sshd sets, SSH_TTY only with a tty.
             ssh: env_set("SSH_CONNECTION") || env_set("SSH_TTY"),
@@ -653,7 +648,14 @@ impl ClassicReason {
                 .to_string(),
             Self::NoAnswer => "the terminal did not answer the capability query".to_string(),
             Self::NoProtocol => {
-                "terminal reports no graphics protocol (kitty/iterm2/sixel)".to_string()
+                let names: Vec<&str> = <ImageProtocol as clap::ValueEnum>::value_variants()
+                    .iter()
+                    .map(|p| p.name())
+                    .collect();
+                format!(
+                    "terminal reports no graphics protocol ({})",
+                    names.join("/")
+                )
             }
             Self::TmuxPassthroughOff => "inside tmux with allow-passthrough off — \
                  `set -g allow-passthrough on` lets kitty graphics through"
@@ -853,6 +855,46 @@ mod tests {
     fn the_grid_unwind_ends_any_image_then_erases_the_display() {
         assert_eq!(grid_unwind(false), b"");
         assert_eq!(grid_unwind(true), b"\x1b\\\x1b[2J");
+    }
+
+    /// The README and the site name the cutaway's protocols from one
+    /// `site/src/features.json` row, cased for reading; no binary build
+    /// reaches the site, so this test is the only bridge to the code's.
+    #[test]
+    fn the_site_names_every_image_protocol() {
+        // crates.io-packaged test runs don't ship the repo's site/ tree.
+        let site = concat!(env!("CARGO_MANIFEST_DIR"), "/../../site");
+        if !std::path::Path::new(site).is_dir() {
+            return;
+        }
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../site/src/features.json");
+        let json = std::fs::read_to_string(path).expect("features.json moved or was renamed");
+        let features: Vec<serde_json::Value> =
+            serde_json::from_str(&json).expect("features.json parses");
+        let rows: Vec<_> = features
+            .iter()
+            .filter_map(|f| f.get("protocols")?.as_array())
+            .collect();
+        let [row] = rows.as_slice() else {
+            panic!(
+                "features.json needs exactly one `protocols` row, has {}",
+                rows.len()
+            );
+        };
+        let mut site: Vec<String> = row
+            .iter()
+            .map(|p| p.as_str().expect("a protocol is a string").to_lowercase())
+            .collect();
+        let mut code: Vec<&str> = <ImageProtocol as clap::ValueEnum>::value_variants()
+            .iter()
+            .map(|p| p.name())
+            .collect();
+        site.sort_unstable();
+        code.sort_unstable();
+        assert_eq!(
+            site, code,
+            "features.json `protocols` must name every ImageProtocol"
+        );
     }
 
     const CELL_8X16: CellSize = CellSize { w: 8, h: 16 };
@@ -1638,7 +1680,7 @@ mod tests {
                 look(LookMode::Auto),
                 answered(None, CELL_8X16, false),
                 BUNDLED,
-                "terminal reports no graphics protocol (kitty/iterm2/sixel)",
+                "terminal reports no graphics protocol (kitty/sixel/iterm2)",
             ),
             (
                 LOCAL,

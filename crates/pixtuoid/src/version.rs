@@ -7,17 +7,6 @@ use semver::Version;
 
 use crate::install::target::{self, Target};
 
-fn is_newer_version(current: &str, last_seen: &str) -> bool {
-    matches!(
-        (Version::parse(current), Version::parse(last_seen)),
-        (Ok(c), Ok(l)) if c > l
-    )
-}
-
-fn is_valid_version(s: &str) -> bool {
-    Version::parse(s).is_ok()
-}
-
 pub(crate) struct BootDecision {
     pub(crate) should_show_popup: bool,
     pub(crate) should_persist: bool,
@@ -37,20 +26,16 @@ pub(crate) struct Versions {
 /// `last_seen_version`. Persist also happens on a first-time install and on an
 /// UNPARSEABLE recorded version — overwrite to recover, else a corrupted or
 /// hand-edited value silently disables the popup forever.
-pub(crate) fn boot_decision(current_ver: &str, last_seen: Option<&str>) -> BootDecision {
-    let last_seen_parseable = last_seen.is_some_and(is_valid_version);
-    let should_show_popup = match last_seen {
-        Some(last) if last_seen_parseable => is_newer_version(current_ver, last),
-        _ => false,
-    };
-    let should_persist = should_show_popup || last_seen.is_none() || !last_seen_parseable;
+pub(crate) fn boot_decision(current: &Version, last_seen: Option<&str>) -> BootDecision {
+    let previous = last_seen.and_then(|v| Version::parse(v).ok());
+    let should_show_popup = previous.as_ref().is_some_and(|p| current > p);
     BootDecision {
         should_show_popup,
-        should_persist,
-        versions: last_seen
-            .and_then(|v| Version::parse(v).ok())
-            .zip(Version::parse(current_ver).ok())
-            .map(|(previous, current)| Versions { previous, current }),
+        should_persist: should_show_popup || previous.is_none(),
+        versions: previous.map(|previous| Versions {
+            previous,
+            current: current.clone(),
+        }),
     }
 }
 
@@ -63,10 +48,14 @@ struct Notice {
 }
 
 /// Every notice, in the order the popup lists them: an action before a tip.
-const NOTICES: [Notice; 2] = [
+const NOTICES: [Notice; 3] = [
     Notice {
         last_without: Version::new(0, 19, 0),
-        says: reconnect,
+        says: |facts| reconnect(&REPLUGGED, facts),
+    },
+    Notice {
+        last_without: Version::new(0, 20, 0),
+        says: |facts| reconnect(&[&target::HERMES], facts),
     },
     Notice {
         last_without: Version::new(0, 20, 0),
@@ -77,10 +66,10 @@ const NOTICES: [Notice; 2] = [
 /// The hosts #1586 moved to a plugin.
 const REPLUGGED: [&Target; 3] = [&target::CLAUDE, &target::CODEX, &target::REASONIX];
 
-/// The hooks an older pixtuoid merged no longer count as a connection, so each
-/// installed host that reads disconnected is named.
-fn reconnect(facts: &Facts<'_>) -> Option<String> {
-    let names: Vec<&str> = REPLUGGED
+/// The hooks an older pixtuoid merged for `hosts` no longer count as a
+/// connection, so each installed one that reads disconnected is named.
+fn reconnect(hosts: &[&Target], facts: &Facts<'_>) -> Option<String> {
+    let names: Vec<&str> = hosts
         .iter()
         .filter(|t| {
             facts.installed.contains(&t.core_source) && !facts.connected.contains(t.core_source)
@@ -168,41 +157,8 @@ pub(crate) fn due(versions: Option<&Versions>, facts: &Facts<'_>) -> Vec<String>
 mod tests {
     use super::*;
 
-    #[test]
-    fn newer_version_detected() {
-        assert!(is_newer_version("0.2.0", "0.1.0"));
-    }
-
-    #[test]
-    fn same_version_not_newer() {
-        assert!(!is_newer_version("0.1.0", "0.1.0"));
-    }
-
-    #[test]
-    fn older_not_newer() {
-        assert!(!is_newer_version("0.1.0", "0.2.0"));
-    }
-
-    #[test]
-    fn major_bump_detected() {
-        assert!(is_newer_version("1.0.0", "0.9.9"));
-    }
-
-    #[test]
-    fn minor_bump_detected() {
-        assert!(is_newer_version("0.5.0", "0.4.0"));
-    }
-
-    #[test]
-    fn patch_bump_detected() {
-        assert!(is_newer_version("0.4.1", "0.4.0"));
-    }
-
-    #[test]
-    fn bad_input_safe() {
-        assert!(!is_newer_version("not-semver", "0.1.0"));
-        assert!(!is_newer_version("0.1.0", "garbage"));
-        assert!(!is_newer_version("", ""));
+    fn is_newer_version(current: &str, last_seen: &str) -> bool {
+        boot_decision(&v(current), Some(last_seen)).should_show_popup
     }
 
     #[test]
@@ -261,59 +217,46 @@ mod tests {
         );
     }
 
-    #[test]
-    fn is_valid_version_accepts_well_formed() {
-        assert!(is_valid_version("0.4.0"));
-        assert!(is_valid_version("1.2.3"));
-        assert!(is_valid_version("0.5.0-rc1"));
-    }
-
-    #[test]
-    fn is_valid_version_rejects_corrupted() {
-        assert!(!is_valid_version("v0.4.0"), "leading v is not semver");
-        assert!(!is_valid_version("0.5"), "semver needs the patch");
-        assert!(!is_valid_version("garbage"));
-        assert!(!is_valid_version(""));
-    }
-
     // `v0.4.0` is the git-tag spelling — the corruption a hand-edit actually hits.
     #[test]
     fn boot_decision_overwrites_corrupted_last_seen() {
-        let d = boot_decision("0.4.1", Some("v0.4.0"));
-        assert!(
-            !d.should_show_popup,
-            "can't show popup when comparison fails"
-        );
-        assert!(
-            d.should_persist,
-            "corrupted last_seen must be overwritten to recover"
-        );
+        for corrupted in ["v0.4.0", "0.5", "garbage", ""] {
+            let d = boot_decision(&v("0.4.1"), Some(corrupted));
+            assert!(
+                !d.should_show_popup,
+                "can't show popup when comparison fails: {corrupted:?}"
+            );
+            assert!(
+                d.should_persist,
+                "corrupted last_seen must be overwritten to recover: {corrupted:?}"
+            );
+        }
     }
 
     #[test]
     fn boot_decision_first_run_persists_silently() {
-        let d = boot_decision("0.4.1", None);
+        let d = boot_decision(&v("0.4.1"), None);
         assert!(!d.should_show_popup);
         assert!(d.should_persist);
     }
 
     #[test]
     fn boot_decision_upgrade_shows_popup_and_persists() {
-        let d = boot_decision("0.4.0", Some("0.3.0"));
+        let d = boot_decision(&v("0.4.0"), Some("0.3.0"));
         assert!(d.should_show_popup);
         assert!(d.should_persist);
     }
 
     #[test]
     fn boot_decision_same_version_no_action() {
-        let d = boot_decision("0.4.0", Some("0.4.0"));
+        let d = boot_decision(&v("0.4.0"), Some("0.4.0"));
         assert!(!d.should_show_popup);
         assert!(!d.should_persist);
     }
 
     #[test]
     fn boot_decision_downgrade_no_action() {
-        let d = boot_decision("0.3.0", Some("0.4.0"));
+        let d = boot_decision(&v("0.3.0"), Some("0.4.0"));
         assert!(!d.should_show_popup);
         assert!(!d.should_persist);
     }
@@ -326,7 +269,16 @@ mod tests {
         ids.iter().map(|s| s.to_string()).collect()
     }
 
-    const EVERY_HOST: [&str; 3] = ["claude-code", "codex", "reasonix"];
+    /// Every host a released pixtuoid merged hooks into, which nothing migrates.
+    fn legacy_hosts() -> impl Iterator<Item = &'static Target> {
+        target::TARGETS
+            .iter()
+            .copied()
+            .filter(|t| t.host.is_some_and(|h| h.legacy.is_some()))
+    }
+
+    static LEGACY_HOSTS: std::sync::LazyLock<Vec<&'static str>> =
+        std::sync::LazyLock::new(|| legacy_hosts().map(|t| t.core_source).collect());
 
     fn versions(previous: &str, current: &str) -> Versions {
         Versions {
@@ -335,12 +287,12 @@ mod tests {
         }
     }
 
-    /// Every notice's state holds: each replugged host installed and
-    /// disconnected, the TUI's cutaway drawn.
+    /// Every notice's state holds: each legacy host installed and disconnected,
+    /// the TUI's cutaway drawn.
     fn all_hold() -> Facts<'static> {
         static NONE: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
         Facts {
-            installed: &EVERY_HOST,
+            installed: &LEGACY_HOSTS,
             connected: &NONE,
             terminal_cutaway: true,
         }
@@ -351,12 +303,12 @@ mod tests {
     #[test]
     fn nothing_is_due_without_a_previous_version() {
         for last_seen in [None, Some("v0.4.0")] {
-            let versions = boot_decision("0.20.0", last_seen).versions;
+            let versions = boot_decision(&v("0.20.0"), last_seen).versions;
             assert_eq!(versions, None, "{last_seen:?}");
             assert!(due(versions.as_ref(), &all_hold()).is_empty());
         }
         assert_eq!(
-            boot_decision("0.20.0", Some("0.19.0")).versions,
+            boot_decision(&v("0.20.0"), Some("0.19.0")).versions,
             Some(versions("0.19.0", "0.20.0"))
         );
     }
@@ -414,7 +366,8 @@ mod tests {
         assert_eq!(
             due(Some(&across_every_notice()), &all_hold()),
             [
-                reconnect(&all_hold()).expect("holds"),
+                reconnect(&REPLUGGED, &all_hold()).expect("holds"),
+                reconnect(&[&target::HERMES], &all_hold()).expect("holds"),
                 cutaway_default(&all_hold()).expect("holds"),
             ]
         );
@@ -425,14 +378,17 @@ mod tests {
     #[test]
     fn reconnect_names_each_installed_host_that_reads_disconnected() {
         let says = |installed: &[&'static str], connected: &[&str]| {
-            reconnect(&Facts {
-                installed,
-                connected: &set(connected),
-                ..all_hold()
-            })
+            reconnect(
+                &REPLUGGED,
+                &Facts {
+                    installed,
+                    connected: &set(connected),
+                    ..all_hold()
+                },
+            )
         };
         assert_eq!(
-            says(&EVERY_HOST, &[]).as_deref(),
+            says(&LEGACY_HOSTS, &[]).as_deref(),
             Some(
                 "pixtuoid now connects to Claude Code, Codex and Reasonix as a plugin: \
                  reconnect the ones you use in Sources (s)."
@@ -444,18 +400,49 @@ mod tests {
                 "pixtuoid now connects to Codex as a plugin: reconnect it in Sources (s) if you use it."
             )
         );
-        assert_eq!(says(&EVERY_HOST, &EVERY_HOST), None, "all reconnected");
+        assert_eq!(says(&LEGACY_HOSTS, &LEGACY_HOSTS), None, "all reconnected");
         assert_eq!(
             says(&["opencode"], &[]),
             None,
             "no replugged host installed"
         );
         assert_eq!(
-            says(&EVERY_HOST, &["claude-code", "reasonix"]).as_deref(),
+            says(&LEGACY_HOSTS, &["claude-code", "reasonix"]).as_deref(),
             Some(
                 "pixtuoid now connects to Codex as a plugin: reconnect it in Sources (s) if you use it."
             )
         );
+    }
+
+    #[test]
+    fn every_legacy_host_is_named_by_a_notice() {
+        let said = due(Some(&across_every_notice()), &all_hold()).join("\n");
+        for t in legacy_hosts() {
+            assert!(said.contains(t.display_name), "{}: {said}", t.name);
+        }
+    }
+
+    /// 0.20.0 merged Hermes's hooks into its own config.yaml, which the plugin
+    /// that replaced them never reads.
+    #[test]
+    fn a_hermes_upgrader_is_told_to_reconnect_it() {
+        let due_with = |connected: &[&str]| {
+            due(
+                Some(&versions("0.20.0", "0.21.0")),
+                &Facts {
+                    installed: &["hermes"],
+                    connected: &set(connected),
+                    terminal_cutaway: false,
+                },
+            )
+        };
+        assert_eq!(
+            due_with(&[]),
+            [
+                "pixtuoid now connects to Hermes Agent as a plugin: reconnect it in Sources (s) if you use it."
+            ]
+        );
+        assert!(due_with(&["hermes"]).is_empty());
     }
 
     #[test]

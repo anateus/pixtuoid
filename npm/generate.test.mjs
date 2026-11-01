@@ -1,7 +1,6 @@
 #!/usr/bin/env node
-// Tests for generate.mjs — the per-platform package generator. Wired as a
-// pre-step of release.yml's npm job, so a broken generator fails the release
-// BEFORE anything is published.
+// Tests for generate.mjs — the per-platform package generator; ci-lint.yml's
+// `npm-gen` job runs them via `just npm-check`.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -34,6 +33,10 @@ const TARGETS = [
 // A release archive's notices as `just stage-notices` lays them out.
 const NOTICE_FILES = ["LICENSE", join("licenses", "pixtuoid", "fonts", "OFL-Font.txt")];
 
+/**
+ * @param {import("node:test").TestContext} t
+ * @param {{ skip?: string, skipNotices?: string }} [omit]
+ */
 function scaffold(t, { skip, skipNotices } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "pixtuoid-gen-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -73,13 +76,26 @@ function scaffold(t, { skip, skipNotices } = {}) {
   return { dir, npmDir, artifacts };
 }
 
-function run(npmDir, artifacts, version) {
+/**
+ * @param {string} npmDir
+ * @param {string} artifacts
+ * @param {string} version
+ * @param {...string} extra
+ */
+function run(npmDir, artifacts, version, ...extra) {
   return spawnSync(
     process.execPath,
-    [SCRIPT, "--version", version, "--artifacts", artifacts, "--npm-dir", npmDir],
+    [SCRIPT, "--version", version, "--artifacts", artifacts, "--npm-dir", npmDir, ...extra],
     { encoding: "utf8" },
   );
 }
+
+test("refuses a flag it does not know rather than ignore it", (t) => {
+  const { npmDir, artifacts } = scaffold(t);
+  const r = run(npmDir, artifacts, "1.2.3", "--bogus");
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /--bogus/);
+});
 
 test("stamps launcher + all 6 platform packages with the asymmetric libc gate", (t) => {
   const { npmDir, artifacts } = scaffold(t);

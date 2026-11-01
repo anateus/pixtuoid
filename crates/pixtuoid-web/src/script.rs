@@ -10,10 +10,11 @@ use std::path::PathBuf;
 
 use pixtuoid_core::source::daemon::DaemonPresenceUpdate;
 use pixtuoid_core::source::{
-    antigravity, claude_code, codewhale, codex, copilot, cursor, grok, hermes, omp, opencode,
-    reasonix,
+    RequestKeys, antigravity, claude_code, codewhale, codex, copilot, cursor, grok, hermes, omp,
+    opencode, reasonix,
 };
 use pixtuoid_core::{AgentEvent, AgentId, ToolDetail, Transport};
+use pixtuoid_scene::DEMO_REPOS;
 
 #[derive(Debug)]
 pub(crate) struct Beat {
@@ -25,55 +26,59 @@ pub(crate) struct Beat {
 /// Long enough that the cycle doesn't read as a loop.
 pub(crate) const LOOP_MS: u64 = 120_000;
 
-/// A cast member: a source CLI + a repo-ish cwd (drives the label AND the
-/// Team-Palette outfit, which keys on cwd). Sources MUST reference the modules'
-/// `SOURCE_NAME` consts — a hand-typed string silently misses the registry and
-/// the label falls back to the RAW string (`claude_code·api` not `cc·api`).
-const CAST: &[(&str, &str, &str)] = &[
-    // (source, session key, cwd)
-    (claude_code::SOURCE_NAME, "hero-cc-api", "/work/api"),
-    (codex::SOURCE_NAME, "hero-cx-web", "/work/webapp"),
-    (antigravity::SOURCE_NAME, "hero-ag-infra", "/work/infra"),
-    (codewhale::SOURCE_NAME, "hero-cw-data", "/work/data"),
-    (opencode::SOURCE_NAME, "hero-oc-cli", "/work/cli"),
-    (copilot::SOURCE_NAME, "hero-cp-docs", "/work/docs"),
-    (cursor::SOURCE_NAME, "hero-cu-etl", "/work/etl"),
-    (hermes::SOURCE_NAME, "hero-hm-tests", "/work/tests"),
-    (grok::SOURCE_NAME, "hero-gk-ml", "/work/ml"),
-    (reasonix::SOURCE_NAME, "hero-rx-research", "/work/research"),
-    (omp::SOURCE_NAME, "hero-om-embedded", "/work/embedded"),
+/// A cast member: a source CLI + its session key; the `i`th works in
+/// [`DEMO_REPOS`]`[i]`, the cwd its label AND its Team-Palette outfit key on.
+/// Sources MUST reference the modules' `SOURCE_NAME` consts — a hand-typed
+/// string silently misses the registry and the label falls back to the RAW
+/// string (`claude_code·api` not `cc·api`).
+const CAST: &[(&str, &str)] = &[
+    // (source, session key)
+    (claude_code::SOURCE_NAME, "hero-cc-api"),
+    (codex::SOURCE_NAME, "hero-cx-web"),
+    (antigravity::SOURCE_NAME, "hero-ag-infra"),
+    (codewhale::SOURCE_NAME, "hero-cw-data"),
+    (opencode::SOURCE_NAME, "hero-oc-cli"),
+    (copilot::SOURCE_NAME, "hero-cp-docs"),
+    (cursor::SOURCE_NAME, "hero-cu-etl"),
+    (hermes::SOURCE_NAME, "hero-hm-tests"),
+    (grok::SOURCE_NAME, "hero-gk-ml"),
+    (reasonix::SOURCE_NAME, "hero-rx-research"),
+    (omp::SOURCE_NAME, "hero-om-embedded"),
 ];
+const _: () = assert!(
+    CAST.len() <= DEMO_REPOS.len(),
+    "a cast member without a repo"
+);
 
 #[cfg(test)]
 pub(crate) const CAST_LEN: usize = CAST.len();
 
 pub(crate) fn cast_id(i: usize) -> AgentId {
-    let (source, key, _) = CAST[i];
+    let (source, key) = CAST[i];
     AgentId::from_parts(source, key)
 }
 
 fn session_start(i: usize) -> AgentEvent {
-    let (source, key, cwd) = CAST[i];
+    let (source, key) = CAST[i];
     AgentEvent::SessionStart {
         agent_id: cast_id(i),
         source: source.to_string(),
         session_id: key.to_string(),
-        cwd: PathBuf::from(cwd),
+        cwd: PathBuf::from("/work").join(DEMO_REPOS[i]),
         parent_id: None,
     }
 }
 
-const BURST_MS: u64 = 900;
-/// The `BURST_SPACING_MS - BURST_MS` idle gap must stay UNDER the reducer's
-/// `ACTIVE_GRACE_WINDOW` or the whole cast visibly flickers Active↔Idle.
-const BURST_SPACING_MS: u64 = 1200;
+/// One scripted call's length. Calls chain back to back: the reducer settles a
+/// slot the moment its call ends, so any gap between them shows as Idle.
+const BURST_MS: u64 = 1200;
 
 fn tool(i: usize, at_ms: u64, tuid: &str, display: &str) -> [Beat; 2] {
     [
         Beat {
             at_ms,
             transport: Transport::Hook,
-            event: AgentEvent::ActivityStart {
+            event: AgentEvent::ToolUseStart {
                 agent_id: cast_id(i),
                 tool_use_id: Some(format!("hero-{i}-{tuid}")),
                 detail: Some(ToolDetail::Generic {
@@ -84,7 +89,7 @@ fn tool(i: usize, at_ms: u64, tuid: &str, display: &str) -> [Beat; 2] {
         Beat {
             at_ms: at_ms + BURST_MS,
             transport: Transport::Hook,
-            event: AgentEvent::ActivityEnd {
+            event: AgentEvent::ToolUseEnd {
                 agent_id: cast_id(i),
                 tool_use_id: Some(format!("hero-{i}-{tuid}")),
             },
@@ -92,12 +97,12 @@ fn tool(i: usize, at_ms: u64, tuid: &str, display: &str) -> [Beat; 2] {
     ]
 }
 
-/// `n` chained bursts — continuously Active, then the agent settles Idle and
+/// `n` chained bursts — continuously Running, then the agent settles Idle and
 /// the engine's wander takes over until the next spell.
 fn spell(beats: &mut Vec<Beat>, i: usize, at_ms: u64, n: u64, tools: &[&str]) {
     for (k, &display) in (0..n).zip(tools.iter().cycle()) {
         let t = format!("s{at_ms}-{k}");
-        beats.extend(tool(i, at_ms + k * BURST_SPACING_MS, &t, display));
+        beats.extend(tool(i, at_ms + k * BURST_MS, &t, display));
     }
 }
 
@@ -119,9 +124,9 @@ fn usage(i: usize, at_ms: u64, fresh_tokens: u64) -> Beat {
 pub(crate) const HIRE_STAY_MS: u64 = 70_000;
 
 /// One visitor-hired coworker's lifecycle, as offsets from the hire instant.
-/// Reuses the cast's `BURST_MS`/`BURST_SPACING_MS` so the idle gap stays under
-/// the reducer's Active debounce here too. The cwd is the hire's own
-/// ("/work/yours") so Team Palette gives hires a distinct outfit family.
+/// Chains its calls back to back on the cast's `BURST_MS`. The cwd is the
+/// hire's own ("/work/yours") so Team Palette gives hires a distinct outfit
+/// family.
 pub(crate) fn hire_beats(id: AgentId, session: String) -> Vec<(u64, AgentEvent)> {
     let mut out: Vec<(u64, AgentEvent)> = Vec::new();
     out.push((
@@ -137,11 +142,11 @@ pub(crate) fn hire_beats(id: AgentId, session: String) -> Vec<(u64, AgentEvent)>
     // Spaced so the hire also idles/wanders like everyone else.
     for (k, start) in [8_000u64, 28_000, 50_000].into_iter().enumerate() {
         for b in 0..4u64 {
-            let at = start + b * BURST_SPACING_MS;
+            let at = start + b * BURST_MS;
             let tuid = format!("hire-{k}-{b}");
             out.push((
                 at,
-                AgentEvent::ActivityStart {
+                AgentEvent::ToolUseStart {
                     agent_id: id,
                     tool_use_id: Some(tuid.clone()),
                     detail: Some(ToolDetail::Generic {
@@ -151,7 +156,7 @@ pub(crate) fn hire_beats(id: AgentId, session: String) -> Vec<(u64, AgentEvent)>
             ));
             out.push((
                 at + BURST_MS,
-                AgentEvent::ActivityEnd {
+                AgentEvent::ToolUseEnd {
                     agent_id: id,
                     tool_use_id: Some(tuid),
                 },
@@ -183,16 +188,15 @@ pub(crate) struct PresenceBeat {
 pub(crate) fn hero_gateway() -> pixtuoid_core::source::daemon::DaemonInstanceKey {
     pixtuoid_core::source::daemon::DaemonInstanceKey::new(
         pixtuoid_core::source::openclaw::SOURCE_NAME,
-        pixtuoid_core::state::DaemonInstanceId::new(HERO_GATEWAY_PORT)
-            .unwrap_or_else(|| unreachable!("HERO_GATEWAY_PORT is a non-empty literal")),
+        pixtuoid_core::state::DaemonInstanceId::from_port(HERO_GATEWAY_PORT),
     )
 }
 
 /// OpenClaw's documented default gateway port — the hero's single instance id.
-const HERO_GATEWAY_PORT: &str = "18789";
+const HERO_GATEWAY_PORT: std::num::NonZeroU16 = std::num::NonZeroU16::new(18789).expect("nonzero");
 
 /// The lobster's loop: the OpenClaw mascot scuttles in mid-loop, shuttles
-/// through two busy runs, and walks out before the wrap — so every loop
+/// through two busy turns, and walks out before the wrap — so every loop
 /// replays a clean enter animation (GatewayUp after Down re-anchors
 /// `entered_at`).
 pub(crate) fn lobster_beats() -> Vec<PresenceBeat> {
@@ -201,26 +205,26 @@ pub(crate) fn lobster_beats() -> Vec<PresenceBeat> {
         (25_000, GatewayUp { pid: None }),
         (
             40_000,
-            RunStarted {
-                run_key: "hero-run-1".into(),
+            TurnStarted {
+                turn: pixtuoid_core::state::TurnKey::Id("hero-turn-1".into()),
             },
         ),
         (
             62_000,
-            RunEnded {
-                run_key: "hero-run-1".into(),
+            TurnEnded {
+                turn: pixtuoid_core::state::TurnKey::Id("hero-turn-1".into()),
             },
         ),
         (
             78_000,
-            RunStarted {
-                run_key: "hero-run-2".into(),
+            TurnStarted {
+                turn: pixtuoid_core::state::TurnKey::Id("hero-turn-2".into()),
             },
         ),
         (
             96_000,
-            RunEnded {
-                run_key: "hero-run-2".into(),
+            TurnEnded {
+                turn: pixtuoid_core::state::TurnKey::Id("hero-turn-2".into()),
             },
         ),
         (112_000, GatewayDown),
@@ -355,12 +359,12 @@ pub(crate) fn hero_script() -> Vec<Beat> {
     b.push(usage(1, 25_000, 90_000));
     b.push(usage(1, 70_000, 160_000));
 
-    // A permission park: agent 6 hits a gate mid-loop, resolved by the gated
-    // tool's completion (the reducer's gated_before_waiting path).
+    // A permission park: agent 6 raises a request mid-loop, answered by its
+    // member call's completion.
     b.push(Beat {
         at_ms: 58_000,
         transport: Transport::Hook,
-        event: AgentEvent::ActivityStart {
+        event: AgentEvent::ToolUseStart {
             agent_id: cast_id(6),
             tool_use_id: Some("hero-6-gated".to_string()),
             detail: Some(ToolDetail::Generic {
@@ -371,16 +375,16 @@ pub(crate) fn hero_script() -> Vec<Beat> {
     b.push(Beat {
         at_ms: 58_400,
         transport: Transport::Hook,
-        event: AgentEvent::Waiting {
-            agent_id: cast_id(6),
-            reason: "permission".to_string(),
-            tool_use_id: None,
-        },
+        event: AgentEvent::user_action_request(
+            cast_id(6),
+            Some("permission".to_string()),
+            RequestKeys::default(),
+        ),
     });
     b.push(Beat {
         at_ms: 70_500,
         transport: Transport::Hook,
-        event: AgentEvent::ActivityEnd {
+        event: AgentEvent::ToolUseEnd {
             agent_id: cast_id(6),
             tool_use_id: Some("hero-6-gated".to_string()),
         },
@@ -445,18 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn burst_gap_stays_under_the_reducer_debounce() {
-        assert!(
-            std::time::Duration::from_millis(BURST_SPACING_MS - BURST_MS)
-                < pixtuoid_core::state::reducer::ACTIVE_GRACE_WINDOW,
-            "burst gap ({}ms) must stay under ACTIVE_GRACE_WINDOW ({:?})",
-            BURST_SPACING_MS - BURST_MS,
-            pixtuoid_core::state::reducer::ACTIVE_GRACE_WINDOW
-        );
-    }
-
-    #[test]
-    fn one_loop_populates_a_working_office() {
+    fn one_loop_populates_a_running_office() {
         let scene = run_script_through_reducer(1);
         assert!(
             scene.agents.len() >= 9,
@@ -497,7 +490,7 @@ mod tests {
             "cx must carry a tower after one loop, got {} tokens",
             tokens_of(1)
         );
-        for (i, (source, _, _)) in CAST.iter().enumerate().skip(2) {
+        for (i, (source, _)) in CAST.iter().enumerate().skip(2) {
             assert_eq!(
                 tokens_of(i),
                 0,
@@ -510,15 +503,10 @@ mod tests {
             pixtuoid_scene::token_meter::token_tier(cc3) >= 2,
             "cc must have grown to T2 by loop 3, got {cc3}"
         );
-    }
-
-    #[test]
-    fn looping_stays_stable_across_wraps() {
-        let scene = run_script_through_reducer(3);
         assert!(
-            (9..=11).contains(&scene.agents.len()),
+            (9..=11).contains(&scene3.agents.len()),
             "cast must stay bounded across loops, got {}",
-            scene.agents.len()
+            scene3.agents.len()
         );
     }
 
@@ -538,18 +526,18 @@ mod tests {
             "morning rush: expected >=6 walk-ins by 3s, got {}",
             scene.agents.len()
         );
-        let active = scene
+        let running = scene
             .agents
             .values()
-            .filter(|a| matches!(a.state, pixtuoid_core::state::ActivityState::Active { .. }))
+            .filter(|a| matches!(a.state, pixtuoid_core::state::ActivityState::Running { .. }))
             .count();
-        // The schedule lands `active` at exactly this floor with zero headroom:
+        // The schedule lands `running` at exactly this floor with zero headroom:
         // a spell-offset tweak can drop it to 3 without the morning-rush spec
         // actually regressing, so re-check the rendered office before assuming
         // a real regression.
         assert!(
-            active >= 4,
-            "morning rush: expected >=4 monitors on by 3s, got {active}"
+            running >= 4,
+            "morning rush: expected >=4 monitors on by 3s, got {running}"
         );
     }
 }

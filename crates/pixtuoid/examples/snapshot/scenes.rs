@@ -1,10 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use pixtuoid_core::source::AgentEvent;
-use pixtuoid_core::state::{ActivityState, ToolKind};
+use pixtuoid_core::source::{AgentEvent, claude_code};
+use pixtuoid_core::state::{ActivityState, ToolKind, ToolUse};
 use pixtuoid_core::{AgentId, AgentSlot, GlobalDeskIndex, Reducer, SceneState, Transport};
 use tokio::sync::{RwLock, mpsc};
 
@@ -25,7 +25,7 @@ pub(crate) async fn capture_live_scene(
     // The SAME liveness probe as the real source: without it an in-flight session
     // first-sights at EOF (no history replay), so session-cumulative state —
     // tokens_used above all — reads ZERO and `--live` renders no paper tower.
-    if let Some(sessions_dir) = pixtuoid_core::source::cc_registry_dir(&root) {
+    if let Some(sessions_dir) = pixtuoid_core::source::claude_code::registry_dir(&root) {
         watcher = watcher.with_liveness_probe(std::sync::Arc::new(move || {
             pixtuoid_core::source::claude_code::live_cc_session_ids(&sessions_dir)
         }));
@@ -91,10 +91,46 @@ pub(crate) fn sample_scene(now: SystemTime, max_desks: usize, n_agents: usize) -
     s
 }
 
+/// Where team `team` works, cycled over [`pixtuoid_scene::DEMO_TEAMS`], and
+/// the label `source`'s decoder gives a session there.
+fn demo_repo(team: usize, source: &str) -> (Arc<Path>, String) {
+    let repo = pixtuoid_scene::DEMO_REPOS[team % pixtuoid_scene::DEMO_TEAMS];
+    let cwd = PathBuf::from("/demo").join(repo);
+    // No transcript path: only a subagent's would name the label.
+    let label = claude_code::cc_derive_label(Path::new(""), source, &cwd);
+    (Arc::from(cwd.as_path()), label)
+}
+
+/// The agent `key` names for `flag`: the one with that session id, else the
+/// one agent wearing that label.
+pub(crate) fn agent_named<'s>(s: &'s SceneState, flag: &str, key: &str) -> Result<&'s AgentSlot> {
+    if let Some(a) = s.agents.values().find(|a| &*a.session_id == key) {
+        return Ok(a);
+    }
+    let wearers: Vec<_> = s
+        .agents
+        .values()
+        .filter(|a| a.label.as_ref() == key)
+        .collect();
+    if let [one] = wearers.as_slice() {
+        return Ok(one);
+    }
+    let agents: Vec<_> = s
+        .agents
+        .values()
+        .map(|a| format!("{} ({})", a.label.as_ref(), a.session_id))
+        .collect();
+    anyhow::bail!(
+        "{flag} {key:?} names {} agents; name one by label or session id: {}",
+        wearers.len(),
+        agents.join(", ")
+    )
+}
+
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub(crate) enum GatewayState {
     Idle,
-    Busy,
+    Running,
     Degraded,
     Down,
 }
@@ -109,16 +145,16 @@ pub(crate) fn inject_openclaw_presence(
     ports: &[String],
 ) -> Result<()> {
     use pixtuoid_core::state::{DaemonLiveness, DaemonPresence};
-    // Busy is DERIVED from the run set: "busy" = UP + in-flight runs, never a
+    // Running is DERIVED from the turn set: "running" = UP + in-flight turns, never a
     // stored state.
-    let (liveness, active_sessions, runs) = match state {
+    let (liveness, active_sessions, turns) = match state {
         GatewayState::Idle => (DaemonLiveness::UP, 1, Vec::new()),
-        GatewayState::Busy => (
+        GatewayState::Running => (
             DaemonLiveness::UP,
             1,
             vec!["run-a".to_string(), "run-b".to_string()],
         ),
-        // Up, but the model backend fails every run — no in-flight runs, because
+        // Up, but the model backend fails every turn — no in-flight turns, because
         // the last one FAILED out of the set.
         GatewayState::Degraded => (DaemonLiveness::Up { degraded: true }, 1, Vec::new()),
         GatewayState::Down => (DaemonLiveness::Down, 0, Vec::new()),
@@ -143,10 +179,10 @@ pub(crate) fn inject_openclaw_presence(
                 active_sessions,
                 last_seen: now,
                 entered_at,
-                in_flight_runs: runs
+                in_flight_turns: turns
                     .iter()
-                    // Fresh leases at `now` so the snapshot renders the BUSY mascot.
-                    .map(|r| (r.clone(), now))
+                    // Fresh leases at `now` so the snapshot renders the running mascot.
+                    .map(|r| (pixtuoid_core::state::TurnKey::Id(r.as_str().into()), now))
                     .collect(),
                 // Distinct per instance: a shared pid would make one exit receipt
                 // look like every gateway's.
@@ -171,31 +207,35 @@ fn fill_sample_agents(s: &mut SceneState, now: SystemTime, desks: std::ops::Rang
         "gallery exemplars must span all four tiers"
     );
     use std::time::Duration as D;
-    // (label, state, since_event, since_entry) — the two must DIFFER, or
-    // `in_thinking_window` and `ENTRY_ANIMATION_MS` between them bar both seated poses.
+    // (role, state, since_event, since_entry): the role keys the agent's
+    // identity, never its name (`demo_repo`'s); a seated pose needs
+    // `since_entry` past `ENTRY_ANIMATION_MS`.
     let agents: [(&str, ActivityState, D, D); 12] = [
-        // Desk 0 is a FAR-seated desk, so this one also demonstrates the
-        // screen staying dark behind a monitor the room only sees the back of.
+        // An open turn between its items. Desk 0 is a FAR-seated desk, so this
+        // one also demonstrates the screen staying dark behind a monitor the
+        // room only sees the back of.
         (
-            "thinking",
-            ActivityState::Idle,
+            "turn",
+            ActivityState::Running { item: None },
             D::from_secs(5),
             D::from_secs(90),
         ),
         (
-            "waiting",
-            ActivityState::Waiting {
-                reason: "permission?".into(),
+            "asking",
+            ActivityState::RequiresAction {
+                reason: Some("permission?".into()),
             },
             D::from_secs(10),
             D::from_secs(30),
         ),
         (
-            "working",
-            ActivityState::Active {
-                tool_use_id: Some("tu_a".into()),
-                detail: Some("Write: src/foo.rs".into()),
-                kind: ToolKind::Edit,
+            "running",
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some("tu_a".into()),
+                    detail: Some("Write: src/foo.rs".into()),
+                    kind: ToolKind::Edit,
+                }),
             },
             D::from_millis(0),
             D::from_secs(6),
@@ -220,28 +260,32 @@ fn fill_sample_agents(s: &mut SceneState, now: SystemTime, desks: std::ops::Rang
         ),
         (
             "couch-act",
-            ActivityState::Active {
-                tool_use_id: Some("tu_c".into()),
-                detail: Some("Read: README.md".into()),
-                kind: ToolKind::Read,
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some("tu_c".into()),
+                    detail: Some("Read: README.md".into()),
+                    kind: ToolKind::Read,
+                }),
             },
             D::from_millis(140),
             D::from_millis(140),
         ),
         (
             "couch-bk",
-            ActivityState::Waiting {
-                reason: "review".into(),
+            ActivityState::RequiresAction {
+                reason: Some("review".into()),
             },
             D::from_millis(0),
             D::from_millis(0),
         ),
         (
             "floor-act",
-            ActivityState::Active {
-                tool_use_id: Some("tu_d".into()),
-                detail: Some("Bash: cargo test".into()),
-                kind: ToolKind::Bash,
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some("tu_d".into()),
+                    detail: Some("Bash: cargo test".into()),
+                    kind: ToolKind::Bash,
+                }),
             },
             D::from_millis(140),
             D::from_millis(140),
@@ -254,10 +298,12 @@ fn fill_sample_agents(s: &mut SceneState, now: SystemTime, desks: std::ops::Rang
         ),
         (
             "floor-act2",
-            ActivityState::Active {
-                tool_use_id: Some("tu_e".into()),
-                detail: Some("Grep: TODO".into()),
-                kind: ToolKind::Search,
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some("tu_e".into()),
+                    detail: Some("Grep: TODO".into()),
+                    kind: ToolKind::Search,
+                }),
             },
             D::from_millis(280),
             D::from_millis(280),
@@ -269,38 +315,36 @@ fn fill_sample_agents(s: &mut SceneState, now: SystemTime, desks: std::ops::Rang
             D::from_millis(3_000),
         ),
     ];
-    const DEMO_REPOS: [&str; 3] = ["/demo/api", "/demo/web", "/demo/infra"];
     for i in desks {
-        let (key, state, since_event, since_entry) = &agents[i % agents.len()];
+        let (role, state, since_event, since_entry) = &agents[i % agents.len()];
         // Keys must be unique across the full desk range so each desk slot gets its
         // own AgentId — suffixed once the archetypes cycle.
         let unique_key = if i < agents.len() {
-            key.to_string()
+            role.to_string()
         } else {
-            format!("{key}-{i}")
+            format!("{role}-{i}")
         };
-        let cwd_str = DEMO_REPOS[i % DEMO_REPOS.len()];
         let id = AgentId::from_transcript_path(&format!("/demo/{unique_key}.jsonl"));
+        let (cwd, label) = demo_repo(i, claude_code::SOURCE_NAME);
         s.agents.insert(
             id,
             AgentSlot {
                 agent_id: id,
-                source: std::sync::Arc::from("claude-code"),
+                source: std::sync::Arc::from(claude_code::SOURCE_NAME),
                 session_id: std::sync::Arc::from(format!("demo-{unique_key}").as_str()),
-                cwd: std::sync::Arc::from(PathBuf::from(cwd_str).as_path()),
-                label: unique_key.as_str().into(),
+                cwd,
+                label: label.as_str().into(),
                 state: state.clone(),
                 state_started_at: now - *since_event,
                 created_at: now - *since_entry,
                 last_event_at: now - *since_event,
                 exiting_at: None,
-                pending_idle_at: None,
 
                 desk_index: GlobalDeskIndex(i),
                 // Hardcoding 0 here would leave overflow agents invisible.
                 floor_idx: s.floor_of(GlobalDeskIndex(i)),
                 tool_call_count: 0,
-                active_ms: 0,
+                running_ms: 0,
                 unknown_cwd: false,
                 parent_id: None,
                 pid: None,
@@ -479,25 +523,25 @@ pub(crate) fn meeting_scene(
         // Back-date past `cycle_n` whole estimated cycles, plus a hair so the
         // integer division can't land on the boundary.
         let back_date = Duration::from_millis(c.cycle_n * est_wander_cycle_ms(c.id) + 400);
-        let label = format!("meet-{}", (b'a' + i as u8) as char);
+        // One team meets: one working directory, one outfit.
+        let (cwd, label) = demo_repo(0, claude_code::SOURCE_NAME);
         s.agents.insert(
             c.id,
             AgentSlot {
                 agent_id: c.id,
-                source: std::sync::Arc::from("claude-code"),
+                source: std::sync::Arc::from(claude_code::SOURCE_NAME),
                 session_id: std::sync::Arc::from(format!("meeting-{i}").as_str()),
-                cwd: std::sync::Arc::from(PathBuf::from("/meeting").as_path()),
+                cwd,
                 label: label.as_str().into(),
                 state: ActivityState::Idle,
                 state_started_at: now - back_date,
                 created_at: now - back_date,
                 last_event_at: now - back_date,
                 exiting_at: None,
-                pending_idle_at: None,
                 desk_index: GlobalDeskIndex(i),
                 floor_idx: s.floor_of(GlobalDeskIndex(i)),
                 tool_call_count: 0,
-                active_ms: 0,
+                running_ms: 0,
                 unknown_cwd: false,
                 parent_id: None,
                 pid: None,
@@ -517,14 +561,15 @@ pub(crate) fn meeting_scene(
 }
 
 pub(crate) fn dashboard_scene(now: SystemTime) -> SceneState {
-    use pixtuoid_core::source::{claude_code, codex, reasonix};
-    use pixtuoid_core::state::{ActivityState, ToolKind};
+    use pixtuoid_core::source::{codex, reasonix};
+    use pixtuoid_core::state::{ActivityState, ToolKind, ToolUse};
     use std::time::Duration as D;
 
     // Named to satisfy clippy::type_complexity (a 6-field tuple trips the lint):
-    // (label, transcript path, state, parent_id, desk_index, source SOURCE_NAME).
+    // (a subagent's type, transcript path, state, parent_id, desk_index, source
+    // SOURCE_NAME).
     type DashAgentSpec = (
-        &'static str,
+        Option<&'static str>,
         &'static str,
         ActivityState,
         Option<AgentId>,
@@ -538,31 +583,35 @@ pub(crate) fn dashboard_scene(now: SystemTime) -> SceneState {
 
     let agents: &[DashAgentSpec] = &[
         (
-            "cc·pixtuoid",
+            None,
             "/demo/dash_cc_root.jsonl",
-            ActivityState::Active {
-                tool_use_id: Some("tu0".into()),
-                detail: Some("Edit: reducer.rs".into()),
-                kind: ToolKind::Edit,
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some("tu0".into()),
+                    detail: Some("Edit: reducer.rs".into()),
+                    kind: ToolKind::Edit,
+                }),
             },
             None,
             0,
             claude_code::SOURCE_NAME,
         ),
         (
-            "code-explorer",
+            Some("code-explorer"),
             "/demo/dash_cc_sub1.jsonl",
-            ActivityState::Active {
-                tool_use_id: Some("tu1".into()),
-                detail: Some("Grep: TODO".into()),
-                kind: ToolKind::Search,
+            ActivityState::Running {
+                item: Some(ToolUse {
+                    tool_use_id: Some("tu1".into()),
+                    detail: Some("Grep: TODO".into()),
+                    kind: ToolKind::Search,
+                }),
             },
             Some(cc_root_id),
             1,
             claude_code::SOURCE_NAME,
         ),
         (
-            "code-reviewer",
+            Some("code-reviewer"),
             "/demo/dash_cc_sub2.jsonl",
             ActivityState::Idle,
             Some(cc_root_id),
@@ -570,7 +619,7 @@ pub(crate) fn dashboard_scene(now: SystemTime) -> SceneState {
             claude_code::SOURCE_NAME,
         ),
         (
-            "cx·sidecar",
+            None,
             "/demo/dash_cx_root.jsonl",
             ActivityState::Idle,
             None,
@@ -578,10 +627,10 @@ pub(crate) fn dashboard_scene(now: SystemTime) -> SceneState {
             codex::SOURCE_NAME,
         ),
         (
-            "rx·helper",
+            None,
             "/demo/dash_rx_root.jsonl",
-            ActivityState::Waiting {
-                reason: "permission?".into(),
+            ActivityState::RequiresAction {
+                reason: Some("permission?".into()),
             },
             None,
             4,
@@ -589,28 +638,30 @@ pub(crate) fn dashboard_scene(now: SystemTime) -> SceneState {
         ),
     ];
 
-    for (label, path, state, parent_id, desk_index, source) in agents {
+    for (subagent, path, state, parent_id, desk_index, source) in agents {
         let id = AgentId::from_transcript_path(path);
+        // A subagent works in its parent's repo, named for its type.
+        let (cwd, label) = match (subagent, parent_id.and_then(|p| s.agents.get(&p))) {
+            (Some(name), Some(parent)) => (Arc::clone(&parent.cwd), name.to_string()),
+            _ => demo_repo(*desk_index, source),
+        };
         s.agents.insert(
             id,
             AgentSlot {
                 agent_id: id,
                 source: std::sync::Arc::from(*source),
-                session_id: std::sync::Arc::from(
-                    format!("demo-dash-{}", label.replace('·', "-")).as_str(),
-                ),
-                cwd: std::sync::Arc::from(PathBuf::from("/demo").as_path()),
-                label: (*label).into(),
+                session_id: std::sync::Arc::from(format!("demo-dash-{desk_index}").as_str()),
+                cwd,
+                label: label.as_str().into(),
                 state: state.clone(),
                 state_started_at: now,
                 created_at: now - D::from_secs(*desk_index as u64),
                 last_event_at: now,
                 exiting_at: None,
-                pending_idle_at: None,
                 desk_index: GlobalDeskIndex(*desk_index),
                 floor_idx: s.floor_of(GlobalDeskIndex(*desk_index)),
                 tool_call_count: 0,
-                active_ms: 0,
+                running_ms: 0,
                 unknown_cwd: false,
                 parent_id: *parent_id,
                 pid: None,
@@ -683,16 +734,16 @@ pub(crate) fn anim_scene(
     // Which home desk to stage. `--anim-facing` picks one seated that way, so
     // the back-turned pose is reachable at all; desk 0 is always viewer-facing.
     let desk_idx = if target == "desk" {
-        let pick = (0..l.home_desks.len()).find(|&i| {
-            want_facing
-                .is_none_or(|f| l.desk_facing(pixtuoid_core::state::FloorLocalDeskIndex(i)) == f)
-        });
+        let pick = l
+            .home_desks
+            .iter()
+            .position(|d| want_facing.is_none_or(|f| d.facing == f));
         match pick {
             Some(i) => {
                 let d = l.home_desks[i];
                 eprintln!(
                     "ANIM target=desk buf_pos≈({}, {}) [home desk {i}]",
-                    d.x, d.y
+                    d.at.x, d.at.y
                 );
                 i
             }
@@ -773,7 +824,7 @@ pub(crate) fn anim_scene(
         id,
         AgentSlot {
             agent_id: id,
-            source: std::sync::Arc::from("claude-code"),
+            source: std::sync::Arc::from(claude_code::SOURCE_NAME),
             session_id: std::sync::Arc::from("anim"),
             cwd: std::sync::Arc::from(PathBuf::from("/anim").as_path()),
             label: target.into(),
@@ -782,11 +833,10 @@ pub(crate) fn anim_scene(
             created_at: now,
             last_event_at: now,
             exiting_at: None,
-            pending_idle_at: None,
             desk_index: GlobalDeskIndex(desk_idx),
             floor_idx: 0,
             tool_call_count: 0,
-            active_ms: 0,
+            running_ms: 0,
             unknown_cwd: false,
             parent_id: None,
             pid: None,
@@ -802,6 +852,41 @@ pub(crate) fn anim_scene(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every sample agent works in its desk's demo team, under the label the
+    /// CC decoder gives a session there, and the default twelve share teams.
+    #[test]
+    fn sample_agents_wear_the_decoder_label_of_their_demo_team() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let scene = sample_scene(now, 12, 12);
+        let mut got: Vec<_> = scene
+            .agents
+            .values()
+            .map(|a| (a.desk_index.0, a.label.to_string()))
+            .collect();
+        got.sort();
+        let team = |i| pixtuoid_scene::DEMO_REPOS[i % pixtuoid_scene::DEMO_TEAMS];
+        let want: Vec<_> = (0..12).map(|i| (i, format!("cc·{}", team(i)))).collect();
+        assert_eq!(got, want);
+        let teams: std::collections::HashSet<_> = got.iter().map(|(_, l)| l).collect();
+        assert!(teams.len() < got.len(), "no two sample agents share a team");
+    }
+
+    /// A flag names an agent by its session id, or by a label only one agent
+    /// wears: a team's shared label names none.
+    #[test]
+    fn an_agent_is_named_by_session_or_by_a_label_it_alone_wears() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let team = sample_scene(now, 12, 12);
+        let a = team.agents.values().next().unwrap();
+        assert!(agent_named(&team, "--flame", a.label.as_ref()).is_err());
+        let by_session = agent_named(&team, "--flame", &a.session_id).unwrap();
+        assert_eq!(by_session.agent_id, a.agent_id);
+        let alone = sample_scene(now, 12, 1);
+        let b = alone.agents.values().next().unwrap();
+        let by_label = agent_named(&alone, "--flame", b.label.as_ref()).unwrap();
+        assert_eq!(by_label.agent_id, b.agent_id);
+    }
 
     #[test]
     fn meeting_scene_stages_a_convergent_group() {
@@ -821,7 +906,7 @@ mod tests {
         let staged: Vec<_> = scene
             .agents
             .values()
-            .filter(|s| s.label.starts_with("meet-"))
+            .filter(|s| s.session_id.starts_with("meeting-"))
             .collect();
         assert_eq!(staged.len(), 3);
 
@@ -837,7 +922,7 @@ mod tests {
                 .as_millis() as u64;
             // Mirror `advance_wander`'s bootstrap fast-forward exactly.
             let cycle_n = elapsed_ms / est_wander_cycle_ms(id);
-            assert!(cycle_n >= 1, "cycle 0 back-dates under the thinking window");
+            assert!(cycle_n >= 1, "cycle 0 back-dates inside the entry walk");
             assert!(takes_trip(id, cycle_n), "staged cycle must be a trip");
             assert!(!is_aimless_cycle(id, cycle_n), "trip must be directed");
             let wp_idx = waypoint_index_for_cycle(id, cycle_n, layout.waypoints.len());

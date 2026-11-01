@@ -4,13 +4,9 @@ on:
   # Called by ci.yml, so its verdict reaches the required `ci-gate`.
   workflow_call:
 
-permissions:
-  contents: read
-
 jobs:
-  # A PR that leaves the extension and its contract inputs alone skips `check`
-  # (a skip `required` accepts); path-changed treats a push or dispatch run as
-  # unchanged.
+  # A PR that leaves the extension and its contract inputs alone skips `check`;
+  # path-changed treats a push or dispatch run as unchanged.
   scope:
     name: raycast in scope
     runs-on: ubuntu-latest
@@ -18,7 +14,7 @@ jobs:
     outputs:
       changed: ${{ steps.scope.outputs.changed }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
           persist-credentials: false
@@ -38,14 +34,16 @@ jobs:
       run:
         working-directory: integrations/raycast
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
           persist-credentials: false
       - uses: ./.github/actions/setup-npm
         with:
           directory: integrations/raycast
-          node-version: '22'
+          # Raycast runs extensions on its own Node 22 runtime, and its CLI
+          # requires 22.22.2+ (developers.raycast.com/misc/changelog).
+          node-version-file: integrations/raycast/.nvmrc
       # Each schema's own freshness vs its Rust struct is gated separately, by the
       # `*_schema_matches_the_committed_contract` tests in ci-tests.yml.
       - name: contract types match the committed schemas
@@ -66,16 +64,3 @@ jobs:
       # skips every check below it (#846/#848).
       - if: steps.lockfile.outputs.changed == 'true'
         run: npm run audit
-
-  required:
-    name: required-raycast-jobs
-    if: ${{ always() }}
-    needs: [scope, check]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: pixtuoid/.github/.github/actions/require-jobs@main
-        with:
-          results: ${{ toJSON(needs) }}
-          label: "Required raycast job failed"
-          allow-skipped: 'true'

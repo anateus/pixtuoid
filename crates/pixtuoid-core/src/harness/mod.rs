@@ -8,7 +8,7 @@
 //! Whether the resulting scene would PAINT is the render layer's question,
 //! asked one crate up; this half stops at the state the painter reads.
 //!
-//! Three things here are load-bearing rather than incidental:
+//! Two things here are load-bearing rather than incidental:
 //!
 //! 1. **Registration comes from the WATCHER, not the decoder.** A JSONL event
 //!    for an unknown id is a documented no-op, so a transcript driven with no
@@ -17,11 +17,7 @@
 //!    reads, so the seed can't drift from production.
 //! 2. **Transport is load-bearing** (the reducer's hook-wins dedup keys on it),
 //!    so it is not a free parameter.
-//! 3. **A decoder panic is a contract violation, everywhere.** The watcher and
-//!    hook listener log-and-continue on malformed input; a panic takes the
-//!    whole watcher down. Every line therefore runs under `catch_unwind`.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -29,22 +25,27 @@ use serde_json::Value;
 
 use crate::source::decoder::{LineDecoder, decode_hook_payload, display_safe};
 use crate::source::registry;
-use crate::state::{ActivityState, SceneState, ToolKind};
+use crate::state::{ActivityState, SceneState, ToolKind, ToolUse};
 use crate::{AgentEvent, AgentId, Reducer, Transport};
 
 mod captures;
 pub mod hermetic;
 pub mod host;
+pub mod merge;
 pub mod plan;
 pub mod provenance;
 pub mod reads;
 #[cfg(feature = "native")]
 pub mod tap;
 
+#[cfg(feature = "native")]
+pub use captures::outlived;
+pub(crate) use captures::source_home;
 pub use captures::{
-    BOOT, CAPTURE_NOTE, CAPTURE_RECORD, CORPUS_REFUSAL, Capture, CaptureRecord, DRIVER_COPY,
-    HOOK_PAYLOADS, NOTE_FILE, PROVENANCE, SecondTurn, canonical_capture, capture_base,
-    capture_root, capture_workspace, capture_workspace_tail, captures, files_under,
+    BOOT, CAPTURE_NOTE, CAPTURE_RECORD, CORPUS_REFUSAL, Canonical, Capture, CaptureRecord,
+    DRIVER_COPY, DRIVER_DIR_ENV, GAVE_UP_NOTE, HOOK_PAYLOADS, NOTE_FILE, OUTSIDE_CONFORMANCE,
+    PROVENANCE, ProcessExit, SecondTurn, ServerStop, canonical_capture, capture_base, capture_root,
+    capture_workspace, capture_workspace_tail, captures, files_under, fixtures_dir,
     jsonl_files_under, required_version_probe, slashed_under, transcript_in, transcripts_under,
     version_answer, wait_until,
 };
@@ -54,44 +55,66 @@ pub(crate) fn sources_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sources")
 }
 
+/// A registered id as the modules for its CLI spell it (`claude-code` →
+/// `claude_code`): its decoder, its profile, its test module and their dirs.
+pub fn module_of(source: &str) -> String {
+    source.replace('-', "_")
+}
+
+/// The registered id a module name spells, the inverse of [`module_of`].
+pub(crate) fn source_of(module: &str) -> String {
+    module.replace('_', "-")
+}
+
+/// The `T` the JSON file at `path` holds.
+///
+/// # Errors
+///
+/// The file cannot be read or holds no `T`, either naming `path`.
+pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::Result<T> {
+    let named = |kind, e: &dyn std::fmt::Display| {
+        std::io::Error::new(kind, format!("{}: {e}", path.display()))
+    };
+    let text = std::fs::read_to_string(path).map_err(|e| named(e.kind(), &e))?;
+    serde_json::from_str(&text).map_err(|e| named(std::io::ErrorKind::InvalidData, &e))
+}
+
 /// A lifecycle CLASS a driven wire pushed the slot through — asserted as
 /// reached-at-some-point, never as the terminal state.
 ///
 /// A class, not a `ToolKind`: `from_display` is case-sensitive, so a lowercase
-/// wire tool name (`"bash"`) renders `Active(Other)` where `"Bash"` renders
-/// `Active(Bash)` — a cosmetic per-source difference that must not be frozen
+/// wire tool name (`"bash"`) renders `Running(Other)` where `"Bash"` renders
+/// `Running(Bash)` — a cosmetic per-source difference that must not be frozen
 /// into a lifecycle assertion.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reach {
     /// A tool call is in flight.
-    Active,
+    Running,
+    /// A turn is open, showing no item.
+    RunningNoItem,
     /// Blocked on a permission/input prompt.
-    Waiting,
+    RequiresAction,
     /// A subagent dispatch is in flight.
     Delegating,
 }
 
 /// One line the pipeline could not carry, identified by position and SHAPE.
 ///
-/// Never by content: a real transcript line carries the user's prose, code and
+/// Never by content: a real hook payload carries the user's prompts, code and
 /// paths, and these render on a terminal.
 #[derive(Clone, Debug)]
-pub struct LineFailure {
+pub(crate) struct LineFailure {
     /// 1-based index among the non-blank lines driven.
     pub(crate) line: usize,
     /// `type="…" keys=[…]` — structure only.
     pub(crate) shape: String,
-    /// The decoder's own error; `None` for a panic.
-    pub(crate) message: Option<String>,
+    /// The decoder's own error.
+    pub(crate) message: String,
 }
 
 impl std::fmt::Display for LineFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "line {}: {}", self.line, self.shape)?;
-        if let Some(m) = &self.message {
-            write!(f, ": {m}")?;
-        }
-        Ok(())
+        write!(f, "line {}: {}: {}", self.line, self.shape, self.message)
     }
 }
 
@@ -108,14 +131,12 @@ pub struct Driven {
     pub(crate) seed_events: usize,
     /// Non-blank lines driven (blank lines are skipped, not counted).
     pub lines: usize,
-    /// Lines that were not valid JSON — a torn write, outside the decoder
-    /// contract (the watcher skips them too).
+    /// Lines the watcher skips too, outside the decoder contract: not UTF-8, or
+    /// not JSON.
     pub unparseable: usize,
-    /// Lines whose decoder returned `Err`. ALWAYS a defect on bytes the source
-    /// itself wrote: the contract is log-and-continue, never a hard error.
-    pub decode_errors: Vec<LineFailure>,
-    /// Lines whose decoder PANICKED — the never-panic contract violated.
-    pub panics: Vec<LineFailure>,
+    /// Hook lines the dispatcher refused. A refusal of bytes the source itself
+    /// wrote is drift in our decoder.
+    pub(crate) decode_errors: Vec<LineFailure>,
     /// Each slot's lifecycle classes, as each was first reached: the one record
     /// [`Self::reached`] unions.
     pub reaches: Vec<(AgentId, Reach)>,
@@ -125,6 +146,20 @@ pub struct Driven {
 }
 
 impl Driven {
+    /// Nothing driven yet, on [`DRIVEN_DESKS`].
+    fn empty() -> Self {
+        Self {
+            scene: SceneState::uniform(DRIVEN_DESKS),
+            events: Vec::new(),
+            seed_events: 0,
+            lines: 0,
+            unparseable: 0,
+            decode_errors: Vec::new(),
+            reaches: Vec::new(),
+            breadcrumbs: Vec::new(),
+        }
+    }
+
     /// The classes any slot passed through, in first-reached order.
     pub fn reached(&self) -> Vec<Reach> {
         let mut out = Vec::new();
@@ -148,11 +183,11 @@ impl Driven {
     }
 
     /// Assert bytes WE control drove cleanly. Not for unbounded bytes (the
-    /// corpus shell reports the same three counts instead).
+    /// corpus shell reports the same counts instead).
     ///
     /// # Panics
     ///
-    /// If a line was not valid JSON, the decoder returned `Err`, or the decoder panicked.
+    /// If a line was not valid JSON or the decoder returned `Err`.
     pub fn assert_clean(&self, what: &str) {
         assert_eq!(
             self.unparseable, 0,
@@ -164,11 +199,6 @@ impl Driven {
             "{what}: decode error(s): {:?}",
             self.decode_errors
         );
-        assert!(
-            self.panics.is_empty(),
-            "{what}: the decoder PANICKED (never-panic contract): {:?}",
-            self.panics
-        );
     }
 }
 
@@ -177,11 +207,14 @@ impl Driven {
 /// is about to assert on.
 const DEFAULT_NOW_EPOCH_SECS: u64 = 1_800_000_000;
 
-/// How far past `now` the settle tick runs. Long enough for the reducer's
-/// `ACTIVE_GRACE_WINDOW` pending-idle to realize (so a resolved tool really
-/// reads Idle), short enough to stay inside `EXIT_GRACE_WINDOW` (so a wire
-/// carrying its own `SessionEnd` still leaves the slot to observe).
-const SETTLE: Duration = Duration::from_secs(3);
+/// How far past `now` the cascade tick runs: past a deferred b1 cascade's
+/// grace, so it fires, and inside the exit grace, so a wire carrying its own
+/// `SessionEnd` still leaves the slot to observe.
+const CASCADE_TICK: Duration = Duration::from_secs(3);
+const _: () = assert!(
+    crate::state::reducer::B1_CASCADE_GRACE.as_nanos() < CASCADE_TICK.as_nanos()
+        && CASCADE_TICK.as_nanos() < crate::state::reducer::EXIT_GRACE_WINDOW.as_nanos()
+);
 
 /// PER-FLOOR desk capacity for the driven scene. Registration past the TOTAL is
 /// REFUSED, and SILENTLY — so a wire carrying more agents than that reads as
@@ -222,6 +255,46 @@ enum Decode {
     Hooks,
 }
 
+impl Decode {
+    /// A line's events, counted in `d`: blank, `None` uncounted; not JSON or
+    /// refused by the decoder, `None` counted as such. `parsed` reads the line
+    /// before the decoder takes it.
+    fn line(
+        &self,
+        line: Option<&str>,
+        d: &mut Driven,
+        parsed: impl FnOnce(&Value),
+    ) -> Option<Vec<AgentEvent>> {
+        if line.is_some_and(|l| l.trim().is_empty()) {
+            return None;
+        }
+        d.lines += 1;
+        let Some((line, Ok(v))) = line.map(|l| (l, serde_json::from_str::<Value>(l))) else {
+            d.unparseable += 1;
+            return None;
+        };
+        parsed(&v);
+        match self {
+            Self::Transcript {
+                decode,
+                source,
+                logical,
+            } => Some(decode(logical, source, v)),
+            Self::Hooks => match decode_hook_payload(v) {
+                Ok(events) => Some(events),
+                Err(e) => {
+                    d.decode_errors.push(LineFailure {
+                        line: d.lines,
+                        shape: shape_of(line),
+                        message: e.to_string(),
+                    });
+                    None
+                }
+            },
+        }
+    }
+}
+
 impl Drive {
     /// Drive the transcript AT `path` — the production form: the logical key is
     /// `normalize_path_key` of it, exactly the string `walk_jsonl` hands the
@@ -243,8 +316,7 @@ impl Drive {
     /// [`Drive::transcript_at`], which applies production's normalization.
     ///
     /// `None` when the source is hook-only, a daemon, or unregistered: a caller
-    /// that silently fell back to some other decoder would report a green
-    /// never-panic run having exercised the wrong one.
+    /// that silently fell back to some other decoder would census the wrong one.
     pub fn transcript(source: &str, logical: &str) -> Option<Self> {
         let decode = registry::descriptor_for(source)?.line_decoder()?;
         Some(Self {
@@ -303,24 +375,30 @@ impl Drive {
     }
 
     /// Drive `lines` end to end: blank lines skipped, every other line parsed,
-    /// decoded under `catch_unwind`, and the decoded stream folded through a
+    /// decoded, and the decoded stream folded through a
     /// real `Reducer`.
     pub fn lines<I, S>(&self, lines: I) -> Driven
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut d = Driven {
-            scene: SceneState::uniform(DRIVEN_DESKS),
-            events: Vec::new(),
-            seed_events: 0,
-            lines: 0,
-            unparseable: 0,
-            decode_errors: Vec::new(),
-            panics: Vec::new(),
-            reaches: Vec::new(),
-            breadcrumbs: Vec::new(),
-        };
+        self.run(lines.into_iter().map(Some))
+    }
+
+    /// [`Self::lines`] over a transcript's bytes, cut into lines as the watcher
+    /// cuts them: a line that is not UTF-8 is unparseable, and costs only itself.
+    pub fn body(&self, body: &[u8]) -> Driven {
+        use crate::source::admit::{lines, whole};
+        self.run(lines(whole(body)).map(Result::ok))
+    }
+
+    /// `None` is a line whose bytes are not UTF-8, so not JSON either.
+    fn run<I, S>(&self, lines: I) -> Driven
+    where
+        I: IntoIterator<Item = Option<S>>,
+        S: AsRef<str>,
+    {
+        let mut d = Driven::empty();
         let sink = BreadcrumbSink::default();
         tracing::subscriber::with_default(sink.clone(), || self.drive(lines, &mut d));
         d.breadcrumbs = sink.take();
@@ -329,76 +407,49 @@ impl Drive {
 
     fn drive<I, S>(&self, lines: I, d: &mut Driven)
     where
-        I: IntoIterator<Item = S>,
+        I: IntoIterator<Item = Option<S>>,
         S: AsRef<str>,
     {
-        if let (
-            true,
-            Decode::Transcript {
-                source, logical, ..
-            },
-        ) = (self.seeded, &self.decode)
-        {
+        if let Some(seed) = self.seed() {
             d.seed_events = 1;
-            d.events.push(AgentEvent::SessionStart {
-                agent_id: Self::seed_id(source, logical),
-                source: source.clone(),
-                session_id: format!("{source}-harness-seed"),
-                cwd: PathBuf::from(SEED_CWD),
-                parent_id: None,
-            });
+            d.events.push(seed);
         }
-
         for line in lines {
-            let line = line.as_ref();
-            if line.trim().is_empty() {
-                continue;
-            }
-            d.lines += 1;
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                d.unparseable += 1;
-                continue;
-            };
-            // `v` moves into the decoder: keeping a copy for the failure shape
-            // would clone whole transcript bodies on the corpus path, and a
-            // failure is rare enough to re-parse for.
-            match catch_unwind(AssertUnwindSafe(|| self.decode_one(v))) {
-                Ok(Ok(evs)) => d.events.extend(evs),
-                Ok(Err(e)) => d.decode_errors.push(LineFailure {
-                    line: d.lines,
-                    shape: shape_of(line),
-                    message: Some(e.to_string()),
-                }),
-                Err(_) => d.panics.push(LineFailure {
-                    line: d.lines,
-                    shape: shape_of(line),
-                    message: None,
-                }),
+            if let Some(events) = self
+                .decode
+                .line(line.as_ref().map(AsRef::as_ref), d, |_| {})
+            {
+                d.events.extend(events);
             }
         }
-
         self.fold(d);
     }
 
-    fn decode_one(&self, v: Value) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
-        match &self.decode {
-            Decode::Transcript {
-                decode,
-                source,
-                logical,
-            } => decode(logical, source, v),
-            Decode::Hooks => decode_hook_payload(v),
-        }
+    /// The `SessionStart` [`Self::seeded`] prepends, when it does.
+    fn seed(&self) -> Option<AgentEvent> {
+        let Decode::Transcript {
+            source, logical, ..
+        } = &self.decode
+        else {
+            return None;
+        };
+        self.seeded.then(|| AgentEvent::SessionStart {
+            agent_id: Self::seed_id(source, logical),
+            source: source.clone(),
+            session_id: format!("{source}-harness-seed"),
+            cwd: PathBuf::from(SEED_CWD),
+            parent_id: None,
+        })
     }
 
-    /// Each event is observed BEFORE and AFTER a settle tick, so a transient
+    /// Each event is observed BEFORE and AFTER a cascade tick, so a transient
     /// class a later event resolves still counts as reached.
     fn fold(&self, d: &mut Driven) {
         let mut reducer = Reducer::new();
         for ev in &d.events {
             reducer.apply(&mut d.scene, ev.clone(), self.now, self.transport);
             note_reached(&d.scene, &mut d.reaches);
-            reducer.tick(&mut d.scene, self.now + SETTLE);
+            reducer.tick(&mut d.scene, self.now + CASCADE_TICK);
             note_reached(&d.scene, &mut d.reaches);
         }
     }
@@ -455,12 +506,18 @@ impl tracing::Subscriber for BreadcrumbSink {
 fn note_reached(scene: &SceneState, reaches: &mut Vec<(AgentId, Reach)>) {
     for (&id, slot) in &scene.agents {
         let r = match &slot.state {
-            ActivityState::Active {
-                kind: ToolKind::Task,
-                ..
+            ActivityState::Running {
+                item:
+                    Some(ToolUse {
+                        kind: ToolKind::Task,
+                        ..
+                    }),
             } => Reach::Delegating,
-            ActivityState::Active { .. } => Reach::Active,
-            ActivityState::Waiting { .. } => Reach::Waiting,
+            ActivityState::Running {
+                item: Some(ToolUse { .. }),
+            } => Reach::Running,
+            ActivityState::Running { item: None } => Reach::RunningNoItem,
+            ActivityState::RequiresAction { .. } => Reach::RequiresAction,
             ActivityState::Idle => continue,
         };
         if !reaches.contains(&(id, r)) {
@@ -472,9 +529,7 @@ fn note_reached(scene: &SceneState, reaches: &mut Vec<(AgentId, Reach)>) {
 /// A line's STRUCTURE — its top-level `type` and key names, never its values.
 /// The one content-safe formatter for failure reporting.
 fn shape_of(line: &str) -> String {
-    let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return "<unparseable>".to_string();
-    };
+    let v = serde_json::from_str::<Value>(line).expect("drive parsed this line");
     // Key NAMES are wire-controlled too, so they route through the crate's ONE
     // terminal-egress policy; a second, laxer sanitizer here would be a
     // chokepoint bypass.
@@ -493,7 +548,7 @@ mod tests {
     #[test]
     fn a_breadcrumb_a_decode_logs_is_part_of_what_it_decoded() {
         let file = sources_root()
-            .join("delegation/fixtures/dsh")
+            .join("dsh/fixtures/subagent-hermetic")
             .join(HOOK_PAYLOADS);
         let text = std::fs::read_to_string(&file).expect("the recorded delegation");
         let call = text
@@ -539,13 +594,13 @@ mod tests {
     }
 
     #[test]
-    fn the_first_sight_seed_registers_and_the_wire_drives_the_slot_active() {
+    fn the_first_sight_seed_registers_and_the_wire_drives_the_slot_running() {
         let d = Drive::transcript(SOURCE, TRANSCRIPT)
             .unwrap()
             .seeded()
             .lines([tool_line()]);
         assert_eq!(d.registered(), 1);
-        assert_eq!(d.reached(), vec![Reach::Active]);
+        assert_eq!(d.reached(), vec![Reach::Running]);
     }
 
     #[test]
@@ -602,43 +657,20 @@ mod tests {
         assert!(Drive::transcript("not-a-source", "/x.jsonl").is_none());
     }
 
-    /// A `Drive` over a STAND-IN decoder: no real decoder rejects or panics on
-    /// any corpus bytes, so neither failure lane below has a real fixture.
-    fn drive_with(decode: LineDecoder) -> Drive {
-        Drive {
-            transport: Transport::Jsonl,
-            decode: Decode::Transcript {
-                decode,
-                source: SOURCE.to_string(),
-                logical: TRANSCRIPT.to_string(),
-            },
-            seeded: false,
-            now: SystemTime::UNIX_EPOCH + Duration::from_secs(DEFAULT_NOW_EPOCH_SECS),
-        }
-    }
-
-    /// A line carrying prose under a key — what the failure report must NOT
-    /// echo back to a terminal.
-    const PROSE_LINE: &str = r#"{"type":"assistant","secret":"do not print me"}"#;
+    /// A hook envelope the dispatcher rejects (no `hook_event_name`), carrying
+    /// prose under a key — what the failure report must NOT echo back to a terminal.
+    const PROSE_LINE: &str =
+        r#"{"_pixtuoid_source":"claude-code","type":"assistant","secret":"do not print me"}"#;
 
     #[test]
     fn a_decoder_error_is_recorded_with_the_lines_shape_not_its_content() {
-        fn refuse(
-            _p: &str,
-            _s: &str,
-            _v: Value,
-        ) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
-            Err(crate::source::decoder::DecodeError::unsupported(
-                "fixture", "event",
-            ))
-        }
-        let d = drive_with(refuse).lines([PROSE_LINE]);
+        let d = Drive::hooks().lines([PROSE_LINE]);
 
         assert_eq!(d.decode_errors.len(), 1);
         assert_eq!(d.decode_errors[0].line, 1);
         assert_eq!(
-            d.decode_errors[0].message.as_deref(),
-            Some("unsupported fixture event: event")
+            d.decode_errors[0].message,
+            "claude-code payload has no hook_event_name"
         );
         let shape = &d.decode_errors[0].shape;
         assert!(
@@ -647,7 +679,6 @@ mod tests {
         );
         assert!(shape.contains("type=\"assistant\""), "got {shape}");
         assert!(shape.contains("secret"), "got {shape}");
-        assert!(d.panics.is_empty(), "a decode error is not a panic");
     }
 
     #[test]
@@ -682,74 +713,18 @@ mod tests {
 
     #[test]
     fn line_failure_display_carries_position_and_shape_not_content() {
-        fn refuse(
-            _p: &str,
-            _s: &str,
-            _v: Value,
-        ) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
-            Err(crate::source::decoder::DecodeError::unsupported(
-                "fixture", "event",
-            ))
-        }
-        let d = drive_with(refuse).lines([PROSE_LINE]);
+        let d = Drive::hooks().lines([PROSE_LINE]);
         let rendered = d.decode_errors[0].to_string();
         assert!(rendered.starts_with("line 1: "), "got {rendered}");
         assert!(rendered.contains("type=\"assistant\""), "got {rendered}");
         assert!(
-            rendered.ends_with(": unsupported fixture event: event"),
+            rendered.ends_with(": claude-code payload has no hook_event_name"),
             "got {rendered}"
         );
         assert!(
             !rendered.contains("do not print me"),
             "Display must not echo the line's values, got {rendered}"
         );
-
-        fn boom(
-            _p: &str,
-            _s: &str,
-            _v: Value,
-        ) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
-            panic!("decoder blew up")
-        }
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let d = drive_with(boom).lines([PROSE_LINE]);
-        std::panic::set_hook(prev);
-        let rendered = d.panics[0].to_string();
-        assert!(!rendered.contains("blew up"), "got {rendered}");
-        assert!(
-            rendered.ends_with(']'),
-            "shape is the whole line, got {rendered}"
-        );
-    }
-
-    #[test]
-    fn a_panicking_decoder_is_caught_and_recorded_by_shape() {
-        fn boom(
-            _p: &str,
-            _s: &str,
-            _v: Value,
-        ) -> crate::source::decoder::DecodeResult<Vec<AgentEvent>> {
-            panic!("decoder blew up")
-        }
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let d = drive_with(boom).lines([PROSE_LINE]);
-        std::panic::set_hook(prev);
-
-        assert_eq!(d.panics.len(), 1, "the panic must be captured, not unwound");
-        assert_eq!(d.panics[0].line, 1);
-        assert!(
-            d.panics[0].shape.contains("type=\"assistant\""),
-            "got {}",
-            d.panics[0].shape
-        );
-        assert!(
-            !d.panics[0].shape.contains("do not print me"),
-            "got {}",
-            d.panics[0].shape
-        );
-        assert!(d.decode_errors.is_empty(), "a panic is not a decode error");
     }
 
     #[test]
@@ -765,7 +740,7 @@ mod tests {
             .seeded()
             .lines([start, end]);
         assert!(
-            d.reached().contains(&Reach::Active),
+            d.reached().contains(&Reach::Running),
             "the resolved tool call must still count as reached, got {:?}",
             d.reaches
         );

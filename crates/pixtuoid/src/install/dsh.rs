@@ -21,14 +21,11 @@ use crate::install::verify::{SchemaParse, ShimRef};
 /// The mount entry's `id` — uninstall and the one-entry verify key on it.
 const PLUGIN_ID: &str = "pixtuoid";
 
-const HOOK_PLACEHOLDER: &str = "\"{{HOOK_PATH_JSON}}\"";
-
 pub(crate) const PLUGIN_TEMPLATE: &str = include_str!("dsh_plugin.mjs");
 
-/// The upstream events the plugin forwards: its literal `ctx.on("…")`
-/// subscriptions and the `case "…"` labels of its session-event switch,
-/// scanned from the template so a hand-kept list can't claim coverage the code
-/// doesn't have.
+/// The upstream events the plugin forwards, read off its agent subscriptions and
+/// its session-event switch's cases: the selftest can fire only the cases it is
+/// told of, so a hand list would leave an added case unexercised.
 #[cfg(test)]
 pub(crate) fn plugin_events() -> Vec<&'static str> {
     let mut names = Vec::new();
@@ -39,6 +36,8 @@ pub(crate) fn plugin_events() -> Vec<&'static str> {
             }
         }
     }
+    // The channel the cases arrive on, not an event.
+    names.retain(|name| *name != "session/event");
     names.sort_unstable();
     names.dedup();
     names
@@ -91,8 +90,7 @@ pub(crate) fn hook_command(resolved: &Path, _explicit: bool) -> Result<String> {
 }
 
 pub(crate) fn plugin_artifacts(hook_path: &str) -> Result<Vec<(PathBuf, String)>> {
-    let rendered =
-        crate::install::merge::bake_hook_path(PLUGIN_TEMPLATE, HOOK_PLACEHOLDER, hook_path, "dsh")?;
+    let rendered = crate::install::merge::bake_hook_path(PLUGIN_TEMPLATE, hook_path, "dsh")?;
     Ok(vec![(plugin_path()?, rendered)])
 }
 
@@ -386,6 +384,7 @@ mod tests {
         let decoder_reads: std::collections::BTreeSet<String> = [
             "session_start",
             "session_end",
+            "turn_end",
             "tool_call",
             "tool_result",
             "approval_asked",
@@ -410,7 +409,7 @@ mod tests {
                 "outcome": "allowed-once", "model": "m",
                 "inputTokens": 1, "outputTokens": 1,
             });
-            let evs = decode_dsh_payload(&payload).expect("decodes");
+            let evs = decode_dsh_payload(payload.as_object().expect("an object")).expect("decodes");
             assert!(
                 !evs.is_empty(),
                 "{ty} decodes to nothing — a dead wire name"
@@ -716,7 +715,7 @@ mod tests {
             assert!(path.starts_with(home.path()));
             assert!(content.contains(SENTINEL));
             assert!(content.contains("\"/opt/bin/pixtuoid-hook\""));
-            assert!(!content.contains(HOOK_PLACEHOLDER));
+            assert!(!content.contains(crate::install::merge::HOOK_PLACEHOLDER));
         });
     }
 

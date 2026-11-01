@@ -68,10 +68,8 @@ pub(crate) struct SimStores<'a> {
 pub(crate) enum CharacterGlow {
     /// No glow.
     None,
-    /// `SeatedThinking` — paint uses the theme's default tool-glow color.
-    Thinking,
-    /// `SeatedTyping` — paint resolves the per-tool tint (`tool_glow_tint`).
-    Tool,
+    /// `SeatedTyping` — paint resolves the work's tint (`work_glow_tint`).
+    Work,
 }
 
 /// One character's fully resolved placement for this tick — everything the
@@ -104,7 +102,7 @@ pub struct CharacterPlacement {
     /// The home desk this placement is SEATED AT, in logical units — `None` for
     /// anyone not sitting at one (walking, at a waypoint, standing). Carried
     /// because `top_left` is already PROJECTED and cannot yield it back.
-    pub(crate) seat_desk: Option<Point>,
+    pub(crate) seat_desk: Option<crate::layout::HomeDesk>,
     /// Whether this figure sits on furniture — a desk's chair, a couch, a sofa
     /// or a meeting chair — which grounds it in place of a shadow.
     pub(crate) seated: bool,
@@ -166,13 +164,13 @@ pub(crate) struct MascotPlacement {
     pub(crate) frame_idx: usize,
     /// Which gateway instance it is.
     pub(crate) key: DaemonInstanceKey,
-    /// Its gateway's backend fails every run ([`GatewayCard::degraded`]), so
+    /// Its gateway's backend fails every turn ([`GatewayCard::degraded`]), so
     /// it greys.
     pub(crate) degraded: bool,
     /// Its gateway is in the roster; one walking out past that has no
     /// [`GatewayCard`], so it hovers as nothing.
     pub(crate) on_roster: bool,
-    /// What rides on it this tick: a bubble per run in flight.
+    /// What rides on it this tick: a bubble per turn in flight.
     pub(crate) effects: Vec<Effect>,
 }
 
@@ -249,7 +247,7 @@ pub struct SimFrame {
     pub(crate) neon: crate::floor::NeonLevels,
     /// Whether that light is a starved tube's catch.
     pub(crate) neon_stutter: bool,
-    /// Active speech bubbles after this tick's venue update.
+    /// In-progress speech bubbles after this tick's venue update.
     pub(crate) chitchat_bubbles: Vec<ChitchatBubble>,
     /// Agents observed walking back with coffee this tick — the caller
     /// persists them into its `CoffeeState`.
@@ -273,17 +271,14 @@ pub struct SimFrame {
 impl SimFrame {
     /// Desk `i`'s props this tick.
     pub(crate) fn desk(&self, i: FloorLocalDeskIndex) -> DeskProps {
-        debug_assert!(
-            i.0 < self.desks.len(),
-            "desk props are index-parallel to the home desks"
-        );
-        self.desks.get(i.0).cloned().unwrap_or_default()
+        self.desks[i.0].clone()
     }
 }
 
 /// What one `sim_step` reads, besides the stores it advances.
 pub(crate) struct SimInputs<'a> {
     pub(crate) world: FloorInputs<'a>,
+    pub(crate) pack: &'a OfficeArt,
     pub(crate) layout: &'a SceneLayout,
     /// Carrier → fetch time of each desk cup.
     pub(crate) coffee: &'a HashMap<AgentId, SystemTime>,
@@ -298,11 +293,11 @@ pub(crate) fn sim_step(stores: &mut SimStores<'_>, inputs: SimInputs<'_>) -> Sim
         world:
             FloorInputs {
                 scene,
-                pack,
                 now,
                 floor,
                 pets,
             },
+        pack,
         layout,
         coffee,
         door_anim_max_ms,
@@ -338,6 +333,9 @@ pub(crate) fn sim_step(stores: &mut SimStores<'_>, inputs: SimInputs<'_>) -> Sim
         {
             continue;
         }
+        let Some(origin) = layout.home_desk(agent.desk_index.single_floor_local()) else {
+            continue;
+        };
         let Some(pose) = pose::derive(agent, now, layout) else {
             continue;
         };
@@ -347,10 +345,7 @@ pub(crate) fn sim_step(stores: &mut SimStores<'_>, inputs: SimInputs<'_>) -> Sim
             // Reserve the cell the agent actually stands on, NOT the
             // blocked furniture center — else another agent's A* routes
             // straight through the stander.
-            let origin = layout
-                .home_desk(agent.desk_index.single_floor_local())
-                .unwrap_or(w.pos);
-            let stand = layout.stand_point(w.kind, w.pos, origin, w.facing);
+            let stand = layout.stand_point(w.kind, w.pos, origin.at, w.facing);
             stores.overlay.add(
                 stand.x.saturating_sub(CHARACTER_SPRITE_W / 2),
                 stand.y.saturating_sub(WALKING_Y_OFF / 2),
@@ -400,10 +395,7 @@ pub(crate) fn sim_step(stores: &mut SimStores<'_>, inputs: SimInputs<'_>) -> Sim
                 && a.exiting_at.is_none()
         })
         .map(|a| {
-            let seated = matches!(
-                poses.get(&a.agent_id),
-                Some(Some(Pose::SeatedTyping | Pose::SeatedThinking))
-            );
+            let seated = matches!(poses.get(&a.agent_id), Some(Some(Pose::SeatedTyping)));
             (a.desk_index.single_floor_local(), seated)
         })
         .collect();
@@ -532,7 +524,6 @@ fn pet_placement(
     let kind = kind?;
     let walk_anim = kind.walk_anim();
     let stride = pack.stride(walk_anim);
-    layout.corridor?;
     let walk = creatures
         .entry(CreatureKey::Pet(kind))
         .or_insert_with(|| CreatureWalk::at_home(layout, floor.floor_seed, now));
@@ -617,8 +608,8 @@ struct DrawnMascot {
     degraded: bool,
     /// [`MascotPlacement::on_roster`].
     on_roster: bool,
-    /// Its gateway's runs in flight.
-    runs: u32,
+    /// Its gateway's turns in flight.
+    turns: u32,
     /// [`CreatureWalk::carried`].
     carried: bool,
 }
@@ -680,7 +671,7 @@ fn mascot_placements(
                 on_roster: true,
                 key,
                 stance,
-                runs: presence.in_flight_runs.len() as u32,
+                turns: presence.in_flight_turns.len() as u32,
                 carried: walk.carried(),
             });
         }
@@ -716,7 +707,7 @@ fn mascot_placements(
                 stance,
                 degraded: false,
                 on_roster: false,
-                runs: 0,
+                turns: 0,
                 carried: walk.carried(),
             });
         }
@@ -730,7 +721,7 @@ fn mascot_placements(
                  stance: Stance { at, walking },
                  degraded,
                  on_roster,
-                 runs,
+                 turns,
                  carried,
              }| {
                 let def = gateway_mascot_def(key.source())?;
@@ -758,10 +749,10 @@ fn mascot_placements(
                     key,
                     degraded,
                     on_roster,
-                    // The busy tell keys on in-flight RUNS, not the (persistent,
+                    // The running tell keys on in-flight TURNS, not the (persistent,
                     // single-user) session count, which sticks at 1 at rest.
-                    effects: if runs > 0 {
-                        effects::mascot_bubbles(pos, size.h, runs, beat).collect()
+                    effects: if turns > 0 {
+                        effects::mascot_bubbles(pos, size.h, turns, beat).collect()
                     } else {
                         Vec::new()
                     },
@@ -781,8 +772,11 @@ fn desk_props(
     timing: Timing,
 ) -> Vec<DeskProps> {
     let Timing { now, beat } = timing;
-    (0..layout.home_desks.len())
-        .map(|i| {
+    layout
+        .home_desks
+        .iter()
+        .enumerate()
+        .map(|(i, desk)| {
             let occupant = desk_occupant(agents, FloorLocalDeskIndex(i));
             let fetched_at = occupant.and_then(|a| coffee.get(&a.agent_id));
             let cup = fetched_at.map(|t| {
@@ -795,16 +789,8 @@ fn desk_props(
                 cup,
                 token_tier: occupant.map_or(0, |a| crate::token_meter::token_tier(a.tokens_used)),
                 sheet_fall: occupant.and_then(|a| crate::token_meter::sheet_fall_dist(a, now)),
-                effects: cup_effects(
-                    desk_cup_at(
-                        pack,
-                        layout.home_desks[i],
-                        layout.desk_facing(FloorLocalDeskIndex(i)),
-                    ),
-                    cup,
-                    beat,
-                ),
-                scanline: scanline_col(layout.home_desks[i].x, beat),
+                effects: cup_effects(desk_cup_at(pack, desk.at, desk.facing), cup, beat),
+                scanline: scanline_col(desk.at.x, beat),
             }
         })
         .collect()
@@ -823,8 +809,8 @@ pub(crate) fn cup_effects(cup_at: Option<Point>, cup: Option<Cup>, beat: Beat) -
 pub(crate) struct Cues {
     /// Asleep: its z's stagger off this seed.
     pub(crate) sleep_seed: Option<u64>,
-    /// Waiting on the human.
-    pub(crate) waiting: bool,
+    /// Blocked on the human.
+    pub(crate) requires_action: bool,
     /// Walking, its weight on this foot ([`effects::planted_foot`]).
     pub(crate) planted_foot: Option<usize>,
 }
@@ -852,8 +838,8 @@ pub(crate) fn character_effects(
         cues.sleep_seed
             .and_then(|seed| effects::sleep_z(top_left, seed, beat)),
     );
-    if cues.waiting {
-        out.push(effects::waiting_mark(top_left));
+    if cues.requires_action {
+        out.push(effects::requires_action_mark(top_left));
     }
     out
 }
@@ -904,10 +890,9 @@ pub(crate) fn resolve_characters(
         let Some(p) = poses.get(&agent.agent_id).copied().flatten() else {
             continue;
         };
-        let is_waiting = matches!(agent.state, ActivityState::Waiting { .. });
+        let is_requires_action = matches!(agent.state, ActivityState::RequiresAction { .. });
         let seated = |base: Piece, glow: CharacterGlow, sleep_seed: Option<u64>| {
-            let facing = layout.desk_facing(agent.desk_index.single_floor_local());
-            let seat = Seat::at_desk(desk, facing);
+            let seat = Seat::at_desk(desk.at, desk.facing);
             let top_left = seat.render_top_left(CHARACTER_SPRITE_W);
             let (anim_name, flip_x) = seat.sprite_for(base);
             let placement = CharacterPlacement {
@@ -929,14 +914,14 @@ pub(crate) fn resolve_characters(
             };
             let cues = Cues {
                 sleep_seed,
-                waiting: is_waiting,
+                requires_action: is_requires_action,
                 planted_foot: None,
             };
             (placement, cues)
         };
         match p {
-            Pose::SeatedIdle if is_waiting => {
-                // Waiting is the one state that WANTS the human — the `N wait`
+            Pose::SeatedIdle if is_requires_action => {
+                // RequiresAction is the one state that WANTS the human — the `N req`
                 // counter's twin. Asleep-with-zzz reads as the opposite.
                 placements.push(seated(SEATED, CharacterGlow::None, None));
             }
@@ -949,11 +934,8 @@ pub(crate) fn resolve_characters(
                     Some(agent.agent_id.raw()),
                 ));
             }
-            Pose::SeatedThinking => {
-                placements.push(seated(SEATED, CharacterGlow::Thinking, None));
-            }
             Pose::SeatedTyping => {
-                let (mut placement, cues) = seated(TYPING, CharacterGlow::Tool, None);
+                let (mut placement, cues) = seated(TYPING, CharacterGlow::Work, None);
                 // the art the seat resolved to, a back view's own loop included
                 placement.frame_idx =
                     pose::typing_frame(agent, beat, pack.piece(placement.anim_name));
@@ -964,7 +946,7 @@ pub(crate) fn resolve_characters(
                     let rank = *wp_rank.entry(wp).or_insert(0);
                     wp_rank.insert(wp, rank + 1);
                     let dx = waypoint_rank_offset_x(kind, rank);
-                    let stand = layout.stand_point(wp_obj.kind, wp_obj.pos, desk, wp_obj.facing);
+                    let stand = layout.stand_point(wp_obj.kind, wp_obj.pos, desk.at, wp_obj.facing);
                     let seat = Seat::at_waypoint(kind, stand, wp_obj.facing);
                     let upright_top_left = seat.render_top_left(CHARACTER_SPRITE_W);
                     let (anim_name, flip_x) = seat.sprite_for(SEATED);
@@ -1107,7 +1089,7 @@ pub(crate) fn resolve_characters(
         // head, the badge clears.
         let ceiling = p
             .seat_desk
-            .map(|d| desk_art_top(pack, d.y, desk_art(pack, layout.desk_facing_at(d)).height()));
+            .map(|d| desk_art_top(pack, d.at.y, desk_art(pack, d.facing).height()));
         p.label_anchor = badge_anchor(fitted, size, ceiling);
         // Breath after the fit, so it never moves the badge.
         let agent = &agents[p.agent_idx];

@@ -36,17 +36,14 @@ async fn codex_source_run_emits_events_from_rollout() {
         "type": "session_meta",
         "payload": { "id": uuid, "cwd": "/repo" }
     });
-    let task_started = serde_json::json!({
-        "type": "event_msg",
-        "payload": { "type": "task_started", "turn_id": "t" }
-    });
+    let work = crate::codex_work_line();
     let mut f = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&transcript)
         .await
         .unwrap();
-    f.write_all(format!("{meta}\n{task_started}\n").as_bytes())
+    f.write_all(format!("{meta}\n{work}\n").as_bytes())
         .await
         .unwrap();
     f.flush().await.unwrap();
@@ -55,17 +52,14 @@ async fn codex_source_run_emits_events_from_rollout() {
     let mut got_activity = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some((_, AgentEvent::ActivityStart { .. }))) =
+        if let Ok(Some((_, AgentEvent::ToolUseStart { .. }))) =
             tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
         {
             got_activity = true;
             break;
         }
     }
-    assert!(
-        got_activity,
-        "CodexSource::run should surface ActivityStart"
-    );
+    assert!(got_activity, "CodexSource::run should surface ToolUseStart");
     handle.abort();
 }
 
@@ -105,7 +99,7 @@ async fn antigravity_source_run_emits_events_from_transcript() {
     let mut got_activity = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
-        if let Ok(Some((_, AgentEvent::ActivityStart { .. }))) =
+        if let Ok(Some((_, AgentEvent::ToolUseStart { .. }))) =
             tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
         {
             got_activity = true;
@@ -114,7 +108,7 @@ async fn antigravity_source_run_emits_events_from_transcript() {
     }
     assert!(
         got_activity,
-        "AntigravitySource::run should surface ActivityStart"
+        "AntigravitySource::run should surface ToolUseStart"
     );
     handle.abort();
 }
@@ -345,7 +339,7 @@ async fn grok_source_run_emits_events_from_updates_jsonl() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-            Ok(Some((_, AgentEvent::ActivityStart { agent_id, .. }))) => {
+            Ok(Some((_, AgentEvent::ToolUseStart { agent_id, .. }))) => {
                 // grok keys on the transcript's PARENT-DIR name, so the id the
                 // watcher mints must equal the hook leg's for the same session.
                 assert_eq!(agent_id, AgentId::from_parts("grok", session_id));
@@ -358,7 +352,7 @@ async fn grok_source_run_emits_events_from_updates_jsonl() {
     }
     assert!(
         saw_start,
-        "GrokSource::run should surface ActivityStart from updates.jsonl"
+        "GrokSource::run should surface ToolUseStart from updates.jsonl"
     );
     handle.abort();
 }
@@ -399,60 +393,109 @@ async fn omp_source_run_watches_profile_roots_beside_the_primary() {
     handle.abort();
 }
 
+/// An `OmpSource` over `dir`'s primary root, its profile roots every
+/// `dir/profiles/<entry>/agent/sessions`, sorted; a backstop past every test
+/// deadline leaves binding a new profile to the profiles-dir watch.
+fn omp_profiles_source(dir: &std::path::Path) -> pixtuoid_core::source::omp::OmpSource {
+    let profiles = dir.join("profiles");
+    let mut src =
+        pixtuoid_core::source::omp::OmpSource::single_root(dir.join("agent").join("sessions"));
+    src.profiles_dir = Some(profiles.clone());
+    src.rescan = std::sync::Arc::new(move || {
+        let Ok(entries) = std::fs::read_dir(&profiles) else {
+            return Vec::new();
+        };
+        let mut roots: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().join("agent").join("sessions"))
+            .collect();
+        roots.sort();
+        roots
+    });
+    src.rescan_interval = Duration::from_secs(3600);
+    src
+}
+
+/// Writes a session under `profile`'s sessions root, creating the profile, and
+/// returns the id the watcher must register it under.
+async fn write_profile_session(
+    dir: &std::path::Path,
+    profile: &str,
+    session_id: &str,
+) -> pixtuoid_core::AgentId {
+    let cwd_dir = dir
+        .join("profiles")
+        .join(profile)
+        .join("agent")
+        .join("sessions")
+        .join("-dev-proj");
+    tokio::fs::create_dir_all(&cwd_dir).await.unwrap();
+    let transcript = cwd_dir.join(format!("2026-07-09T08-00-00-000Z_{session_id}.jsonl"));
+    write_omp_header(&transcript, session_id).await;
+    pixtuoid_core::AgentId::from_parts("omp", &omp_watcher_key(&transcript))
+}
+
+/// Once `profiles` exists, its own watch reports each new profile; its anchor
+/// sees only `profiles` itself.
 #[tokio::test]
 async fn omp_source_rescan_hot_plugs_a_profile_created_mid_run() {
-    use pixtuoid_core::AgentId;
-    use pixtuoid_core::source::omp::OmpSource;
-
     fast_watch();
     let dir = TempDir::new().unwrap();
-    let primary = dir.path().join("agent").join("sessions");
-    tokio::fs::create_dir_all(&primary).await.unwrap();
-    let late_profile = dir
-        .path()
-        .join("profiles")
-        .join("late")
-        .join("agent")
-        .join("sessions");
-
-    // The rescan seam reports nothing until the test "creates" the profile.
-    let announced = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let feed = announced.clone();
+    tokio::fs::create_dir_all(dir.path().join("agent").join("sessions"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir(dir.path().join("profiles"))
+        .await
+        .unwrap();
     let (tx, mut rx) = mpsc::channel::<(Transport, AgentEvent)>(32);
-    let mut src = OmpSource::single_root(primary);
-    src.rescan = std::sync::Arc::new(move || feed.lock().unwrap().clone());
-    src.rescan_interval = Duration::from_millis(50);
+    let src = omp_profiles_source(dir.path());
     let handle = tokio::spawn(async move { Box::new(src).run(tx).await });
 
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    const STEM: &str = "2026-07-09T08-00-00-000Z_0197f0aa-0000-7000-8000-000000000022";
-    let cwd_dir = late_profile.join("-dev-proj");
-    tokio::fs::create_dir_all(&cwd_dir).await.unwrap();
-    announced.lock().unwrap().push(late_profile.clone());
-    // Give the rescan a tick to bind the new root BEFORE the transcript lands,
-    // so registration cannot ride the initial scan of an already-known root.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let transcript = cwd_dir.join(format!("{STEM}.jsonl"));
-    write_omp_header(&transcript, "0197f0aa-0000-7000-8000-000000000022").await;
-
-    let want = AgentId::from_parts("omp", &omp_watcher_key(&transcript));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let late =
+        write_profile_session(dir.path(), "late", "0197f0aa-0000-7000-8000-000000000022").await;
     assert!(
-        wait_for_session_start(&mut rx, want).await,
-        "a profile announced after startup must gain a watcher without a restart"
+        wait_for_session_start(&mut rx, late).await,
+        "a profile created after startup must gain a watcher without a restart"
     );
 
-    // Re-announcing the SAME root must not disturb it: a later transcript
-    // still registers. (Watcher-count dedup itself is not observable here —
-    // one watcher already emits SessionStart twice, seed + decoded header.)
-    announced.lock().unwrap().push(late_profile.clone());
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    const STEM2: &str = "2026-07-09T08-00-00-000Z_0197f0aa-0000-7000-8000-000000000023";
-    let second = cwd_dir.join(format!("{STEM2}.jsonl"));
-    write_omp_header(&second, "0197f0aa-0000-7000-8000-000000000023").await;
-    let want2 = AgentId::from_parts("omp", &omp_watcher_key(&second));
+    // A second profile re-lists the first: the already-bound root must not be
+    // disturbed. (Watcher-count dedup itself is not observable here — one
+    // watcher already emits SessionStart twice, seed + decoded header.)
+    let later =
+        write_profile_session(dir.path(), "later", "0197f0aa-0000-7000-8000-000000000023").await;
     assert!(
-        wait_for_session_start(&mut rx, want2).await,
-        "a re-announced root must keep registering new transcripts"
+        wait_for_session_start(&mut rx, later).await,
+        "a second profile must gain a watcher too"
+    );
+    let again =
+        write_profile_session(dir.path(), "late", "0197f0aa-0000-7000-8000-000000000024").await;
+    assert!(
+        wait_for_session_start(&mut rx, again).await,
+        "a re-listed root must keep registering new transcripts"
+    );
+    handle.abort();
+}
+
+/// With no `profiles` dir at boot, its anchor reports the dir appearing with its
+/// first profile.
+#[tokio::test]
+async fn omp_source_hot_plugs_a_profiles_dir_created_mid_run() {
+    fast_watch();
+    let dir = TempDir::new().unwrap();
+    tokio::fs::create_dir_all(dir.path().join("agent").join("sessions"))
+        .await
+        .unwrap();
+    let (tx, mut rx) = mpsc::channel::<(Transport, AgentEvent)>(32);
+    let src = omp_profiles_source(dir.path());
+    let handle = tokio::spawn(async move { Box::new(src).run(tx).await });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let first =
+        write_profile_session(dir.path(), "first", "0197f0aa-0000-7000-8000-000000000025").await;
+    assert!(
+        wait_for_session_start(&mut rx, first).await,
+        "the first profile must gain a watcher without a restart"
     );
     handle.abort();
 }
@@ -670,7 +713,7 @@ async fn omp_oversized_first_sight_uses_the_head_title_through_source_wiring() {
                 }
                 rename_labels.push(label);
             }
-            Ok(Some((_, AgentEvent::ActivityStart { .. }))) => saw_activity = true,
+            Ok(Some((_, AgentEvent::ToolUseStart { .. }))) => saw_activity = true,
             Ok(Some(_)) | Ok(None) | Err(_) => {}
         }
         if rename_seen_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(500)) {
@@ -687,7 +730,7 @@ async fn omp_oversized_first_sight_uses_the_head_title_through_source_wiring() {
 }
 
 #[tokio::test]
-async fn codex_permission_hermetic_fixture_drives_the_reducer_through_waiting() {
+async fn codex_permission_hermetic_fixture_drives_the_reducer_through_its_turn() {
     use pixtuoid_core::state::ActivityState;
     use pixtuoid_core::{Reducer, SceneState};
 
@@ -698,7 +741,7 @@ async fn codex_permission_hermetic_fixture_drives_the_reducer_through_waiting() 
     // `codex_id_from_path` keys on the filename's trailing UUID, so the replay
     // name (not the fixture's own) is what identifies the session.
     let recorded = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/sources/fixtures/codex/permission-hermetic");
+        .join("tests/sources/codex/fixtures/permission-hermetic");
     let fixture = pixtuoid_core::harness::transcript_in("codex", &recorded)
         .unwrap_or_else(|found| panic!("one recorded rollout, found {found:?}"));
     let body = std::fs::read_to_string(&fixture).expect("committed permission-hermetic fixture");
@@ -758,37 +801,26 @@ async fn codex_permission_hermetic_fixture_drives_the_reducer_through_waiting() 
         "label derives from the session_meta cwd basename"
     );
 
-    // ORDER, not mere presence: two `any()` checks would also pass for a reducer
-    // that parked the agent on the permission prompt BEFORE the tool ran.
-    let idx = |want: &str| {
-        states.iter().position(|s| {
-            matches!(
-                (s, want),
-                (ActivityState::Idle, "idle")
-                    | (ActivityState::Active { .. }, "active")
-                    | (ActivityState::Waiting { .. }, "waiting")
-            )
-        })
-    };
-    let (first_active, first_waiting) = (idx("active"), idx("waiting"));
+    // The approval rides the hooks alone, so the rollout never parks the turn.
     assert!(
         matches!(states.first(), Some(ActivityState::Idle)),
         "registration lands Idle, got {states:?}"
     );
     assert!(
-        first_active.is_some(),
-        "task_started must drive Active, got {states:?}"
+        states
+            .iter()
+            .any(|s| matches!(s, ActivityState::Running { .. })),
+        "task_started must drive Running, got {states:?}"
     );
     assert!(
-        first_waiting.is_some(),
-        "the escalated exec_command must drive Waiting(permission), got {states:?}"
+        !states
+            .iter()
+            .any(|s| matches!(s, ActivityState::RequiresAction { .. })),
+        "the rollout alone must never require action, got {states:?}"
     );
-    assert!(
-        first_active < first_waiting,
-        "Active must precede Waiting — the gate parks the turn after it starts: {states:?}"
-    );
-    assert!(
-        !matches!(states.last(), Some(ActivityState::Waiting { .. })),
-        "the agent must not still be Waiting after its turn ended, got {states:?}"
+    assert_eq!(
+        states.last(),
+        Some(&ActivityState::Idle),
+        "the turn's end settles the agent"
     );
 }
